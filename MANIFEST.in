@@ -1,5 +1,8 @@
 include LICENSE
 include README.md
+include AGENTS.md
+recursive-include docs *.md
+recursive-include scripts *.py
 
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]

@@ -1,9 +1,10 @@
 [project]
 name = "napari-label-manager"
 dynamic = ["version"]
-description = "A plugin for management of label colormap generation and opacity control"
+description = "Navigate neuron box ROIs and control Labels visibility in napari"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 authors = [
   {name = "JH Wang"},
   {email = "wjh19937458882@mail.ustc.edu.cn"},
@@ -12,39 +13,38 @@ classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: napari",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11,<3.15"
 # napari can be included in dependencies if napari imports are required.
 # However, you should not include napari[all], napari[qt],
 # or any other Qt bindings directly (e.g. PyQt5, PySide2).
 # See best practices: https://napari.org/stable/plugins/building_a_plugin/best_practices.html
 dependencies = [
+    "napari>=0.8,<0.9",
     "numpy",
-    "magicgui",
     "qtpy",
-    "scikit-image", "pyqt5>=5.15.11,<6", "pytest-qt>=4.5.0,<5",
 ]
 
 [project.optional-dependencies]
 # Allow easily installation with the full, default napari installation
 # (including Qt backend) using napari-label-manager[all].
-all = ["napari"]
+all = ["napari[all]>=0.8,<0.9"]
+excel = ["openpyxl>=3.1"]
 testing = [
     "tox",
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
-    "napari",  # test with napari's default Qt bindings
+    "napari[pyqt6]>=0.8,<0.9",
 ]
 
 [project.entry-points."napari.manifest"]
@@ -57,7 +57,7 @@ napari-label-manager = "napari_label_manager:napari.yaml"
 "User Support" = "https://github.com/Wenlab/napari-label-manager/issues"
 
 [build-system]
-requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
+requires = ["setuptools>=77.0.0", "wheel", "setuptools_scm"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -75,7 +75,7 @@ fallback_version = "0.0.1+nogit"
 
 [tool.black]
 line-length = 79
-target-version = ['py39', 'py310', 'py311', 'py312', 'py313']
+target-version = ['py311', 'py312', 'py313']
 
 [tool.ruff]
 line-length = 79
@@ -94,7 +94,7 @@ lint.select = [
 ]
 lint.ignore = [
     "E501", # line too long. let black handle this
-    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
+    "UP006", "UP007", # Preserve compatibility-oriented runtime annotations.
 ]
 
 exclude = [
@@ -104,6 +104,8 @@ exclude = [
     ".git",
     ".mypy_cache",
     ".pants.d",
+    ".pixi",
+    ".pytest_cache",
     ".ruff_cache",
     ".svn",
     ".tox",
@@ -119,7 +121,7 @@ exclude = [
     "*_vendor*",
 ]
 
-target-version = "py39"
+target-version = "py311"
 fix = true
 
 [tool.pixi.workspace]
@@ -131,13 +133,16 @@ napari-label-manager = { path = ".", editable = true }
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
-all = { features = ["all"], solve-group = "default" }
-testing = { features = ["testing"], solve-group = "default" }
+excel = { features = ["excel"], solve-group = "default" }
 
 [tool.pixi.tasks]
+launch-actual = "python scripts/launch_20260417_w2.py"
 
 [tool.pixi.dependencies]
+python = ">=3.11,<3.15"
 pytest = ">=8.4.1,<9"
+pytest-qt = ">=4.5,<5"
 ruff = ">=0.12.9,<0.13"
-napari = ">=0.5.0,<0.7"
+napari = ">=0.8,<0.9"
+pyqt6 = ">=6,<7"
 pre_commit = ">=4.3.0,<5"

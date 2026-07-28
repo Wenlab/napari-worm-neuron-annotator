@@ -1,33 +1,22 @@
-"""
-Napari Label Manager Plugin
-A plugin for batch management of label colors and opacity in napari.
-"""
+"""Napari widget for ROI-driven neuron navigation and label visibility."""
 
-import os
-import re
-import threading
+from __future__ import annotations
 
-# Add Excel support imports
-try:
-    import pandas as pd
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.styles import Alignment
-
-    EXCEL_AVAILABLE = True
-except ImportError:
-    EXCEL_AVAILABLE = False
+from contextlib import suppress
+from pathlib import Path
 
 import napari
 import numpy as np
-from napari.layers import Labels
+from napari.layers import Labels, Vectors
 from napari.utils import colormaps as cmap
-from qtpy.QtCore import Qt, QTimer, Signal
-from qtpy.QtGui import QFont
+from qtpy.QtCore import Qt
+from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -40,316 +29,256 @@ from qtpy.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from ._roi import (
+    NeuronBoxDataset,
+    add_time_axis,
+    box_vectors_2d,
+    box_vectors_3d,
+    neuron_id_to_label_value,
+)
 
-class LabelLayerSelector:
-    """A specialized layer selector that only shows Labels layers."""
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment
 
-    def __init__(self, combo_widget, viewer, callback_function=None):
-        """
-        Initialize the label layer selector.
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
 
-        Parameters
-        ----------
-        combo_widget : QComboBox
-            The combo box widget to populate with labels layers
-        viewer : napari.Viewer
-            The napari viewer instance
-        callback_function : callable, optional
-            Function to call when layer selection changes
-        """
-        self.combo = combo_widget
-        self.viewer = viewer
-        self.callback = callback_function
 
-        # Connect to viewer events
-        self.viewer.layers.events.inserted.connect(self.update_layers)
-        self.viewer.layers.events.removed.connect(self.update_layers)
-        self.viewer.layers.events.reordered.connect(self.update_layers)
-
-        # Initial population (before connecting the callback to avoid premature calls)
-        self.update_layers()
-
-        # Connect combo box change event after initial population
-        if self.callback:
-            self.combo.currentTextChanged.connect(self.callback)
-
-    def update_layers(self):
-        """Update the combo box with only Labels layers."""
-        current_selection = self.combo.currentText()
-        self.combo.clear()
-
-        # Get all Labels layers
-        label_layers = [
-            layer.name
-            for layer in self.viewer.layers
-            if isinstance(layer, Labels)
-        ]
-
-        if label_layers:
-            self.combo.addItems(label_layers)
-            # Try to maintain previous selection if it still exists
-            if current_selection in label_layers:
-                self.combo.setCurrentText(current_selection)
-        else:
-            # Add a placeholder when no labels layers are available
-            self.combo.addItem("No Labels layers available")
-            self.combo.setEnabled(False)
-            return
-
-        self.combo.setEnabled(True)
-
-    def get_current_layer(self):
-        """Get the currently selected Labels layer."""
-        layer_name = self.combo.currentText()
-        if layer_name and layer_name != "No Labels layers available":
-            try:
-                layer = self.viewer.layers[layer_name]
-                if isinstance(layer, Labels):
-                    return layer
-            except KeyError:
-                pass
-        return None
+ROLE_KEY = "napari_label_manager.role"
+ROLE_SELECTED = "roi_boxes_selected"
+LEGACY_ROLE_ALL = "roi_boxes_all"
+ROLE_ACTIVE = "roi_box_active"
+MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
+MAX_EXACT_LABEL_PIXELS = 10_000_000
 
 
 class LabelManager(QWidget):
-    """Main widget for label management."""
-
-    # Signal emitted when colormap changes
-    colormap_changed = Signal(object)
+    """Manage Labels visibility and navigate read-only neuron boxes."""
 
     def __init__(self, napari_viewer: napari.Viewer, parent=None):
         super().__init__(parent)
         self.viewer = napari_viewer
-        self.current_layer = None
-        self.full_color_dict = {}
-        self.background_value = 0
-        self.max_labels = 100
+        self.current_layer: Labels | None = None
+        self.roi_dataset: NeuronBoxDataset | None = None
+        self.active_id: int | None = None
+        self.checked_ids: set[int] = set()
+        self._available_ids: list[int] = []
+        self._selection_items: dict[int, QTreeWidgetItem] = {}
+        self._base_colors: dict[int, tuple[float, float, float, float]] = {}
+        self._original_colormap = None
+        self._original_opacity: float | None = None
+        self._ui_sync = False
+        self._closed = False
+        self._keys_bound: list[str] = []
 
-        # Performance optimization: cache for layer stats
-        self._layer_stats_cache = {}
-        self._update_timer = QTimer()
-        self._update_timer.setSingleShot(True)
-        self._update_timer.timeout.connect(self._delayed_update_layer_info)
+        self._setup_ui()
+        self._connect_viewer_events()
+        self._bind_keys()
+        self._refresh_label_layers()
 
-        # Initialize layer_selector as None first
-        self.layer_selector = None
-
-        self.setup_ui()
-        self.connect_signals()
-
-        # Initialize the label layer selector
-        self.layer_selector = LabelLayerSelector(
-            self.layer_combo, self.viewer, self.on_layer_changed
-        )
-
-    def setup_ui(self):
-        """Setup the user interface."""
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout()
+        self.setMinimumWidth(430)
 
-        # set width
-        self.setMinimumWidth(400)
-        # Header
-        header = QLabel("Label Manager")
+        header = QLabel("Neuron ROI Navigator")
         header.setFont(QFont("Arial", 12, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
 
-        # Layer selection
-        layer_group = QGroupBox("Layer Selection")
-        layer_layout = QVBoxLayout()
+        self.labels_layer_group = self._build_layer_group()
+        layout.addWidget(self.labels_layer_group)
+        layout.addWidget(self._build_roi_group())
+        layout.addWidget(self._build_selection_group())
+        layout.addWidget(self._build_annotation_group())
+        layout.addWidget(self._build_status_group())
+        self.setLayout(layout)
 
+    def _build_layer_group(self) -> QGroupBox:
+        group = QGroupBox("Labels Layer")
+        group_layout = QVBoxLayout()
         self.layer_combo = QComboBox()
-        layer_layout.addWidget(QLabel("Select Label Layer:"))
-        layer_layout.addWidget(self.layer_combo)
+        self.layer_combo.currentTextChanged.connect(self._on_layer_changed)
+        group_layout.addWidget(QLabel("Controlled layer:"))
+        group_layout.addWidget(self.layer_combo)
+        self._add_labels_appearance_controls(group_layout)
+        group.setLayout(group_layout)
+        return group
 
-        # Initialize the specialized layer selector
-        self.layer_selector = LabelLayerSelector(
-            self.layer_combo, self.viewer, self.on_layer_changed
+    def _build_roi_group(self) -> QGroupBox:
+        group = QGroupBox("Neuron ROI Source")
+        group_layout = QVBoxLayout()
+
+        path_layout = QHBoxLayout()
+        self.roi_path_input = QLineEdit()
+        self.roi_path_input.setReadOnly(True)
+        self.roi_path_input.setPlaceholderText("Load neuron_pt_tuple.npy")
+        self.load_roi_btn = QPushButton("Load NPY")
+        self.load_roi_btn.clicked.connect(self.load_roi_npy)
+        self.unload_roi_btn = QPushButton("Unload")
+        self.unload_roi_btn.clicked.connect(self.unload_roi)
+        self.unload_roi_btn.setEnabled(False)
+        path_layout.addWidget(self.roi_path_input, 1)
+        path_layout.addWidget(self.load_roi_btn)
+        path_layout.addWidget(self.unload_roi_btn)
+        group_layout.addLayout(path_layout)
+
+        config_layout = QHBoxLayout()
+        config_layout.addWidget(QLabel("Z divisor:"))
+        self.z_divisor_spin = QDoubleSpinBox()
+        self.z_divisor_spin.setDecimals(3)
+        self.z_divisor_spin.setRange(0.001, 1_000_000)
+        self.z_divisor_spin.setValue(5.0)
+        config_layout.addWidget(self.z_divisor_spin)
+
+        config_layout.addWidget(QLabel("Volume start:"))
+        self.volume_start_spin = QSpinBox()
+        self.volume_start_spin.setRange(0, 1_000_000)
+        config_layout.addWidget(self.volume_start_spin)
+
+        config_layout.addWidget(QLabel("Stride:"))
+        self.volume_stride_spin = QSpinBox()
+        self.volume_stride_spin.setRange(1, 1_000_000)
+        self.volume_stride_spin.setValue(1)
+        config_layout.addWidget(self.volume_stride_spin)
+        group_layout.addLayout(config_layout)
+
+        self.roi_info_label = QLabel("No ROI loaded; IDs come from Labels")
+        self.roi_info_label.setWordWrap(True)
+        group_layout.addWidget(self.roi_info_label)
+        group.setLayout(group_layout)
+        return group
+
+    def _build_selection_group(self) -> QGroupBox:
+        group = QGroupBox("Neuron Selection")
+        group_layout = QVBoxLayout()
+
+        self.navigation_help_label = QLabel("Q/W: last/next")
+        group_layout.addWidget(self.navigation_help_label)
+
+        controls_layout = QHBoxLayout()
+        self.check_all_btn = QPushButton("All")
+        self.check_all_btn.clicked.connect(self.check_all)
+        self.check_none_btn = QPushButton("None")
+        self.check_none_btn.clicked.connect(self.check_none)
+        controls_layout.addWidget(self.check_all_btn)
+        controls_layout.addWidget(self.check_none_btn)
+        controls_layout.addStretch(1)
+        group_layout.addLayout(controls_layout)
+
+        self.selection_tree = QTreeWidget()
+        self.selection_tree.setColumnCount(2)
+        self.selection_tree.setHeaderLabels(["", "Neuron"])
+        self.selection_tree.setRootIsDecorated(False)
+        self.selection_tree.setAlternatingRowColors(False)
+        self.selection_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.selection_tree.setMinimumHeight(190)
+        self.selection_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents
         )
-
-        layer_group.setLayout(layer_layout)
-        layout.addWidget(layer_group)
-
-        # Colormap generation
-        colormap_group = QGroupBox("Colormap Generation")
-        colormap_layout = QVBoxLayout()
-
-        # Number of colors and seed
-        gen_layout = QHBoxLayout()
-        gen_layout.addWidget(QLabel("Max Labels:"))
-        self.max_labels_spin = QSpinBox()
-        self.max_labels_spin.setRange(1, 1000)
-        self.max_labels_spin.setValue(self.max_labels)
-        gen_layout.addWidget(self.max_labels_spin)
-
-        gen_layout.addWidget(QLabel("Random Seed:"))
-        self.seed_spin = QSpinBox()
-        self.seed_spin.setRange(0, 100)
-        self.seed_spin.setValue(50)
-        gen_layout.addWidget(self.seed_spin)
-
-        self.generate_btn = QPushButton("Generate New Colormap")
-        self.generate_btn.clicked.connect(self.generate_colormap)
-        gen_layout.addWidget(self.generate_btn)
-
-        colormap_layout.addLayout(gen_layout)
-        colormap_group.setLayout(colormap_layout)
-        layout.addWidget(colormap_group)
-
-        # Batch management
-        batch_group = QGroupBox("Batch Label Management")
-        batch_layout = QVBoxLayout()
-
-        # Label IDs input
-        batch_layout.addWidget(
-            QLabel("Label IDs (comma-separated, ranges with '-'):")
+        self.selection_tree.header().setSectionResizeMode(
+            1, QHeaderView.Stretch
         )
-        self.label_ids_input = QLineEdit()
-        self.label_ids_input.setPlaceholderText("e.g., 1,3,5-10,20,25-30")
-        batch_layout.addWidget(self.label_ids_input)
-
-        # Quick presets
-        presets_layout = QHBoxLayout()
-        presets_layout.addWidget(QLabel("Quick presets:"))
-        self.preset_first10_btn = QPushButton("First 10")
-        self.preset_first10_btn.clicked.connect(
-            lambda: self.set_preset_ids("1-10")
+        self.selection_tree.itemChanged.connect(
+            self._on_selection_item_changed
         )
-        presets_layout.addWidget(self.preset_first10_btn)
+        self.selection_tree.itemClicked.connect(
+            self._on_selection_item_clicked
+        )
+        group_layout.addWidget(self.selection_tree)
+        group.setLayout(group_layout)
+        return group
 
-        self.preset_next_btn = QPushButton("Next ID")
-        self.preset_next_btn.clicked.connect(self.add_next_id)
-        presets_layout.addWidget(self.preset_next_btn)
-
-        self.preset_all_btn = QPushButton("All Current")
-        self.preset_all_btn.clicked.connect(self.set_all_current_ids)
-        presets_layout.addWidget(self.preset_all_btn)
-
-        batch_layout.addLayout(presets_layout)
-
-        # Opacity controls
-        opacity_frame = QFrame()
-        opacity_layout = QVBoxLayout()
-
-        # Selected labels opacity
+    def _add_labels_appearance_controls(
+        self, group_layout: QVBoxLayout
+    ) -> None:
         selected_layout = QHBoxLayout()
-        selected_layout.addWidget(QLabel("Selected Labels Opacity:"))
+        selected_layout.addWidget(QLabel("Checked label opacity:"))
         self.selected_opacity_slider = QSlider(Qt.Horizontal)
         self.selected_opacity_slider.setRange(0, 100)
         self.selected_opacity_slider.setValue(100)
         self.selected_opacity_label = QLabel("1.00")
         self.selected_opacity_slider.valueChanged.connect(
-            lambda v: self.selected_opacity_label.setText(f"{v/100:.2f}")
+            self._on_opacity_changed
         )
         selected_layout.addWidget(self.selected_opacity_slider)
         selected_layout.addWidget(self.selected_opacity_label)
-        opacity_layout.addLayout(selected_layout)
+        group_layout.addLayout(selected_layout)
 
-        # Other labels opacity
         other_layout = QHBoxLayout()
-        other_layout.addWidget(QLabel("Other Labels Opacity:"))
+        other_layout.addWidget(QLabel("Unchecked label opacity:"))
         self.other_opacity_slider = QSlider(Qt.Horizontal)
         self.other_opacity_slider.setRange(0, 100)
-        self.other_opacity_slider.setValue(50)
-        self.other_opacity_label = QLabel("0.50")
+        self.other_opacity_slider.setValue(20)
+        self.other_opacity_label = QLabel("0.20")
         self.other_opacity_slider.valueChanged.connect(
-            lambda v: self.other_opacity_label.setText(f"{v/100:.2f}")
+            self._on_opacity_changed
         )
         other_layout.addWidget(self.other_opacity_slider)
         other_layout.addWidget(self.other_opacity_label)
-        opacity_layout.addLayout(other_layout)
+        group_layout.addLayout(other_layout)
 
-        # Hide other labels option
-        self.hide_others_checkbox = QCheckBox(
-            "Hide Other Labels (opacity = 0)"
+        controls_layout = QHBoxLayout()
+        self.hide_unchecked_checkbox = QCheckBox("Hide unchecked labels")
+        self.hide_unchecked_checkbox.toggled.connect(
+            self._on_opacity_changed
         )
-        self.hide_others_checkbox.toggled.connect(self.on_hide_others_toggled)
-        opacity_layout.addWidget(self.hide_others_checkbox)
+        controls_layout.addWidget(self.hide_unchecked_checkbox)
+        controls_layout.addStretch(1)
+        group_layout.addLayout(controls_layout)
 
-        opacity_frame.setLayout(opacity_layout)
-        batch_layout.addWidget(opacity_frame)
+    def _build_annotation_group(self) -> QGroupBox:
+        group = QGroupBox("Neuron Annotation")
+        group_layout = QVBoxLayout()
+        controls = QHBoxLayout()
 
-        # Apply button
-        self.apply_btn = QPushButton("Apply Changes")
-        self.apply_btn.clicked.connect(self.apply_changes)
-        batch_layout.addWidget(self.apply_btn)
+        controls.addWidget(QLabel("Sheet:"))
+        self.sheet_name_input = QLineEdit("Neuron Annotations")
+        self.sheet_name_input.setFixedWidth(130)
+        controls.addWidget(self.sheet_name_input)
 
-        batch_group.setLayout(batch_layout)
-        layout.addWidget(batch_group)
-
-        # Label Annotation
-        annotation_group = QGroupBox("Label Annotation")
-        annotation_layout = QVBoxLayout()
-
-        # Control buttons
-        annotation_control_layout = QHBoxLayout()
-
-        # Sheet name input
-        annotation_control_layout.addWidget(QLabel("Sheet:"))
-        self.sheet_name_input = QLineEdit("Label Annotations")
-        self.sheet_name_input.setFixedWidth(120)
-        self.sheet_name_input.setToolTip(
-            "Excel sheet name for save/load operations"
-        )
-        annotation_control_layout.addWidget(self.sheet_name_input)
-
-        # Fill range controls
-        annotation_control_layout.addWidget(QLabel("Start:"))
-        self.annotation_start_input = QLineEdit("1")
-        self.annotation_start_input.setFixedWidth(50)
-        annotation_control_layout.addWidget(self.annotation_start_input)
-
-        annotation_control_layout.addWidget(QLabel("End:"))
-        self.annotation_end_input = QLineEdit("10")
-        self.annotation_end_input.setFixedWidth(50)
-        annotation_control_layout.addWidget(self.annotation_end_input)
+        controls.addWidget(QLabel("Start:"))
+        self.annotation_start_input = QLineEdit("0")
+        self.annotation_start_input.setFixedWidth(45)
+        controls.addWidget(self.annotation_start_input)
+        controls.addWidget(QLabel("End:"))
+        self.annotation_end_input = QLineEdit("9")
+        self.annotation_end_input.setFixedWidth(45)
+        controls.addWidget(self.annotation_end_input)
 
         self.fill_annotation_btn = QPushButton("Fill")
         self.fill_annotation_btn.clicked.connect(self.fill_annotation_range)
-        annotation_control_layout.addWidget(self.fill_annotation_btn)
-
+        controls.addWidget(self.fill_annotation_btn)
         self.load_current_labels_btn = QPushButton("Current IDs")
         self.load_current_labels_btn.clicked.connect(
-            self.load_current_labels_to_annotation
+            self.load_current_ids_to_annotation
         )
-        annotation_control_layout.addWidget(self.load_current_labels_btn)
+        controls.addWidget(self.load_current_labels_btn)
 
-        # Load Excel button
         self.load_excel_btn = QPushButton("Load")
         self.load_excel_btn.clicked.connect(self.load_excel_to_annotation)
         self.load_excel_btn.setEnabled(EXCEL_AVAILABLE)
-        if not EXCEL_AVAILABLE:
-            self.load_excel_btn.setToolTip(
-                "Install openpyxl to enable Excel import"
-            )
-        annotation_control_layout.addWidget(self.load_excel_btn)
-
-        annotation_control_layout.addStretch(1)
-
-        # Save button
+        controls.addWidget(self.load_excel_btn)
         self.save_annotation_btn = QPushButton("Save")
         self.save_annotation_btn.clicked.connect(self.save_annotation_to_excel)
         self.save_annotation_btn.setEnabled(EXCEL_AVAILABLE)
-        if not EXCEL_AVAILABLE:
-            self.save_annotation_btn.setToolTip(
-                "Install openpyxl to enable Excel export"
-            )
-        annotation_control_layout.addWidget(self.save_annotation_btn)
+        controls.addWidget(self.save_annotation_btn)
+        group_layout.addLayout(controls)
 
-        annotation_layout.addLayout(annotation_control_layout)
-
-        # Annotation table
-        self.annotation_table = QTableWidget()
-        self.annotation_table.setColumnCount(3)
+        self.annotation_table = QTableWidget(0, 3)
         self.annotation_table.setHorizontalHeaderLabels(
             ["digital", "biological", "annotation"]
         )
-
-        # Set column resize modes
         self.annotation_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeToContents
         )
@@ -359,1275 +288,1128 @@ class LabelManager(QWidget):
         self.annotation_table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.Stretch
         )
+        self.annotation_table.setSelectionBehavior(
+            QAbstractItemView.SelectRows
+        )
+        self.annotation_table.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self.annotation_table.itemSelectionChanged.connect(
+            self._on_annotation_selection_changed
+        )
+        self.annotation_table.itemChanged.connect(
+            self._on_annotation_item_changed
+        )
+        group_layout.addWidget(self.annotation_table)
+        group.setLayout(group_layout)
+        return group
 
-        # Allow multiple row selection
-        self.annotation_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.annotation_table.setSelectionMode(QTableWidget.ExtendedSelection)
-
-        # Set initial table size and fill with default range
-        self.annotation_table.setRowCount(5)
-        self.fill_annotation_range()
-
-        annotation_layout.addWidget(self.annotation_table)
-
-        annotation_group.setLayout(annotation_layout)
-        layout.addWidget(annotation_group)
-
-        # Status and info
-        info_group = QGroupBox("Status & Info")
-        info_layout = QVBoxLayout()
-
+    def _build_status_group(self) -> QGroupBox:
+        group = QGroupBox("Status")
+        group_layout = QVBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: green;")
-        info_layout.addWidget(self.status_label)
-
+        group_layout.addWidget(self.status_label)
         self.info_text = QTextEdit()
-        self.info_text.setMaximumHeight(100)
         self.info_text.setReadOnly(True)
-        info_layout.addWidget(self.info_text)
+        self.info_text.setMaximumHeight(90)
+        group_layout.addWidget(self.info_text)
+        group.setLayout(group_layout)
+        return group
 
-        info_group.setLayout(info_layout)
-        layout.addWidget(info_group)
+    # ------------------------------------------------------------------
+    # Viewer and layer lifecycle
+    # ------------------------------------------------------------------
+    def _connect_viewer_events(self) -> None:
+        events = self.viewer.layers.events
+        events.inserted.connect(self._refresh_label_layers)
+        events.removed.connect(self._on_layer_removed)
+        events.reordered.connect(self._refresh_label_layers)
+        if hasattr(events, "renamed"):
+            events.renamed.connect(self._refresh_label_layers)
 
-        self.setLayout(layout)
+        dims_events = self.viewer.dims.events
+        dims_events.point.connect(self._on_dims_changed)
+        dims_events.ndisplay.connect(self._on_dims_changed)
+        dims_events.order.connect(self._on_dims_changed)
 
-    def connect_signals(self):
-        """Connect viewer signals."""
-        # Layer selection is now handled by LabelLayerSelector
-        self.viewer.layers.events.removed.connect(self.on_layer_removed)
+    def _disconnect_viewer_events(self) -> None:
+        events = self.viewer.layers.events
+        for emitter, callback in (
+            (events.inserted, self._refresh_label_layers),
+            (events.removed, self._on_layer_removed),
+            (events.reordered, self._refresh_label_layers),
+        ):
+            with suppress(TypeError, ValueError):
+                emitter.disconnect(callback)
+        if hasattr(events, "renamed"):
+            with suppress(TypeError, ValueError):
+                events.renamed.disconnect(self._refresh_label_layers)
 
-        # Connect to layer events for cache invalidation
-        self.viewer.layers.events.changed.connect(
-            self.on_layer_properties_changed
-        )
+        dims_events = self.viewer.dims.events
+        for emitter in (
+            dims_events.point,
+            dims_events.ndisplay,
+            dims_events.order,
+        ):
+            with suppress(TypeError, ValueError):
+                emitter.disconnect(self._on_dims_changed)
 
-    def on_layer_removed(self, event):
-        """Handle layer removal to clean up cache."""
-        # Clean up cache for removed layers
-        removed_layer = event.value
-        layer_id = id(removed_layer)
-        if layer_id in self._layer_stats_cache:
-            del self._layer_stats_cache[layer_id]
-
-    def on_layer_properties_changed(self, event):
-        """Handle layer property changes that might affect cache validity."""
-        # Clear cache when layer properties change (e.g., time step)
-        if hasattr(event, "source") and hasattr(event.source, "current_step"):
-            layer_id = id(event.source)
-            if layer_id in self._layer_stats_cache:
-                # Only clear if this is a time-series change
-                del self._layer_stats_cache[layer_id]
-
-    def on_layer_changed(self, layer_name: str):
-        """Handle layer selection change."""
-        if layer_name and layer_name != "No Labels layers available":
-            # Use the layer selector to get the current layer if available
-            if self.layer_selector is not None:
-                self.current_layer = self.layer_selector.get_current_layer()
-            else:
-                # Fallback for initialization period
-                try:
-                    layer = self.viewer.layers[layer_name]
-                    if isinstance(layer, Labels):
-                        self.current_layer = layer
-                    else:
-                        self.current_layer = None
-                except KeyError:
-                    self.current_layer = None
-
-            if self.current_layer is not None:
-                self.update_status(f"Selected layer: {layer_name}", "blue")
-
-                # Initialize colormap if needed
-                if hasattr(self.current_layer, "colormap"):
-                    self.extract_current_colormap()
-
-                # Clear cache for this layer
-                layer_id = id(self.current_layer)
-                if layer_id in self._layer_stats_cache:
-                    del self._layer_stats_cache[layer_id]
-
-                # Delay layer info update to avoid blocking UI
-                self._update_timer.start(100)  # 100ms delay
-            else:
-                self.update_status("Invalid layer selection", "red")
-        else:
-            self.current_layer = None
-            self.update_status("No Labels layer selected", "orange")
-
-    def extract_current_colormap(self):
-        """Extract current colormap from the selected layer."""
-        if self.current_layer and hasattr(self.current_layer, "colormap"):
-            colormap = self.current_layer.colormap
-            if hasattr(colormap, "colors"):
-                self.full_color_dict = {
-                    i + 1: tuple(color)
-                    for i, color in enumerate(colormap.colors)
-                }
-                self.full_color_dict[None] = (0.0, 0.0, 0.0, 0.0)
-                if hasattr(colormap, "background_value"):
-                    self.background_value = colormap.background_value
-
-    def set_preset_ids(self, preset_type: str):
-        """Set preset label IDs."""
-        if preset_type == "1-10":
-            self.label_ids_input.setText("1-10")
-
-    def add_next_id(self):
-        """Add the next ID from the current layer's label list."""
-        if not self.current_layer:
-            self.update_status("No layer selected", "red")
-            return
-
-        # Get current label IDs from the layer
-        current_layer_ids = self.get_current_label_ids()
-        if not current_layer_ids:
-            self.update_status("No labels found in current layer", "orange")
-            return
-
-        # Parse currently selected IDs from input
-        current_input = self.label_ids_input.text().strip()
-        if current_input:
-            selected_ids = set(self.parse_label_ids(current_input))
-        else:
-            selected_ids = set()
-
-        # Find the next ID that's not already selected
-        next_id = None
-
-        if selected_ids:
-            # select the maximum ID from the currently selected IDs
-            max_selected_id = max(selected_ids)
-
-            # Find the next ID in current_layer_ids that's greater than max_selected_id
-            for label_id in sorted(current_layer_ids):
-                if label_id > max_selected_id and label_id not in selected_ids:
-                    next_id = label_id
-                    break
-
-            # If that doesn't work, find the smallest missing ID in current_layer_ids
-            if next_id is None:
-                for label_id in sorted(current_layer_ids):
-                    if label_id not in selected_ids:
-                        next_id = label_id
-                        break
-        else:
-            # If no IDs are selected, start from the smallest
-            for label_id in sorted(current_layer_ids):
-                if label_id not in selected_ids:
-                    next_id = label_id
-                    break
-
-        if next_id is not None:
-            # Add to existing selection
-            if current_input:
-                new_input = f"{current_input},{next_id}"
-            else:
-                new_input = str(next_id)
-            self.label_ids_input.setText(new_input)
-            self.update_status(f"Added next ID: {next_id}", "green")
-        else:
-            self.update_status(
-                "All available IDs are already selected", "orange"
-            )
-
-    def parse_label_ids(self, ids_string: str) -> list:
-        """Parse label IDs from string input using regex."""
-        ids = set()
-        pattern = (
-            r"(\d+)(?:-(\d+))?"  # Matches single IDs or ranges like "1-5"
-        )
-        matches = re.findall(pattern, ids_string)
-        if not ids_string.strip():
-            return ids
-
-        for start, end in matches:
-            if end:
-                # match a range
-                ids.update(range(int(start), int(end) + 1))
-            else:
-                # match a single ID
-                ids.add(int(start))
-
-        return sorted(ids)  # Remove duplicates and sort
-
-    def on_hide_others_toggled(self, checked: bool):
-        """Handle hide others checkbox toggle."""
-        self.other_opacity_slider.setEnabled(not checked)
-        if checked:
-            self.other_opacity_label.setText("0.00")
-        else:
-            self.other_opacity_label.setText(
-                f"{self.other_opacity_slider.value()/100:.2f}"
-            )
-
-    def generate_colormap(self):
-        """Generate a new random colormap."""
-        self.max_labels = self.max_labels_spin.value()
-        seed = self.seed_spin.value() / 100.0
-
-        # Generate colormap
-        colormap = self.generate_random_label_colormap(
-            self.max_labels,
-            background_value=self.background_value,
-            random_seed=seed,
-        )
-
-        # Convert to color dict
-        self.full_color_dict, self.background_value = (
-            self.colormap_to_color_dict(colormap)
-        )
-
-        self.update_status(
-            f"Generated colormap with {self.max_labels} colors", "green"
-        )
-
-    def apply_changes(self):
-        """Apply opacity changes to selected labels."""
-        if not self.current_layer:
-            self.update_status("No layer selected", "red")
-            return
-
-        # Parse label IDs
-        ids_string = self.label_ids_input.text()
-        valid_ids = self.parse_label_ids(ids_string)
-
-        if not valid_ids:
-            self.update_status("No valid label IDs provided", "red")
-            return
-
-        # Get opacity values
-        selected_opacity = self.selected_opacity_slider.value() / 100.0
-        other_opacity = (
-            0.0
-            if self.hide_others_checkbox.isChecked()
-            else self.other_opacity_slider.value() / 100.0
-        )
-
-        # Apply changes
-        filtered_color_dict = self.get_filtered_color_dict(
-            self.full_color_dict,
-            valid_ids,
-            selected_opacity=selected_opacity,
-            other_opacity=other_opacity,
-        )
-
-        # Create and apply new colormap
-        new_colormap = self.color_dict_to_color_map(
-            filtered_color_dict,
-            name=f"batch_managed_{len(valid_ids)}",
-            background_value=self.background_value,
-        )
-
-        self.current_layer.colormap = new_colormap
-
-        # Update info
-        info_text = f"Applied to {len(valid_ids)} labels: {valid_ids[:10]}"
-        if len(valid_ids) > 10:
-            info_text += f"... (and {len(valid_ids) - 10} more)"
-        info_text += f"\nSelected opacity: {selected_opacity:.2f}"
-        info_text += f"\nOther opacity: {other_opacity:.2f}"
-
-        self.info_text.setText(info_text)
-        self.update_status("Changes applied successfully", "green")
-
-        # Emit signal
-        self.colormap_changed.emit(new_colormap)
-
-    def update_status(self, message: str, color: str = "black"):
-        """Update status label."""
-        self.status_label.setText(message)
-        self.status_label.setStyleSheet(f"color: {color};")
-
-    # Core colormap functions
-    def generate_random_label_colormap(
-        self,
-        num_colors: int,
-        background_value: int = 0,
-        random_seed: float = 0.5,
-    ):
-        """Generate random label colormap."""
-        return cmap.label_colormap(num_colors, random_seed, background_value)
-
-    def colormap_to_color_dict(self, colormap):
-        """Convert colormap to color dictionary."""
-        color_dict = {
-            item_id + 1: tuple(color)
-            for item_id, color in enumerate(colormap.colors)
-        }
-        color_dict[None] = (0.0, 0.0, 0.0, 0.0)
-        background_value = (
-            colormap.background_value
-            if hasattr(colormap, "background_value")
-            else 0
-        )
-        return color_dict, background_value
-
-    def get_filtered_color_dict(
-        self,
-        full_color_dict,
-        valid_ids,
-        selected_opacity=1.0,
-        other_opacity=0.5,
-    ):
-        """Get filtered color dictionary with batch opacity management."""
-        filtered_color_dict = {}
-
-        for key, color in full_color_dict.items():
-            if key is None:
-                # Keep background unchanged
-                filtered_color_dict[key] = color
-            elif key in valid_ids:
-                # Apply selected opacity to valid IDs
-                filtered_color_dict[key] = (
-                    color[0],
-                    color[1],
-                    color[2],
-                    selected_opacity,
-                )
-            else:
-                # Apply other opacity to invalid IDs
-                filtered_color_dict[key] = (
-                    color[0],
-                    color[1],
-                    color[2],
-                    other_opacity,
-                )
-
-        return filtered_color_dict
-
-    def color_dict_to_color_map(
-        self, color_dict, name="custom", background_value=0
-    ):
-        """Convert color dictionary to colormap."""
-        direct_colormap = cmap.direct_colormap(color_dict)
-        direct_colormap.background_value = background_value
-        direct_colormap.name = name
-        return direct_colormap
-
-    def get_current_label_count(self) -> int:
-        """Get the count of unique non-zero labels in the current layer."""
-        if not self.current_layer or not hasattr(self.current_layer, "data"):
-            return 0
-
-        # Use cache to avoid expensive computation
-        layer_id = id(self.current_layer)
-        if layer_id in self._layer_stats_cache:
-            return self._layer_stats_cache[layer_id]["count"]
-
-        # For large arrays, use sampling for estimation
-        data = self._get_current_time_slice(self.current_layer.data)
-        # For large arrays, use sparse-aware sampling for estimation
-        if data.size > 10_000_000:  # 10M pixels
+    def _bind_keys(self) -> None:
+        bindings = (("Q", self._previous_key), ("W", self._next_key))
+        for key, callback in bindings:
             try:
-                # Step 1: Quick sparse check - find non-zero positions efficiently
-                non_zero_mask = data != 0
-                non_zero_count = np.count_nonzero(non_zero_mask)
-
-                # If very few non-zero elements, process them all (exact result)
-                if (
-                    non_zero_count < 100_000
-                ):  # Less than 100k non-zero elements
-                    non_zero_values = data[non_zero_mask]
-                    unique_labels = np.unique(non_zero_values)
-                    count = len(unique_labels)
-
-                    # Cache exact result for sparse arrays
-                    self._layer_stats_cache[layer_id] = {
-                        "count": count,
-                        "ids": unique_labels.tolist(),
-                        "is_estimate": False,  # This is exact for sparse arrays
-                        "sparsity": non_zero_count / data.size,
-                        "non_zero_count": non_zero_count,
-                        "data_shape": self.current_layer.data.shape,
-                    }
-                    return count
-                # For denser arrays, sample from non-zero positions only
-                return self._sample_from_non_zero_positions(
-                    data, non_zero_mask, layer_id
+                self.viewer.bind_key(key, callback)
+                self._keys_bound.append(key)
+            except ValueError:
+                self.update_status(
+                    f"Hotkey {key} is already assigned; button navigation remains available",
+                    "orange",
                 )
 
-            except MemoryError:
-                # Fallback to original block sampling if memory is insufficient
-                return self._estimate_label_count_sampling(data, layer_id)
-        # For smaller arrays, compute exactly
-        unique_labels = np.unique(data)
-        non_zero_labels = unique_labels[unique_labels != 0]
-        count = len(non_zero_labels)
+    def _unbind_keys(self) -> None:
+        for key in self._keys_bound:
+            with suppress(KeyError, ValueError):
+                self.viewer.bind_key(key, None, overwrite=True)
+        self._keys_bound.clear()
 
-        # Cache the result
-        self._layer_stats_cache[layer_id] = {
-            "count": count,
-            "ids": non_zero_labels.tolist(),
-        }
-        return count
+    def _refresh_label_layers(self, event=None) -> None:
+        del event
+        if self._closed:
+            return
+        current_name = (
+            self.current_layer.name if self.current_layer is not None else ""
+        )
+        names = [
+            layer.name
+            for layer in self.viewer.layers
+            if isinstance(layer, Labels)
+        ]
 
-    def get_current_label_ids(self) -> list:
-        """Get list of unique non-zero label IDs in the current layer."""
-        if not self.current_layer or not hasattr(self.current_layer, "data"):
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.clear()
+        if names:
+            self.layer_combo.addItems(names)
+            if current_name in names:
+                self.layer_combo.setCurrentText(current_name)
+            self.layer_combo.setEnabled(True)
+        else:
+            self.layer_combo.addItem("No Labels layers available")
+            self.layer_combo.setEnabled(False)
+        self.layer_combo.blockSignals(False)
+
+        target_name = self.layer_combo.currentText() if names else ""
+        if target_name != current_name or self.current_layer is None:
+            self._on_layer_changed(target_name)
+
+    def _on_layer_changed(self, layer_name: str) -> None:
+        if self.current_layer is not None and self.current_layer.name == layer_name:
+            return
+
+        self._detach_current_layer(restore=True)
+        self._remove_vector_layers()
+        if not layer_name or layer_name == "No Labels layers available":
+            self.current_layer = None
+            self._available_ids = []
+            self.checked_ids.clear()
+            self.active_id = None
+            self._rebuild_selection_items()
+            self._remove_vector_layers()
+            self.update_status("No Labels layer selected", "orange")
+            return
+
+        try:
+            layer = self.viewer.layers[layer_name]
+        except KeyError:
+            self.update_status("Labels layer no longer exists", "red")
+            return
+        if not isinstance(layer, Labels):
+            self.update_status("Selected layer is not a Labels layer", "red")
+            return
+
+        self.current_layer = layer
+        self._original_colormap = layer.colormap
+        self._original_opacity = float(layer.opacity)
+        self._base_colors.clear()
+        layer.events.data.connect(self._on_label_data_changed)
+        self.checked_ids.clear()
+        self.active_id = None
+        self._refresh_available_ids(select_first=True)
+        if self.roi_dataset is not None and layer.ndim in (3, 4):
+            self._ensure_vector_layers()
+        elif self.roi_dataset is not None:
+            self.update_status(
+                "ROI overlays require a (z,y,x) or (t,z,y,x) Labels layer",
+                "orange",
+            )
+        self._refresh_vector_layers()
+        self.update_status(f"Selected layer: {layer.name}", "blue")
+
+    def _detach_current_layer(self, *, restore: bool) -> None:
+        if self.current_layer is None:
+            return
+        with suppress(TypeError, ValueError):
+            self.current_layer.events.data.disconnect(
+                self._on_label_data_changed
+            )
+        if restore:
+            self._restore_layer_display()
+        self.current_layer = None
+        self._original_colormap = None
+        self._original_opacity = None
+        self._base_colors.clear()
+
+    def _on_layer_removed(self, event) -> None:
+        if self._closed:
+            return
+        removed = getattr(event, "value", None)
+        if (
+            isinstance(removed, Vectors)
+            and removed.metadata.get(ROLE_KEY) in MANAGED_VECTOR_ROLES
+        ):
+            return
+        if removed is self.current_layer:
+            self._detach_current_layer(restore=False)
+        self._refresh_label_layers()
+
+    def _on_label_data_changed(self, event=None) -> None:
+        del event
+        if self.roi_dataset is None:
+            self._refresh_available_ids(select_first=False)
+        else:
+            self._cache_base_colors(self._available_ids)
+            self._apply_label_opacity()
+        self._refresh_vector_layers()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        """Restore managed display state and disconnect all external events."""
+        if self._closed:
+            return
+        self._closed = True
+        self._disconnect_viewer_events()
+        self._unbind_keys()
+        self._detach_current_layer(restore=True)
+        self._remove_vector_layers()
+
+    # ------------------------------------------------------------------
+    # ID discovery, checkable selection, and navigation
+    # ------------------------------------------------------------------
+    def _refresh_available_ids(self, *, select_first: bool) -> None:
+        if self.roi_dataset is not None:
+            ids = self.roi_dataset.neuron_ids
+        else:
+            ids = self._exact_label_ids()
+        self._available_ids = ids
+
+        if self.active_id not in ids:
+            self.active_id = None
+        self.checked_ids.intersection_update(ids)
+
+        if select_first and ids and self.active_id is None:
+            valid = self._valid_navigation_ids()
+            self.active_id = valid[0] if valid else ids[0]
+            self.checked_ids = {self.active_id}
+
+        self._cache_base_colors(ids)
+        self._rebuild_selection_items()
+        self._apply_label_opacity()
+
+    def _exact_label_ids(self) -> list[int]:
+        if self.current_layer is None:
+            return []
+        data = self.current_layer.data
+        size = getattr(data, "size", None)
+        if not isinstance(data, np.ndarray) or size is None:
+            self.info_text.setText(
+                "Out-of-core Labels are not scanned automatically. "
+                "Load neuron_pt_tuple.npy for authoritative IDs."
+            )
+            return []
+        if int(size) > MAX_EXACT_LABEL_PIXELS:
+            self.info_text.setText(
+                f"Labels has {int(size):,} voxels. Automatic ID discovery "
+                "is disabled above 10,000,000 voxels; load ROI NPY."
+            )
             return []
 
-        # Use cache to avoid expensive computation
-        layer_id = id(self.current_layer)
-        if layer_id in self._layer_stats_cache:
-            return self._layer_stats_cache[layer_id]["ids"]
-
-        # For time-series data, only process current time slice
-        data = self._get_current_time_slice(self.current_layer.data)
-
-        # For large arrays, use sparse-aware sampling for estimation
-        if data.size > 10_000_000:  # 10M pixels
-            try:
-                # Step 1: Quick sparse check - find non-zero positions efficiently
-                non_zero_mask = data != 0
-                non_zero_count = np.count_nonzero(non_zero_mask)
-
-                # If very few non-zero elements, process them all (exact result)
-                if (
-                    non_zero_count < 100_000
-                ):  # Less than 100k non-zero elements
-                    non_zero_values = data[non_zero_mask]
-                    unique_labels = np.unique(non_zero_values)
-                    ids = sorted(unique_labels.tolist())
-
-                    # Cache exact result for sparse arrays
-                    self._layer_stats_cache[layer_id] = {
-                        "count": len(ids),
-                        "ids": ids,
-                        "is_estimate": False,  # This is exact for sparse arrays
-                        "sparsity": non_zero_count / data.size,
-                        "non_zero_count": non_zero_count,
-                        "data_shape": self.current_layer.data.shape,
-                    }
-                    return ids
-
-                # For denser arrays, sample from non-zero positions only
-                return self._sample_from_non_zero_positions(
-                    data, non_zero_mask, layer_id, return_ids=True
-                )
-
-            except MemoryError:
-                # Fallback to original block sampling if memory is insufficient
-                return self._estimate_label_ids_sampling(data, layer_id)
-
-        # For smaller arrays, compute exactly
-        unique_labels = np.unique(data)
-        non_zero_labels = unique_labels[unique_labels != 0]
-        ids = sorted(non_zero_labels.tolist())
-
-        # Cache the result
-        self._layer_stats_cache[layer_id] = {"count": len(ids), "ids": ids}
-        return ids
-
-    def _sample_from_non_zero_positions(
-        self,
-        data: np.ndarray,
-        non_zero_mask: np.ndarray,
-        layer_id: int,
-        return_ids: bool = False,
-    ):
-        """Sample from non-zero positions only for better efficiency."""
-        try:
-            # Get non-zero positions efficiently
-            non_zero_indices = np.where(non_zero_mask)
-            total_non_zero = len(non_zero_indices[0])
-
-            # Sample from non-zero positions
-            max_sample_size = min(
-                50_000, total_non_zero
-            )  # Sample at most 50k non-zero positions
-
-            if total_non_zero <= max_sample_size:
-                # Use all non-zero values if small enough
-                sampled_values = data[non_zero_mask]
-            else:
-                # Sample indices from non-zero positions
-                sample_step = max(1, total_non_zero // max_sample_size)
-                if data.ndim == 2:
-                    sampled_indices = (
-                        non_zero_indices[0][::sample_step][:max_sample_size],
-                        non_zero_indices[1][::sample_step][:max_sample_size],
-                    )
-                    sampled_values = data[sampled_indices]
-                elif data.ndim == 3:
-                    sampled_indices = (
-                        non_zero_indices[0][::sample_step][:max_sample_size],
-                        non_zero_indices[1][::sample_step][:max_sample_size],
-                        non_zero_indices[2][::sample_step][:max_sample_size],
-                    )
-                    sampled_values = data[sampled_indices]
-                else:
-                    # For higher dimensions, use flat indexing
-                    flat_indices = np.ravel_multi_index(
-                        non_zero_indices, data.shape
-                    )
-                    sampled_flat_indices = flat_indices[::sample_step][
-                        :max_sample_size
-                    ]
-                    sampled_values = data.flat[sampled_flat_indices]
-
-            # Get unique labels from sampled values
-            unique_labels = np.unique(sampled_values)
-
-            sparsity = total_non_zero / data.size
-
-            if return_ids:
-                ids = sorted(unique_labels.tolist())
-                self._layer_stats_cache[layer_id] = {
-                    "count": len(ids),
-                    "ids": ids,
-                    "is_estimate": total_non_zero > max_sample_size,
-                    "sparsity": sparsity,
-                    "non_zero_count": total_non_zero,
-                    "data_shape": self.current_layer.data.shape,
-                }
-                return ids
-            else:
-                count = len(unique_labels)
-                self._layer_stats_cache[layer_id] = {
-                    "count": count,
-                    "ids": unique_labels.tolist(),
-                    "is_estimate": total_non_zero > max_sample_size,
-                    "sparsity": sparsity,
-                    "non_zero_count": total_non_zero,
-                    "data_shape": self.current_layer.data.shape,
-                }
-                return count
-
-        except (MemoryError, ValueError):
-            # Fallback to original sampling method
-            if return_ids:
-                return self._estimate_label_ids_sampling(data, layer_id)
-            else:
-                return self._estimate_label_count_sampling(data, layer_id)
-
-    def update_layer_info(self):
-        """Update layer information display (now optimized for large datasets)."""
-        # This method is now handled by _delayed_update_layer_info
-        # to prevent blocking the UI thread
-        self._delayed_update_layer_info()
-
-    def set_all_current_ids(self):
-        """Set all current label IDs in the input field."""
-        if label_ids := self.get_current_label_ids():
-            ids_string = ",".join(map(str, label_ids))
-            self.label_ids_input.setText(ids_string)
-
-            layer_id = id(self.current_layer)
-            cache_info = self._layer_stats_cache.get(layer_id, {})
-            is_estimate = cache_info.get("is_estimate", False)
-            is_minimal = cache_info.get("minimal_sample", False)
-
-            if is_estimate:
-                if is_minimal:
-                    self.update_status(
-                        f"Set ~{len(label_ids)} label IDs (minimal sample - very large dataset)",
-                        "orange",
-                    )
-                else:
-                    original_shape = cache_info.get("data_shape", "unknown")
-                    self.update_status(
-                        f"Set ~{len(label_ids)} estimated label IDs (shape: {original_shape})",
-                        "orange",
-                    )
-            else:
-                self.update_status(
-                    f"Set {len(label_ids)} current label IDs,\n label IDs list is {label_ids}",
-                    "green",
-                )
-        else:
-            self.update_status("No labels found in current layer", "orange")
-
-    def _get_current_time_slice(self, data: np.ndarray) -> np.ndarray:
-        """Get the current time slice if this is a time-series dataset."""
-        if hasattr(self.current_layer, "current_step") and data.ndim >= 3:
-            # This is likely a time-series dataset
-            current_step = getattr(
-                self.current_layer, "current_step", [0] * (data.ndim - 2)
-            )
-            if (
-                isinstance(current_step, (list, tuple))
-                and len(current_step) > 0
-            ):
-                # Get the first dimension's current step (usually time)
-                time_idx = (
-                    current_step[0] if current_step[0] < data.shape[0] else 0
-                )
-                return data[time_idx]
-        return data
-
-    def _estimate_label_count_sampling(
-        self, data: np.ndarray, layer_id: int
-    ) -> int:
-        """Estimate label count using memory-efficient sampling for large arrays."""
-        # For time-series data, only process current time slice
-        data = self._get_current_time_slice(data)
-
-        # Use smaller sample size for extremely large arrays
-        max_sample_size = 500_000  # Reduced from 1M
-        sample_size = min(
-            max_sample_size, max(10_000, data.size // 100)
-        )  # At least 10k, at most 1% of data
-
-        try:
-            # Use memory-efficient block sampling instead of random indices
-            sample = self._block_sample_array(data, sample_size)
-
-            # Get unique labels in sample
-            unique_sample = np.unique(sample)
-            non_zero_sample = unique_sample[unique_sample != 0]
-            estimated_count = len(non_zero_sample)
-
-            # Cache the estimated result (mark as estimate)
-            self._layer_stats_cache[layer_id] = {
-                "count": estimated_count,
-                "ids": non_zero_sample.tolist(),
-                "is_estimate": True,
-                "data_shape": self.current_layer.data.shape,  # Store original shape
-            }
-            return estimated_count
-
-        except MemoryError:
-            # Fallback to even smaller sample
-            return self._minimal_sample_estimation(data, layer_id)
-
-    def _estimate_label_ids_sampling(
-        self, data: np.ndarray, layer_id: int
-    ) -> list:
-        """Estimate label IDs using memory-efficient sampling for large arrays."""
-        # For time-series data, only process current time slice
-        data = self._get_current_time_slice(data)
-
-        # Use smaller sample size for extremely large arrays
-        max_sample_size = 500_000  # Reduced from 1M
-        sample_size = min(
-            max_sample_size, max(10_000, data.size // 100)
-        )  # At least 10k, at most 1% of data
-
-        try:
-            # Use memory-efficient block sampling instead of random indices
-            sample = self._block_sample_array(data, sample_size)
-
-            # Get unique labels in sample
-            unique_sample = np.unique(sample)
-            non_zero_sample = unique_sample[unique_sample != 0]
-            ids = sorted(non_zero_sample.tolist())
-
-            # Cache the estimated result (mark as estimate)
-            self._layer_stats_cache[layer_id] = {
-                "count": len(ids),
-                "ids": ids,
-                "is_estimate": True,
-                "data_shape": self.current_layer.data.shape,  # Store original shape
-            }
-            return ids
-
-        except MemoryError:
-            # Fallback to even smaller sample
-            return self._minimal_sample_estimation(
-                data, layer_id, return_ids=True
-            )
-
-    def _block_sample_array(
-        self, data: np.ndarray, sample_size: int
-    ) -> np.ndarray:
-        """Memory-efficient block sampling without creating large index arrays."""
-        # Calculate step size for uniform sampling
-        total_size = data.size
-        step = max(1, total_size // sample_size)
-
-        # Use numpy's advanced indexing with calculated steps
-        if data.ndim == 1:
-            return data[::step][:sample_size]
-        elif data.ndim == 2:
-            h, w = data.shape
-            h_step = max(1, h // int(np.sqrt(sample_size)))
-            w_step = max(1, w // int(np.sqrt(sample_size)))
-            return data[::h_step, ::w_step].ravel()[:sample_size]
-        else:
-            # For higher dimensions, flatten and sample with step
-            flat_data = data.ravel()
-            return flat_data[::step][:sample_size]
-
-    def _minimal_sample_estimation(
-        self, data: np.ndarray, layer_id: int, return_ids: bool = False
-    ):
-        """Fallback method for extremely large arrays that cause memory errors."""
-        try:
-            # Use a very small sample size
-            sample_size = min(
-                50_000, data.size // 1000
-            )  # 0.1% of data or 50k max
-            sample = self._block_sample_array(data, sample_size)
-
-            unique_sample = np.unique(sample)
-            non_zero_sample = unique_sample[unique_sample != 0]
-
-            if return_ids:
-                ids = sorted(non_zero_sample.tolist())
-                self._layer_stats_cache[layer_id] = {
-                    "count": len(ids),
-                    "ids": ids,
-                    "is_estimate": True,
-                    "minimal_sample": True,
-                    "data_shape": self.current_layer.data.shape,
-                }
-                return ids
-            else:
-                count = len(non_zero_sample)
-                self._layer_stats_cache[layer_id] = {
-                    "count": count,
-                    "ids": non_zero_sample.tolist(),
-                    "is_estimate": True,
-                    "minimal_sample": True,
-                    "data_shape": self.current_layer.data.shape,
-                }
-                return count
-
-        except (MemoryError, ValueError, RuntimeError) as e:
-            # Ultimate fallback - return minimal info
-            self._layer_stats_cache[layer_id] = {
-                "count": 0,
-                "ids": [],
-                "is_estimate": True,
-                "error": str(e),
-                "data_shape": self.current_layer.data.shape,
-            }
-            return [] if return_ids else 0
-
-    def _delayed_update_layer_info(self):
-        """Update layer information in a delayed manner to avoid blocking UI."""
-        if not self.current_layer:
-            self.info_text.setText("No layer selected")
-            return
-
-        # Start background computation
-        self._compute_layer_info_async()
-
-    def _compute_layer_info_async(self):
-        """Compute layer information asynchronously."""
-
-        def compute_in_background():
-            try:
-                label_count = self.get_current_label_count()
-                layer_id = id(self.current_layer)
-                cache_info = self._layer_stats_cache.get(layer_id, {})
-                is_estimate = cache_info.get("is_estimate", False)
-                is_minimal = cache_info.get("minimal_sample", False)
-                data_shape = cache_info.get("data_shape", "unknown")
-                sparsity = cache_info.get("sparsity", None)
-                non_zero_count = cache_info.get("non_zero_count", None)
-
-                # Prepare info text
-                info_text = f"Current layer: {self.current_layer.name}\n"
-                info_text += f"Data shape: {data_shape}\n"
-
-                if sparsity is not None:
-                    info_text += f"Sparsity: {sparsity:.4f} ({non_zero_count:,} non-zero pixels)\n"
-
-                if is_estimate:
-                    if is_minimal:
-                        info_text += f"Estimated labels: ~{label_count} (minimal sample - extremely large dataset)\n"
-                    else:
-                        info_text += f"Estimated labels: ~{label_count} (sampled from non-zero positions)\n"
-                else:
-                    if (
-                        sparsity is not None and sparsity < 0.01
-                    ):  # Less than 1% non-zero
-                        info_text += f"Total labels: {label_count} (exact - sparse array)\n"
-                    else:
-                        info_text += f"Total labels: {label_count}\n"
-
-                # Add performance tip for time-series data
-                if (
-                    isinstance(data_shape, (tuple, list))
-                    and len(data_shape) >= 4
-                ):
-                    info_text += "Tip: Processing current time slice only for performance\n"
-
-                # Add sparsity optimization info
-                if (
-                    sparsity is not None and sparsity < 0.1
-                ):  # Less than 10% non-zero
-                    info_text += (
-                        "Optimization: Using sparse-aware processing\n"
-                    )
-
-                # Update UI in main thread
-                QTimer.singleShot(0, lambda: self.info_text.setText(info_text))
-
-            except (
-                MemoryError,
-                ValueError,
-                RuntimeError,
-                AttributeError,
-            ) as e:
-                error_msg = f"Error computing layer info: {str(e)}"
-                QTimer.singleShot(
-                    0, lambda: self.update_status(error_msg, "red")
-                )
-
-        # Run computation in background thread
-        thread = threading.Thread(target=compute_in_background, daemon=True)
-        thread.start()
-
-    def fill_annotation_range(self):
-        """Fill the annotation table with a range of label IDs."""
-        try:
-            start_num = int(self.annotation_start_input.text())
-            end_num = int(self.annotation_end_input.text())
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "Error",
-                "Please enter valid integers for start and end numbers.",
-            )
-            return
-
-        if start_num > end_num:
-            QMessageBox.warning(
-                self,
-                "Error",
-                "Start number cannot be greater than end number.",
-            )
-            return
-
-        num_rows = end_num - start_num + 1
-
-        # Get current selected rows
-        selected_ranges = self.annotation_table.selectedRanges()
-
-        if selected_ranges:
-            # Fill only selected rows
-            for r_range in selected_ranges:
-                # Adjust table size if needed
-                if r_range.bottomRow() >= self.annotation_table.rowCount():
-                    self.annotation_table.setRowCount(r_range.bottomRow() + 1)
-
-                for row_idx in range(
-                    r_range.topRow(), r_range.bottomRow() + 1
-                ):
-                    # Calculate label ID based on position in selection
-                    current_num = start_num + (row_idx - r_range.topRow())
-
-                    label_item = QTableWidgetItem(str(current_num))
-                    label_item.setTextAlignment(Qt.AlignCenter)
-                    self.annotation_table.setItem(row_idx, 0, label_item)
-
-                    # Keep existing data if any
-                    if self.annotation_table.item(row_idx, 1) is None:
-                        self.annotation_table.setItem(
-                            row_idx, 1, QTableWidgetItem("")
-                        )
-                    if self.annotation_table.item(row_idx, 2) is None:
-                        self.annotation_table.setItem(
-                            row_idx, 2, QTableWidgetItem("")
-                        )
-        else:
-            # Fill all rows
-            current_rows = self.annotation_table.rowCount()
-            # Save existing data
-            biological_data = []
-            annotation_data = []
-            for row in range(current_rows):
-                biological_item = self.annotation_table.item(row, 1)
-                annotation_item = self.annotation_table.item(row, 2)
-                biological_data.append(
-                    biological_item.text() if biological_item else ""
-                )
-                annotation_data.append(
-                    annotation_item.text() if annotation_item else ""
-                )
-
-            # Set new row count
-            self.annotation_table.setRowCount(num_rows)
-
-            for row_idx in range(num_rows):
-                current_num = start_num + row_idx
-                # Set digital (label ID)
-                digital_item = QTableWidgetItem(str(current_num))
-                digital_item.setTextAlignment(Qt.AlignCenter)
-                self.annotation_table.setItem(row_idx, 0, digital_item)
-
-                # Restore biological data if exists
-                if row_idx < len(biological_data):
-                    biological_item = QTableWidgetItem(
-                        biological_data[row_idx]
-                    )
-                    self.annotation_table.setItem(row_idx, 1, biological_item)
-                else:
-                    self.annotation_table.setItem(
-                        row_idx, 1, QTableWidgetItem("")
-                    )
-
-                # Restore annotation data if exists
-                if row_idx < len(annotation_data):
-                    annotation_item = QTableWidgetItem(
-                        annotation_data[row_idx]
-                    )
-                    self.annotation_table.setItem(row_idx, 2, annotation_item)
-                else:
-                    self.annotation_table.setItem(
-                        row_idx, 2, QTableWidgetItem("")
-                    )
-
-    def load_current_labels_to_annotation(self):
-        """Load current layer's label IDs into the annotation table."""
-        if not self.current_layer:
-            QMessageBox.warning(self, "Error", "No label layer selected.")
-            return
-
-        try:
-            # Get current label IDs
-            label_ids = self.get_current_label_ids()
-
-            if not label_ids:
-                QMessageBox.information(
-                    self, "Info", "No labels found in current layer."
-                )
-                return
-
-            # Remove background value (0) if present
-            if 0 in label_ids:
-                label_ids.remove(0)
-
-            # Save existing annotations
-            existing_annotations = {}
-            existing_biological = {}
-            for row in range(self.annotation_table.rowCount()):
-                digital_item = self.annotation_table.item(row, 0)
-                biological_item = self.annotation_table.item(row, 1)
-                annotation_item = self.annotation_table.item(row, 2)
-                if digital_item:
-                    try:
-                        label_id = int(digital_item.text())
-                        if biological_item:
-                            existing_biological[label_id] = (
-                                biological_item.text()
-                            )
-                        if annotation_item:
-                            existing_annotations[label_id] = (
-                                annotation_item.text()
-                            )
-                    except ValueError:
-                        continue
-
-            # Set table size and fill with label IDs
-            self.annotation_table.setRowCount(len(label_ids))
-
-            for row_idx, label_id in enumerate(sorted(label_ids)):
-                # Set digital (label ID)
-                digital_item = QTableWidgetItem(str(label_id - 1))
-                digital_item.setTextAlignment(Qt.AlignCenter)
-                self.annotation_table.setItem(row_idx, 0, digital_item)
-
-                # Set biological (keep existing if available)
-                biological_text = existing_biological.get(label_id, "")
-                biological_item = QTableWidgetItem(biological_text)
-                self.annotation_table.setItem(row_idx, 1, biological_item)
-
-                # Set annotation (keep existing if available)
-                annotation_text = existing_annotations.get(label_id, "")
-                annotation_item = QTableWidgetItem(annotation_text)
-                self.annotation_table.setItem(row_idx, 2, annotation_item)
-
-            self.update_status(
-                f"Loaded {len(label_ids)} labels from current layer", "green"
-            )
-
-        except (MemoryError, ValueError, RuntimeError, AttributeError) as e:
-            QMessageBox.critical(
-                self, "Error", f"Failed to load current labels:\n{str(e)}"
-            )
-
-    def save_annotation_to_excel(self):
-        """Save annotation table to Excel file with custom sheet name and append mode."""
-        if not EXCEL_AVAILABLE:
-            QMessageBox.critical(
-                self,
-                "Error",
-                "openpyxl library is not installed.\nPlease install it with: pip install openpyxl",
-            )
-            return
-
-        # Get file path from user
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Annotation to Excel",
-            "label_annotations.xlsx",
-            "Excel Files (*.xlsx);;All Files (*)",
+        unique_values = np.unique(data)
+        background = self._background_value()
+        return sorted(
+            int(value)
+            for value in unique_values
+            if int(value) != background
         )
 
-        if not file_path:
+    def _background_value(self) -> int:
+        colormap = (
+            self._original_colormap
+            if self._original_colormap is not None
+            else getattr(self.current_layer, "colormap", None)
+        )
+        return int(getattr(colormap, "background_value", 0))
+
+    def _label_value(self, display_id: int) -> int:
+        if self.roi_dataset is not None:
+            return neuron_id_to_label_value(display_id)
+        return int(display_id)
+
+    def _cache_base_colors(self, display_ids: list[int]) -> None:
+        if self.current_layer is None or self._original_colormap is None:
+            return
+        label_values = {self._label_value(item_id) for item_id in display_ids}
+        data = self.current_layer.data
+        size = getattr(data, "size", None)
+        if (
+            isinstance(data, np.ndarray)
+            and size is not None
+            and int(size) <= MAX_EXACT_LABEL_PIXELS
+        ):
+            background = self._background_value()
+            label_values.update(
+                int(value)
+                for value in np.unique(data)
+                if int(value) != background
+            )
+
+        managed_colormap = self.current_layer.colormap
+        if managed_colormap is not self._original_colormap:
+            self.current_layer.colormap = self._original_colormap
+        try:
+            for label_value in label_values:
+                if label_value in self._base_colors:
+                    continue
+                mapped = np.asarray(
+                    self.current_layer.get_color(label_value), dtype=float
+                ).reshape(-1)
+                if mapped.size != 4 or not np.all(np.isfinite(mapped)):
+                    raise ValueError(
+                        "Labels colormap returned an invalid RGBA value "
+                        f"for label {label_value}"
+                    )
+                self._base_colors[label_value] = tuple(mapped)
+        finally:
+            if managed_colormap is not self._original_colormap:
+                self.current_layer.colormap = managed_colormap
+
+    def _rebuild_selection_items(self) -> None:
+        self._ui_sync = True
+        try:
+            self.selection_tree.clear()
+            self._selection_items.clear()
+            for display_id in self._available_ids:
+                item = QTreeWidgetItem()
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemIsUserCheckable
+                    | Qt.ItemIsSelectable
+                    | Qt.ItemIsEnabled
+                )
+                item.setData(0, Qt.UserRole, display_id)
+                item.setCheckState(
+                    0,
+                    Qt.Checked
+                    if display_id in self.checked_ids
+                    else Qt.Unchecked,
+                )
+                self.selection_tree.addTopLevelItem(item)
+                self._selection_items[display_id] = item
+        finally:
+            self._ui_sync = False
+        self._refresh_selection_item_styles()
+
+    def _refresh_selection_item_styles(self) -> None:
+        names = self._annotation_names()
+        valid_ids = set(self._valid_navigation_ids())
+        self._ui_sync = True
+        try:
+            for display_id in self._available_ids:
+                self._style_selection_item(
+                    display_id,
+                    valid=display_id in valid_ids,
+                    biological_name=names.get(display_id, ""),
+                )
+            if self.active_id is None:
+                self.selection_tree.clearSelection()
+                self.selection_tree.setCurrentItem(None)
+            else:
+                item = self._selection_items.get(self.active_id)
+                if item is not None:
+                    self.selection_tree.setCurrentItem(item)
+                    self.selection_tree.scrollToItem(item)
+        finally:
+            self._ui_sync = False
+
+    def _style_selection_item(
+        self,
+        display_id: int,
+        *,
+        valid: bool | None = None,
+        biological_name: str = "",
+    ) -> None:
+        item = self._selection_items.get(display_id)
+        if item is None:
+            return
+        if valid is None:
+            valid = display_id in set(self._valid_navigation_ids())
+        if not biological_name:
+            biological_name = self._annotation_names().get(display_id, "")
+
+        prefix = "Neuron" if self.roi_dataset is not None else "Label"
+        text = f"{prefix} {display_id}"
+        if biological_name:
+            text += f" · {biological_name}"
+        if self.roi_dataset is not None and not valid:
+            text += " (missing)"
+        item.setText(1, text)
+        item.setCheckState(
+            0,
+            Qt.Checked if display_id in self.checked_ids else Qt.Unchecked,
+        )
+        font = item.font(1)
+        font.setBold(display_id == self.active_id)
+        item.setFont(1, font)
+        if valid:
+            rgba = self._display_color(display_id)
+            color = QColor.fromRgbF(*rgba[:3])
+        else:
+            color = QColor("#777777")
+        item.setForeground(1, QBrush(color))
+
+    def _display_color(self, display_id: int) -> np.ndarray:
+        label_value = self._label_value(display_id)
+        rgba = self._base_colors.get(label_value, (0.7, 0.7, 0.7, 1.0))
+        return np.asarray(rgba, dtype=float)
+
+    def _on_selection_item_changed(
+        self, item: QTreeWidgetItem, column: int
+    ) -> None:
+        if self._ui_sync or column != 0:
+            return
+        display_id = int(item.data(0, Qt.UserRole))
+        checked = item.checkState(0) == Qt.Checked
+        if checked:
+            self.checked_ids.add(display_id)
+            self.active_id = display_id
+        else:
+            self.checked_ids.discard(display_id)
+            if self.active_id == display_id:
+                self.active_id = None
+        self._selection_changed(locate=checked)
+
+    def _on_selection_item_clicked(
+        self, item: QTreeWidgetItem, column: int
+    ) -> None:
+        if self._ui_sync or column == 0:
+            return
+        display_id = int(item.data(0, Qt.UserRole))
+        self.activate_id(display_id, locate=True)
+
+    def activate_id(self, display_id: int, *, locate: bool = True) -> None:
+        """Check and activate one available identity."""
+        if display_id not in self._available_ids:
+            return
+        self.checked_ids.add(display_id)
+        self.active_id = display_id
+        self._selection_changed(locate=locate)
+
+    def check_all(self) -> None:
+        """Check every available identity without changing an existing active."""
+        self.checked_ids = set(self._available_ids)
+        locate = False
+        if self.active_id is None:
+            valid = self._valid_navigation_ids()
+            if valid:
+                self.active_id = valid[0]
+                locate = True
+        self._selection_changed(locate=locate)
+
+    def check_none(self) -> None:
+        """Clear both the checked collection and active identity."""
+        self.checked_ids.clear()
+        self.active_id = None
+        self._selection_changed(locate=False)
+
+    def _selection_changed(self, *, locate: bool) -> None:
+        self._refresh_selection_item_styles()
+        self._apply_label_opacity()
+        self._refresh_vector_layers()
+        self._sync_annotation_to_active()
+        if locate:
+            self._locate_active_box()
+        self._update_info()
+
+    def _valid_navigation_ids(self) -> list[int]:
+        if self.roi_dataset is None:
+            return list(self._available_ids)
+        return self.roi_dataset.valid_ids(self._viewer_time())
+
+    def navigate(self, step: int) -> None:
+        valid_ids = self._valid_navigation_ids()
+        if not valid_ids:
+            self.update_status("No valid neuron at the current volume", "orange")
+            return
+        if self.active_id not in valid_ids:
+            next_id = valid_ids[0] if step >= 0 else valid_ids[-1]
+        else:
+            index = valid_ids.index(self.active_id)
+            next_id = valid_ids[(index + step) % len(valid_ids)]
+        self.activate_id(next_id, locate=True)
+
+    def _previous_key(self, viewer=None) -> None:
+        del viewer
+        self.navigate(-1)
+
+    def _next_key(self, viewer=None) -> None:
+        del viewer
+        self.navigate(1)
+
+    # ------------------------------------------------------------------
+    # Labels appearance
+    # ------------------------------------------------------------------
+    def _on_opacity_changed(self, value=None) -> None:
+        del value
+        self.selected_opacity_label.setText(
+            f"{self.selected_opacity_slider.value() / 100:.2f}"
+        )
+        self.other_opacity_slider.setEnabled(
+            not self.hide_unchecked_checkbox.isChecked()
+        )
+        other = (
+            0.0
+            if self.hide_unchecked_checkbox.isChecked()
+            else self.other_opacity_slider.value() / 100
+        )
+        self.other_opacity_label.setText(f"{other:.2f}")
+        self._apply_label_opacity()
+
+    def _apply_label_opacity(self) -> None:
+        if (
+            self.current_layer is None
+            or self._original_colormap is None
+            or not self._available_ids
+        ):
             return
 
-        # Get sheet name from input field
-        sheet_name = self.sheet_name_input.text().strip()
-        if not sheet_name:
-            sheet_name = "Label Annotations"
+        selected_alpha = self.selected_opacity_slider.value() / 100
+        other_alpha = (
+            0.0
+            if self.hide_unchecked_checkbox.isChecked()
+            else self.other_opacity_slider.value() / 100
+        )
+        colors: dict[int | None, tuple[float, float, float, float]] = {
+            None: (0.0, 0.0, 0.0, 0.0)
+        }
+        for label_value, base in self._base_colors.items():
+            display_id = (
+                label_value - 1
+                if self.roi_dataset is not None
+                else label_value
+            )
+            rgba = list(base)
+            rgba[3] = (
+                selected_alpha
+                if display_id in self.checked_ids
+                else other_alpha
+            )
+            colors[label_value] = tuple(rgba)
+
+        direct = cmap.direct_colormap(colors)
+        direct.background_value = self._background_value()
+        direct.name = "neuron_roi_visibility"
+        self.current_layer.colormap = direct
+        self.current_layer.opacity = 1.0
+
+    def _restore_layer_display(self) -> None:
+        if self.current_layer is None:
+            return
+        if self._original_colormap is not None:
+            self.current_layer.colormap = self._original_colormap
+        if self._original_opacity is not None:
+            self.current_layer.opacity = self._original_opacity
+
+    # ------------------------------------------------------------------
+    # ROI loading and geometry layers
+    # ------------------------------------------------------------------
+    def load_roi_npy(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load neuron_pt_tuple",
+            "",
+            "NumPy arrays (*.npy);;All files (*)",
+        )
+        if not path:
+            return
 
         try:
-            # Check if file exists and load existing workbook or create new one
-            if os.path.exists(file_path):
-                wb = load_workbook(file_path)
-                # If sheet already exists, ask user if they want to overwrite
-                if sheet_name in wb.sheetnames:
+            self.load_roi_path(path)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Invalid ROI file", f"Could not load ROI data:\n{error}"
+            )
+            self.update_status("ROI load failed", "red")
+
+    def load_roi_path(self, path: str | Path) -> None:
+        """Load and activate a read-only ROI NPY without opening a dialog."""
+        if self.current_layer is None:
+            raise RuntimeError("Select a Labels layer before loading ROI data")
+        if self.current_layer.ndim not in (3, 4):
+            raise ValueError(
+                "ROI overlays require a (z,y,x) or (t,z,y,x) Labels layer"
+            )
+
+        dataset = NeuronBoxDataset.from_npy(
+            path,
+            z_divisor=self.z_divisor_spin.value(),
+            volume_start=self.volume_start_spin.value(),
+            volume_stride=self.volume_stride_spin.value(),
+        )
+        source_path = Path(path)
+
+        self.roi_dataset = dataset
+        self.roi_path_input.setText(str(source_path))
+        self.unload_roi_btn.setEnabled(True)
+        self._set_roi_config_enabled(False)
+        self.active_id = None
+        self.checked_ids.clear()
+        self._refresh_available_ids(select_first=True)
+        self._ensure_vector_layers()
+        self._refresh_vector_layers()
+        self._update_roi_info()
+        self.update_status(f"Loaded ROI: {source_path.name}", "green")
+
+    def unload_roi(self) -> None:
+        self.roi_dataset = None
+        self.roi_path_input.clear()
+        self.unload_roi_btn.setEnabled(False)
+        self._set_roi_config_enabled(True)
+        self._remove_vector_layers()
+        self.active_id = None
+        self.checked_ids.clear()
+        self.roi_info_label.setText("No ROI loaded; IDs come from Labels")
+        self._refresh_available_ids(select_first=True)
+        self.update_status("ROI unloaded", "green")
+
+    def _set_roi_config_enabled(self, enabled: bool) -> None:
+        self.z_divisor_spin.setEnabled(enabled)
+        self.volume_start_spin.setEnabled(enabled)
+        self.volume_stride_spin.setEnabled(enabled)
+        self.load_roi_btn.setEnabled(enabled)
+
+    def _update_roi_info(self) -> None:
+        if self.roi_dataset is None:
+            return
+        viewer_t = self._viewer_time()
+        source_t = self.roi_dataset.source_time(viewer_t)
+        valid = len(self.roi_dataset.valid_ids(viewer_t))
+        self.roi_info_label.setText(
+            f"T={self.roi_dataset.time_count}, "
+            f"N={self.roi_dataset.neuron_count}; "
+            f"viewer t={viewer_t} → source t={source_t}; "
+            f"{valid} valid boxes"
+        )
+
+    def _viewer_time(self) -> int:
+        if self.current_layer is None or self.current_layer.ndim == 3:
+            return 0
+        steps = self.viewer.dims.current_step
+        return int(steps[-4]) if len(steps) >= 4 else 0
+
+    def _viewer_z(self) -> int:
+        if self.current_layer is None:
+            return 0
+        steps = self.viewer.dims.current_step
+        if self.current_layer.ndim == 4 and len(steps) >= 4:
+            return int(steps[-3])
+        if len(steps) >= 3:
+            return int(steps[-3])
+        return 0
+
+    def _shape_zyx(self) -> tuple[int, int, int]:
+        if self.current_layer is None:
+            raise RuntimeError("No Labels layer selected")
+        shape = self.current_layer.data.shape
+        return tuple(int(value) for value in shape[-3:])
+
+    def _view_axes_supported(self) -> bool:
+        if self.current_layer is None:
+            return False
+        ndim = int(self.viewer.dims.ndim)
+        order = tuple(self.viewer.dims.order)
+        if self.viewer.dims.ndisplay == 2:
+            return order[-2:] == (ndim - 2, ndim - 1)
+        return order[-3:] == (ndim - 3, ndim - 2, ndim - 1)
+
+    def _on_dims_changed(self, event=None) -> None:
+        del event
+        if (
+            self.roi_dataset is not None
+            and self.current_layer is not None
+            and self.current_layer in self.viewer.layers
+        ):
+            self._update_roi_info()
+            self._refresh_selection_item_styles()
+            self._refresh_vector_layers()
+
+    def _ensure_vector_layers(self) -> None:
+        if (
+            self.current_layer is None
+            or self.roi_dataset is None
+            or self.current_layer.ndim not in (3, 4)
+        ):
+            return
+        ndim = self.current_layer.ndim
+        empty = np.empty((0, 2, ndim), dtype=float)
+        axis_labels = tuple(self.current_layer.axis_labels)
+
+        legacy_layer = self._managed_vector_layer(LEGACY_ROLE_ALL)
+        if legacy_layer is not None and legacy_layer in self.viewer.layers:
+            self.viewer.layers.remove(legacy_layer)
+
+        if self._managed_vector_layer(ROLE_SELECTED) is None:
+            self.viewer.add_vectors(
+                empty,
+                ndim=ndim,
+                name="Neuron boxes – selected",
+                vector_style="line",
+                edge_width=1.0,
+                edge_color="white",
+                opacity=0.25,
+                blending="translucent",
+                scale=tuple(self.current_layer.scale),
+                translate=tuple(self.current_layer.translate),
+                axis_labels=axis_labels,
+                metadata={ROLE_KEY: ROLE_SELECTED},
+            )
+        if self._managed_vector_layer(ROLE_ACTIVE) is None:
+            self.viewer.add_vectors(
+                empty,
+                ndim=ndim,
+                name="Neuron box – active",
+                vector_style="line",
+                edge_width=3.0,
+                edge_color="yellow",
+                opacity=1.0,
+                blending="translucent",
+                scale=tuple(self.current_layer.scale),
+                translate=tuple(self.current_layer.translate),
+                axis_labels=axis_labels,
+                metadata={ROLE_KEY: ROLE_ACTIVE},
+            )
+
+    def _managed_vector_layer(self, role: str) -> Vectors | None:
+        for layer in self.viewer.layers:
+            if (
+                isinstance(layer, Vectors)
+                and layer.metadata.get(ROLE_KEY) == role
+            ):
+                return layer
+        return None
+
+    def _remove_vector_layers(self) -> None:
+        managed = [
+            layer
+            for layer in self.viewer.layers
+            if isinstance(layer, Vectors)
+            and layer.metadata.get(ROLE_KEY) in MANAGED_VECTOR_ROLES
+        ]
+        for layer in managed:
+            if layer in self.viewer.layers:
+                self.viewer.layers.remove(layer)
+
+    def _refresh_vector_layers(self) -> None:
+        if (
+            self.roi_dataset is None
+            or self.current_layer is None
+            or self.current_layer.ndim not in (3, 4)
+        ):
+            return
+        selected_layer = self._managed_vector_layer(ROLE_SELECTED)
+        active_layer = self._managed_vector_layer(ROLE_ACTIVE)
+        if selected_layer is None or active_layer is None:
+            return
+
+        if not self._view_axes_supported():
+            self._set_vector_data(selected_layer, [], [])
+            self._set_vector_data(active_layer, [], [], active=True)
+            self.update_status(
+                "ROI overlays require spatial y/x axes in 2D or z/y/x axes in 3D",
+                "orange",
+            )
+            return
+
+        viewer_t = self._viewer_time()
+        z_index = self._viewer_z()
+        shape_zyx = self._shape_zyx()
+        selected_vectors: list[np.ndarray] = []
+        selected_neuron_ids: list[int] = []
+        active_vectors: list[np.ndarray] = []
+        active_ids: list[int] = []
+
+        for neuron_id in self.roi_dataset.valid_ids(viewer_t):
+            if (
+                neuron_id not in self.checked_ids
+                and neuron_id != self.active_id
+            ):
+                continue
+            box = self.roi_dataset.get_box(viewer_t, neuron_id)
+            if box is None:
+                continue
+            if self.viewer.dims.ndisplay == 2:
+                geometry = box_vectors_2d(
+                    box, z_index, shape_zyx=shape_zyx
+                )
+            else:
+                geometry = box_vectors_3d(box, shape_zyx=shape_zyx)
+            if self.current_layer.ndim == 4:
+                geometry = add_time_axis(geometry, viewer_t)
+            if len(geometry):
+                if neuron_id in self.checked_ids:
+                    selected_vectors.append(geometry)
+                    selected_neuron_ids.extend(
+                        [neuron_id] * len(geometry)
+                    )
+                if neuron_id == self.active_id:
+                    active_vectors.append(geometry)
+                    active_ids.extend([neuron_id] * len(geometry))
+
+        self._set_vector_data(
+            selected_layer, selected_vectors, selected_neuron_ids
+        )
+        self._set_vector_data(
+            active_layer, active_vectors, active_ids, active=True
+        )
+
+    def _set_vector_data(
+        self,
+        layer: Vectors,
+        vector_blocks: list[np.ndarray],
+        neuron_ids: list[int],
+        *,
+        active: bool = False,
+    ) -> None:
+        ndim = layer.ndim
+        data = (
+            np.concatenate(vector_blocks, axis=0)
+            if vector_blocks
+            else np.empty((0, 2, ndim), dtype=float)
+        )
+        layer.data = data
+        layer.features = {"neuron_id": np.asarray(neuron_ids, dtype=int)}
+        if active:
+            layer.edge_color = "yellow"
+        elif neuron_ids:
+            layer.edge_color = np.asarray(
+                [self._display_color(item_id) for item_id in neuron_ids]
+            )
+        else:
+            layer.edge_color = "white"
+
+    def _locate_active_box(self) -> None:
+        if (
+            self.roi_dataset is None
+            or self.current_layer is None
+            or self.active_id is None
+        ):
+            return
+        box = self.roi_dataset.get_box(self._viewer_time(), self.active_id)
+        if box is None:
+            self.update_status(
+                f"Neuron {self.active_id} is missing at this volume", "orange"
+            )
+            return
+
+        z, y, x = box.center_zyx
+        steps = list(self.viewer.dims.current_step)
+        if self.current_layer.ndim == 4 and len(steps) >= 4:
+            z_axis = len(steps) - 3
+        else:
+            z_axis = len(steps) - 3
+        z_size = self._shape_zyx()[0]
+        steps[z_axis] = int(np.clip(round(z), 0, z_size - 1))
+        self.viewer.dims.current_step = tuple(steps)
+
+        point = (
+            (self._viewer_time(), z, y, x)
+            if self.current_layer.ndim == 4
+            else (z, y, x)
+        )
+        world = self.current_layer.data_to_world(point)
+        self.viewer.camera.center = tuple(world[-3:])
+
+    # ------------------------------------------------------------------
+    # Annotation and Excel
+    # ------------------------------------------------------------------
+    def _annotation_names(self) -> dict[int, str]:
+        names: dict[int, str] = {}
+        for row in range(self.annotation_table.rowCount()):
+            digital = self.annotation_table.item(row, 0)
+            biological = self.annotation_table.item(row, 1)
+            if digital is None:
+                continue
+            try:
+                item_id = int(digital.text())
+            except ValueError:
+                continue
+            names[item_id] = biological.text() if biological is not None else ""
+        return names
+
+    def _annotation_rows(
+        self,
+    ) -> dict[int, tuple[str, str]]:
+        rows: dict[int, tuple[str, str]] = {}
+        for row in range(self.annotation_table.rowCount()):
+            digital = self.annotation_table.item(row, 0)
+            if digital is None:
+                continue
+            try:
+                item_id = int(digital.text())
+            except ValueError:
+                continue
+            biological = self.annotation_table.item(row, 1)
+            annotation = self.annotation_table.item(row, 2)
+            rows[item_id] = (
+                biological.text() if biological is not None else "",
+                annotation.text() if annotation is not None else "",
+            )
+        return rows
+
+    def _set_annotation_rows(
+        self,
+        rows: list[tuple[int, str, str]],
+    ) -> None:
+        self._ui_sync = True
+        self.annotation_table.blockSignals(True)
+        try:
+            self.annotation_table.setRowCount(len(rows))
+            for row, (item_id, biological, annotation) in enumerate(rows):
+                digital_item = QTableWidgetItem(str(item_id))
+                digital_item.setTextAlignment(Qt.AlignCenter)
+                self.annotation_table.setItem(row, 0, digital_item)
+                self.annotation_table.setItem(
+                    row, 1, QTableWidgetItem(biological)
+                )
+                self.annotation_table.setItem(
+                    row, 2, QTableWidgetItem(annotation)
+                )
+        finally:
+            self.annotation_table.blockSignals(False)
+            self._ui_sync = False
+        self._refresh_selection_item_styles()
+
+    def fill_annotation_range(self) -> None:
+        try:
+            start = int(self.annotation_start_input.text())
+            end = int(self.annotation_end_input.text())
+        except ValueError:
+            QMessageBox.warning(
+                self, "Invalid range", "Start and end must be integers."
+            )
+            return
+        if start > end:
+            QMessageBox.warning(
+                self, "Invalid range", "Start cannot be greater than end."
+            )
+            return
+        existing = self._annotation_rows()
+        rows = [
+            (item_id, *existing.get(item_id, ("", "")))
+            for item_id in range(start, end + 1)
+        ]
+        self._set_annotation_rows(rows)
+
+    def load_current_ids_to_annotation(self) -> None:
+        existing = self._annotation_rows()
+        rows = [
+            (item_id, *existing.get(item_id, ("", "")))
+            for item_id in self._available_ids
+        ]
+        self._set_annotation_rows(rows)
+        self.update_status(
+            f"Loaded {len(rows)} identities into annotation table", "green"
+        )
+
+    def _sync_annotation_to_active(self) -> None:
+        if self.active_id is None:
+            self._ui_sync = True
+            try:
+                self.annotation_table.clearSelection()
+            finally:
+                self._ui_sync = False
+            return
+        self._ui_sync = True
+        try:
+            for row in range(self.annotation_table.rowCount()):
+                item = self.annotation_table.item(row, 0)
+                if item is not None and item.text() == str(self.active_id):
+                    self.annotation_table.selectRow(row)
+                    self.annotation_table.scrollToItem(item)
+                    break
+        finally:
+            self._ui_sync = False
+
+    def _on_annotation_selection_changed(self) -> None:
+        if self._ui_sync:
+            return
+        rows = self.annotation_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        item = self.annotation_table.item(rows[0].row(), 0)
+        if item is None:
+            return
+        try:
+            item_id = int(item.text())
+        except ValueError:
+            return
+        if item_id not in self._available_ids:
+            return
+        self.activate_id(item_id, locate=True)
+
+    def _on_annotation_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._ui_sync:
+            return
+        if item.column() in (0, 1):
+            self._refresh_selection_item_styles()
+
+    def save_annotation_to_excel(self) -> None:
+        if not EXCEL_AVAILABLE:
+            QMessageBox.critical(
+                self, "Excel unavailable", "Install the 'excel' extra first."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save neuron annotations",
+            "neuron_annotations.xlsx",
+            "Excel workbooks (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        sheet_name = self.sheet_name_input.text().strip() or "Neuron Annotations"
+
+        try:
+            if Path(path).exists():
+                workbook = load_workbook(path)
+                if sheet_name in workbook.sheetnames:
                     reply = QMessageBox.question(
                         self,
-                        "Sheet Exists",
-                        f"Sheet '{sheet_name}' already exists. Do you want to overwrite it?",
+                        "Sheet exists",
+                        f"Overwrite sheet '{sheet_name}'?",
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.No,
                     )
-                    if reply == QMessageBox.Yes:
-                        # Remove existing sheet
-                        wb.remove(wb[sheet_name])
-                    else:
+                    if reply != QMessageBox.Yes:
+                        workbook.close()
                         return
-
-                # Create new sheet
-                ws = wb.create_sheet(title=sheet_name)
+                    workbook.remove(workbook[sheet_name])
+                sheet = workbook.create_sheet(sheet_name)
             else:
-                wb = Workbook()
-                ws = wb.active
-                ws.title = sheet_name
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = sheet_name
 
-            # Write headers
-            ws.append(["digital", "biological", "annotation"])
-
-            # Set header alignment
-            for col_idx in range(1, ws.max_column + 1):
-                ws.cell(row=1, column=col_idx).alignment = Alignment(
+            sheet.append(["digital", "biological", "annotation"])
+            for cell in sheet[1]:
+                cell.alignment = Alignment(
                     horizontal="center", vertical="center"
                 )
-
-            # Write data
-            for row in range(self.annotation_table.rowCount()):
-                digital_item = self.annotation_table.item(row, 0)
-                biological_item = self.annotation_table.item(row, 1)
-                annotation_item = self.annotation_table.item(row, 2)
-
-                # Convert digital value from string to number
-                digital_value = digital_item.text() if digital_item else ""
-                try:
-                    # Try to convert to integer first, then float if that fails
-                    if digital_value.strip():
-                        if "." in digital_value:
-                            digital_value = float(digital_value)
-                        else:
-                            digital_value = int(digital_value)
-                    else:
-                        digital_value = ""
-                except (ValueError, AttributeError):
-                    # Keep as string if conversion fails
-                    pass
-
-                biological_value = (
-                    biological_item.text() if biological_item else ""
+            for item_id, (biological, annotation) in self._annotation_rows().items():
+                sheet.append([item_id, biological, annotation])
+            for column in sheet.columns:
+                width = max(
+                    (len(str(cell.value)) for cell in column if cell.value is not None),
+                    default=0,
                 )
-                annotation_value = (
-                    annotation_item.text() if annotation_item else ""
+                sheet.column_dimensions[column[0].column_letter].width = (
+                    width + 2
                 )
-
-                ws.append([digital_value, biological_value, annotation_value])
-
-            # Adjust column widths
-            for col in ws.columns:
-                max_length = 0
-                column = col[0].column_letter
-                for cell in col:
-                    try:
-                        if cell.value is not None:
-                            cell_length = len(str(cell.value))
-                            if cell_length > max_length:
-                                max_length = cell_length
-                    except (AttributeError, TypeError, ValueError):
-                        pass
-                adjusted_width = (max_length + 2) * 1.2
-                ws.column_dimensions[column].width = adjusted_width
-
-            wb.save(file_path)
-            QMessageBox.information(
-                self,
-                "Success",
-                f"Annotations saved to sheet '{sheet_name}' in:\n{file_path}",
-            )
-            self.update_status(
-                f"Annotations saved to Excel sheet '{sheet_name}'", "green"
-            )
-
-        except (OSError, PermissionError, ValueError) as e:
+            workbook.save(path)
+            workbook.close()
+        except (OSError, PermissionError, ValueError) as error:
             QMessageBox.critical(
-                self, "Error", f"Failed to save Excel file:\n{str(e)}"
+                self, "Save failed", f"Could not save workbook:\n{error}"
             )
-            self.update_status("Failed to save annotations", "red")
+            self.update_status("Annotation save failed", "red")
+            return
+        self.update_status(f"Saved annotations to {sheet_name}", "green")
 
-    def load_excel_to_annotation(self):
-        """Load Excel file and populate annotation table using specified sheet name."""
+    def load_excel_to_annotation(self) -> None:
         if not EXCEL_AVAILABLE:
             QMessageBox.critical(
-                self,
-                "Error",
-                "openpyxl and pandas libraries are not installed.\nPlease install them with: pip install openpyxl pandas",
+                self, "Excel unavailable", "Install the 'excel' extra first."
             )
             return
-
-        # Get file path from user
-        file_path, _ = QFileDialog.getOpenFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "Load Excel File",
+            "Load neuron annotations",
             "",
-            "Excel Files (*.xlsx *.xls);;All Files (*)",
+            "Excel workbooks (*.xlsx)",
         )
-
-        if not file_path:
+        if not path:
             return
-
-        # Get sheet name from input field
-        sheet_name = self.sheet_name_input.text().strip()
-        if not sheet_name:
-            sheet_name = "Label Annotations"
+        requested = self.sheet_name_input.text().strip()
 
         try:
-            # Check available sheets in the Excel file
-            wb = load_workbook(file_path, read_only=True)
-            available_sheets = wb.sheetnames
-            wb.close()
-
-            # Determine which sheet to read
-            sheet_to_read = None
-            if sheet_name in available_sheets:
-                sheet_to_read = sheet_name
+            workbook = load_workbook(path, read_only=True, data_only=True)
+            if requested and requested in workbook.sheetnames:
+                sheet = workbook[requested]
             else:
-                # If specified sheet doesn't exist, use the first sheet
-                if available_sheets:
-                    sheet_to_read = available_sheets[0]
-                    QMessageBox.information(
-                        self,
-                        "Sheet Not Found",
-                        f"Sheet '{sheet_name}' not found. Using first sheet '{sheet_to_read}' instead.",
-                    )
-                else:
-                    QMessageBox.warning(
-                        self, "Warning", "No sheets found in the Excel file."
-                    )
-                    return
+                sheet = workbook[workbook.sheetnames[0]]
+                self.sheet_name_input.setText(sheet.title)
 
-            # Read Excel file using pandas with specific sheet
-            df = pd.read_excel(
-                file_path, sheet_name=sheet_to_read, header=None
-            )
-
-            if df.empty:
-                QMessageBox.warning(
-                    self, "Warning", f"The sheet '{sheet_to_read}' is empty."
+            rows: list[tuple[int, str, str]] = []
+            for values in sheet.iter_rows(values_only=True):
+                if not values or values[0] is None:
+                    continue
+                try:
+                    numeric_id = float(values[0])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    not np.isfinite(numeric_id)
+                    or not numeric_id.is_integer()
+                    or numeric_id < 0
+                ):
+                    continue
+                item_id = int(numeric_id)
+                biological = (
+                    "" if len(values) < 2 or values[1] is None else str(values[1])
                 )
-                return
-
-            # Find the first column with numeric data (ignoring headers)
-            numeric_col_idx = None
-            start_row = 0
-
-            # Look for the first row that contains numeric data in any column
-            for row_idx in range(len(df)):
-                for col_idx in range(len(df.columns)):
-                    cell_value = df.iloc[row_idx, col_idx]
-                    if pd.notna(cell_value):
-                        try:
-                            # Try to convert to number
-                            float(str(cell_value))
-                            numeric_col_idx = col_idx
-                            start_row = row_idx
-                            break
-                        except (ValueError, TypeError):
-                            continue
-                if numeric_col_idx is not None:
-                    break
-
-            if numeric_col_idx is None:
-                QMessageBox.warning(
-                    self,
-                    "Warning",
-                    f"No numeric data found in sheet '{sheet_to_read}'.",
+                annotation = (
+                    "" if len(values) < 3 or values[2] is None else str(values[2])
                 )
-                return
-
-            # Extract data from the identified starting row
-            data_rows = []
-            for row_idx in range(start_row, len(df)):
-                # Get the numeric value from the identified column
-                cell_value = df.iloc[row_idx, numeric_col_idx]
-                if pd.notna(cell_value):
-                    try:
-                        num_value = int(float(str(cell_value)))
-
-                        # Get data from the next two columns (biological and annotation)
-                        biological_value = ""
-                        annotation_value = ""
-
-                        # Try to get biological value from next column
-                        if numeric_col_idx + 1 < len(df.columns):
-                            bio_cell = df.iloc[row_idx, numeric_col_idx + 1]
-                            if pd.notna(bio_cell):
-                                biological_value = str(bio_cell).strip()
-
-                        # Try to get annotation value from column after that
-                        if numeric_col_idx + 2 < len(df.columns):
-                            ann_cell = df.iloc[row_idx, numeric_col_idx + 2]
-                            if pd.notna(ann_cell):
-                                annotation_value = str(ann_cell).strip()
-
-                        data_rows.append(
-                            (num_value, biological_value, annotation_value)
-                        )
-                    except (ValueError, TypeError):
-                        continue
-
-            if not data_rows:
-                QMessageBox.warning(
-                    self,
-                    "Warning",
-                    f"No valid data rows found in sheet '{sheet_to_read}'.",
-                )
-                return
-
-            # Set table size based on the number of data entries
-            self.annotation_table.setRowCount(len(data_rows))
-
-            # Fill the three columns with data from Excel
-            for row_idx, (
-                digital_value,
-                biological_value,
-                annotation_value,
-            ) in enumerate(data_rows):
-                # Column 0: digital (the numeric value from Excel)
-                digital_item = QTableWidgetItem(str(digital_value))
-                digital_item.setTextAlignment(Qt.AlignCenter)
-                self.annotation_table.setItem(row_idx, 0, digital_item)
-
-                # Column 1: biological (from Excel file)
-                biological_item = QTableWidgetItem(biological_value)
-                self.annotation_table.setItem(row_idx, 1, biological_item)
-
-                # Column 2: annotation (from Excel file)
-                annotation_item = QTableWidgetItem(annotation_value)
-                self.annotation_table.setItem(row_idx, 2, annotation_item)
-
-            self.update_status(
-                f"Loaded {len(data_rows)} entries from sheet '{sheet_to_read}'",
-                "green",
-            )
-
-            QMessageBox.information(
-                self,
-                "Success",
-                f"Successfully loaded {len(data_rows)} entries from sheet '{sheet_to_read}'.\n"
-                f"Found data starting from row {start_row + 1}, column {numeric_col_idx + 1}.\n"
-                f"Loaded digital, biological, and annotation data from 3 columns.",
-            )
-
-        except ValueError as e:
+                rows.append((item_id, biological, annotation))
+            workbook.close()
+        except (OSError, PermissionError, ValueError) as error:
             QMessageBox.critical(
-                self, "Error", f"Failed to load Excel file:\n{str(e)}"
+                self, "Load failed", f"Could not load workbook:\n{error}"
             )
-            self.update_status("Failed to load Excel file", "red")
+            self.update_status("Annotation load failed", "red")
+            return
+
+        self._set_annotation_rows(rows)
+        self.update_status(f"Loaded {len(rows)} annotations", "green")
+
+    # ------------------------------------------------------------------
+    # Status helpers
+    # ------------------------------------------------------------------
+    def _update_info(self) -> None:
+        mode = "ROI" if self.roi_dataset is not None else "Labels"
+        checked = sorted(self.checked_ids)
+        text = (
+            f"Mode: {mode}\n"
+            f"Active: {self.active_id if self.active_id is not None else 'none'}\n"
+            f"Checked: {checked[:12]}"
+        )
+        if len(checked) > 12:
+            text += f" … (+{len(checked) - 12})"
+        self.info_text.setText(text)
+
+    def update_status(self, message: str, color: str = "black") -> None:
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(f"color: {color};")
