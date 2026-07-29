@@ -55,6 +55,7 @@ def main() -> None:
     if widget.active_id is not None:
         widget.activate_id(widget.active_id, locate=True)
 
+    viewer.window.show()
     napari.run()
 
 
