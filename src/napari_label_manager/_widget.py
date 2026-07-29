@@ -7,7 +7,7 @@ from pathlib import Path
 
 import napari
 import numpy as np
-from napari.layers import Labels, Vectors
+from napari.layers import Image, Labels, Vectors
 from napari.utils import colormaps as cmap
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont
@@ -17,6 +17,7 @@ from qtpy.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -24,6 +25,7 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTableWidget,
@@ -42,6 +44,16 @@ from ._roi import (
     box_vectors_3d,
     neuron_id_to_label_value,
 )
+from ._z_layers import (
+    ZLayerRange,
+    build_z_layer_ranges,
+    find_z_layer,
+    parse_z_cuts,
+    shifted_z_translation,
+    slice_z_range,
+    z_threshold_count_profile,
+)
+from ._z_profile import ZThresholdProfileWidget
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -57,7 +69,19 @@ ROLE_SELECTED = "roi_boxes_selected"
 LEGACY_ROLE_ALL = "roi_boxes_all"
 ROLE_ACTIVE = "roi_box_active"
 MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
+ROLE_Z_IMAGE = "z_layer_image"
+ROLE_Z_LABELS = "z_layer_labels"
+MANAGED_Z_ROLES = (ROLE_Z_IMAGE, ROLE_Z_LABELS)
 MAX_EXACT_LABEL_PIXELS = 10_000_000
+Z_SOURCE_GEOMETRY_EVENTS = (
+    "scale",
+    "translate",
+    "rotate",
+    "shear",
+    "affine",
+    "axis_labels",
+    "units",
+)
 
 
 class LabelManager(QWidget):
@@ -78,18 +102,39 @@ class LabelManager(QWidget):
         self._ui_sync = False
         self._closed = False
         self._keys_bound: list[str] = []
+        self._z_ranges: tuple[ZLayerRange, ...] = ()
+        self._z_source_image: Image | None = None
+        self._z_image_layers: list[Image] = []
+        self._z_labels_proxy: Labels | None = None
+        self._z_active_index: int | None = None
+        self._z_source_image_visible: bool | None = None
+        self._z_source_labels_visible: bool | None = None
+        self._z_source_labels_data = None
+        self._z_cleanup = False
+        self._z_session_token = f"{id(self):x}"
+        self._z_profile_source: Image | None = None
+        self._z_profile_time: int | None = None
 
         self._setup_ui()
         self._connect_viewer_events()
         self._bind_keys()
         self._refresh_label_layers()
+        self._refresh_image_layers()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _setup_ui(self) -> None:
-        layout = QVBoxLayout()
-        self.setMinimumWidth(430)
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.setMinimumWidth(320)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_content = QWidget()
+        layout = QVBoxLayout(self.scroll_content)
 
         header = QLabel("Neuron ROI Navigator")
         header.setFont(QFont("Arial", 12, QFont.Bold))
@@ -98,11 +143,15 @@ class LabelManager(QWidget):
 
         self.labels_layer_group = self._build_layer_group()
         layout.addWidget(self.labels_layer_group)
+        layout.addWidget(self._build_z_layer_group())
         layout.addWidget(self._build_roi_group())
         layout.addWidget(self._build_selection_group())
         layout.addWidget(self._build_annotation_group())
         layout.addWidget(self._build_status_group())
-        self.setLayout(layout)
+        layout.addStretch(1)
+        self.scroll_area.setWidget(self.scroll_content)
+        outer_layout.addWidget(self.scroll_area)
+        self.setLayout(outer_layout)
 
     def _build_layer_group(self) -> QGroupBox:
         group = QGroupBox("Labels Layer")
@@ -112,6 +161,85 @@ class LabelManager(QWidget):
         group_layout.addWidget(QLabel("Controlled layer:"))
         group_layout.addWidget(self.layer_combo)
         self._add_labels_appearance_controls(group_layout)
+        group.setLayout(group_layout)
+        return group
+
+    def _build_z_layer_group(self) -> QGroupBox:
+        group = QGroupBox("Z Layers")
+        group_layout = QVBoxLayout()
+
+        image_layout = QHBoxLayout()
+        image_layout.addWidget(QLabel("Image:"))
+        self.z_image_combo = QComboBox()
+        self.z_image_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.z_image_combo.setMinimumContentsLength(10)
+        self.z_image_combo.currentIndexChanged.connect(
+            self._on_z_image_changed
+        )
+        image_layout.addWidget(self.z_image_combo, 1)
+        group_layout.addLayout(image_layout)
+
+        cuts_layout = QHBoxLayout()
+        cuts_layout.addWidget(QLabel("Cuts:"))
+        self.z_cuts_input = QLineEdit()
+        self.z_cuts_input.setPlaceholderText("4,10")
+        self.z_cuts_input.setToolTip(
+            "Z cuts define half-open ranges [start, stop); "
+            "a boundary slice belongs to the following layer."
+        )
+        self.z_cuts_input.textChanged.connect(self._sync_z_profile_cuts)
+        cuts_layout.addWidget(self.z_cuts_input, 1)
+        self.split_z_btn = QPushButton("Split")
+        self.split_z_btn.clicked.connect(self.split_z_layers)
+        cuts_layout.addWidget(self.split_z_btn)
+        group_layout.addLayout(cuts_layout)
+
+        profile_header = QHBoxLayout()
+        self.z_profile_label = QLabel("Pixels >")
+        profile_header.addWidget(self.z_profile_label)
+        self.z_profile_threshold_spin = QDoubleSpinBox()
+        self.z_profile_threshold_spin.setRange(-1_000_000_000, 1_000_000_000)
+        self.z_profile_threshold_spin.setDecimals(3)
+        self.z_profile_threshold_spin.setValue(170)
+        self.z_profile_threshold_spin.setKeyboardTracking(False)
+        self.z_profile_threshold_spin.setToolTip(
+            "Count pixels with intensity strictly greater than this threshold."
+        )
+        self.z_profile_threshold_spin.valueChanged.connect(
+            self.refresh_z_profile
+        )
+        profile_header.addWidget(self.z_profile_threshold_spin)
+        self.z_profile_state_label = QLabel("")
+        profile_header.addWidget(self.z_profile_state_label)
+        profile_header.addStretch(1)
+        self.z_profile_refresh_btn = QPushButton("Refresh")
+        self.z_profile_refresh_btn.clicked.connect(self.refresh_z_profile)
+        profile_header.addWidget(self.z_profile_refresh_btn)
+        group_layout.addLayout(profile_header)
+        self.z_profile = ZThresholdProfileWidget()
+        self.z_profile.cutToggled.connect(self._toggle_z_profile_cut)
+        group_layout.addWidget(self.z_profile)
+
+        view_layout = QHBoxLayout()
+        view_layout.addWidget(QLabel("Show:"))
+        self.z_view_combo = QComboBox()
+        self.z_view_combo.addItem("All", None)
+        self.z_view_combo.setEnabled(False)
+        self.z_view_combo.currentIndexChanged.connect(self._on_z_view_changed)
+        view_layout.addWidget(self.z_view_combo, 1)
+        self.clear_z_btn = QPushButton("Clear")
+        self.clear_z_btn.setEnabled(False)
+        self.clear_z_btn.clicked.connect(self.clear_z_layers)
+        view_layout.addWidget(self.clear_z_btn)
+        group_layout.addLayout(view_layout)
+
+        description = QLabel("Split image by z; sync Labels and boxes.")
+        description.setToolTip(
+            "Neuron boxes are assigned to one layer by center Z."
+        )
+        group_layout.addWidget(description)
         group.setLayout(group_layout)
         return group
 
@@ -133,24 +261,25 @@ class LabelManager(QWidget):
         path_layout.addWidget(self.unload_roi_btn)
         group_layout.addLayout(path_layout)
 
-        config_layout = QHBoxLayout()
-        config_layout.addWidget(QLabel("Z divisor:"))
+        config_layout = QGridLayout()
+        config_layout.addWidget(QLabel("Z divisor:"), 0, 0)
         self.z_divisor_spin = QDoubleSpinBox()
         self.z_divisor_spin.setDecimals(3)
         self.z_divisor_spin.setRange(0.001, 1_000_000)
         self.z_divisor_spin.setValue(5.0)
-        config_layout.addWidget(self.z_divisor_spin)
+        config_layout.addWidget(self.z_divisor_spin, 0, 1)
 
-        config_layout.addWidget(QLabel("Volume start:"))
+        config_layout.addWidget(QLabel("Volume start:"), 1, 0)
         self.volume_start_spin = QSpinBox()
         self.volume_start_spin.setRange(0, 1_000_000)
-        config_layout.addWidget(self.volume_start_spin)
+        config_layout.addWidget(self.volume_start_spin, 1, 1)
 
-        config_layout.addWidget(QLabel("Stride:"))
+        config_layout.addWidget(QLabel("Stride:"), 2, 0)
         self.volume_stride_spin = QSpinBox()
         self.volume_stride_spin.setRange(1, 1_000_000)
         self.volume_stride_spin.setValue(1)
-        config_layout.addWidget(self.volume_stride_spin)
+        config_layout.addWidget(self.volume_stride_spin, 2, 1)
+        config_layout.setColumnStretch(1, 1)
         group_layout.addLayout(config_layout)
 
         self.roi_info_label = QLabel("No ROI loaded; IDs come from Labels")
@@ -230,9 +359,7 @@ class LabelManager(QWidget):
 
         controls_layout = QHBoxLayout()
         self.hide_unchecked_checkbox = QCheckBox("Hide unchecked labels")
-        self.hide_unchecked_checkbox.toggled.connect(
-            self._on_opacity_changed
-        )
+        self.hide_unchecked_checkbox.toggled.connect(self._on_opacity_changed)
         controls_layout.addWidget(self.hide_unchecked_checkbox)
         controls_layout.addStretch(1)
         group_layout.addLayout(controls_layout)
@@ -240,25 +367,14 @@ class LabelManager(QWidget):
     def _build_annotation_group(self) -> QGroupBox:
         group = QGroupBox("Neuron Annotation")
         group_layout = QVBoxLayout()
-        controls = QHBoxLayout()
+        sheet_layout = QHBoxLayout()
 
-        controls.addWidget(QLabel("Sheet:"))
+        sheet_layout.addWidget(QLabel("Sheet:"))
         self.sheet_name_input = QLineEdit("Neuron Annotations")
-        self.sheet_name_input.setFixedWidth(130)
-        controls.addWidget(self.sheet_name_input)
+        sheet_layout.addWidget(self.sheet_name_input, 1)
+        group_layout.addLayout(sheet_layout)
 
-        controls.addWidget(QLabel("Start:"))
-        self.annotation_start_input = QLineEdit("0")
-        self.annotation_start_input.setFixedWidth(45)
-        controls.addWidget(self.annotation_start_input)
-        controls.addWidget(QLabel("End:"))
-        self.annotation_end_input = QLineEdit("9")
-        self.annotation_end_input.setFixedWidth(45)
-        controls.addWidget(self.annotation_end_input)
-
-        self.fill_annotation_btn = QPushButton("Fill")
-        self.fill_annotation_btn.clicked.connect(self.fill_annotation_range)
-        controls.addWidget(self.fill_annotation_btn)
+        controls = QHBoxLayout()
         self.load_current_labels_btn = QPushButton("Current IDs")
         self.load_current_labels_btn.clicked.connect(
             self.load_current_ids_to_annotation
@@ -323,10 +439,13 @@ class LabelManager(QWidget):
     def _connect_viewer_events(self) -> None:
         events = self.viewer.layers.events
         events.inserted.connect(self._refresh_label_layers)
+        events.inserted.connect(self._refresh_image_layers)
         events.removed.connect(self._on_layer_removed)
         events.reordered.connect(self._refresh_label_layers)
+        events.reordered.connect(self._refresh_image_layers)
         if hasattr(events, "renamed"):
             events.renamed.connect(self._refresh_label_layers)
+            events.renamed.connect(self._refresh_image_layers)
 
         dims_events = self.viewer.dims.events
         dims_events.point.connect(self._on_dims_changed)
@@ -337,14 +456,18 @@ class LabelManager(QWidget):
         events = self.viewer.layers.events
         for emitter, callback in (
             (events.inserted, self._refresh_label_layers),
+            (events.inserted, self._refresh_image_layers),
             (events.removed, self._on_layer_removed),
             (events.reordered, self._refresh_label_layers),
+            (events.reordered, self._refresh_image_layers),
         ):
             with suppress(TypeError, ValueError):
                 emitter.disconnect(callback)
         if hasattr(events, "renamed"):
             with suppress(TypeError, ValueError):
                 events.renamed.disconnect(self._refresh_label_layers)
+            with suppress(TypeError, ValueError):
+                events.renamed.disconnect(self._refresh_image_layers)
 
         dims_events = self.viewer.dims.events
         for emitter in (
@@ -384,6 +507,7 @@ class LabelManager(QWidget):
             layer.name
             for layer in self.viewer.layers
             if isinstance(layer, Labels)
+            and layer.metadata.get(ROLE_KEY) != ROLE_Z_LABELS
         ]
 
         self.layer_combo.blockSignals(True)
@@ -402,10 +526,502 @@ class LabelManager(QWidget):
         if target_name != current_name or self.current_layer is None:
             self._on_layer_changed(target_name)
 
+    def _refresh_image_layers(self, event=None) -> None:
+        del event
+        if self._closed:
+            return
+        current = self.z_image_combo.currentData()
+        sources = [
+            layer
+            for layer in self.viewer.layers
+            if isinstance(layer, Image)
+            and not isinstance(layer, Labels)
+            and layer.ndim in (3, 4)
+            and getattr(layer.data, "ndim", None) in (3, 4)
+            and not layer.rgb
+            and not layer.multiscale
+            and layer.metadata.get(ROLE_KEY) != ROLE_Z_IMAGE
+        ]
+
+        self.z_image_combo.blockSignals(True)
+        self.z_image_combo.clear()
+        if sources:
+            for layer in sources:
+                self.z_image_combo.addItem(layer.name, layer)
+            target = (
+                self._z_source_image
+                if self._z_source_image in sources
+                else current
+            )
+            if target in sources:
+                self.z_image_combo.setCurrentIndex(sources.index(target))
+            self.z_image_combo.setEnabled(self._z_source_image is None)
+            self.split_z_btn.setEnabled(True)
+        else:
+            self.z_image_combo.addItem("No 3D/4D Image layers available")
+            self.z_image_combo.setEnabled(False)
+            self.split_z_btn.setEnabled(False)
+        self.z_image_combo.blockSignals(False)
+        selected = self.z_image_combo.currentData() if sources else None
+        self.z_profile_refresh_btn.setEnabled(isinstance(selected, Image))
+        if selected is not self._z_profile_source:
+            self._on_z_image_changed(self.z_image_combo.currentIndex())
+
+    def _on_z_image_changed(self, index: int) -> None:
+        del index
+        source = self.z_image_combo.currentData()
+        if not isinstance(source, Image) or isinstance(source, Labels):
+            self._z_profile_source = None
+            self._z_profile_time = None
+            self.z_profile.clear_profile()
+            self.z_profile_state_label.clear()
+            self.z_profile_refresh_btn.setEnabled(False)
+            return
+        self.z_profile_refresh_btn.setEnabled(True)
+        if source is not self._z_profile_source:
+            self._z_profile_source = None
+            self._z_profile_time = None
+            self.z_profile.clear_profile()
+            self.refresh_z_profile()
+
+    def refresh_z_profile(self) -> None:
+        """Count above-threshold pixels per Z for the current Image and time."""
+
+        source = self.z_image_combo.currentData()
+        if not isinstance(source, Image) or isinstance(source, Labels):
+            return
+        time_index = self._z_profile_time_index(source)
+        threshold = float(self.z_profile_threshold_spin.value())
+        self.z_profile_refresh_btn.setEnabled(False)
+        self.z_profile_state_label.setText("computing…")
+        try:
+            values = z_threshold_count_profile(
+                source.data,
+                threshold=threshold,
+                time_index=time_index,
+            )
+        except Exception as error:  # noqa: BLE001 - Qt callback boundary
+            self._z_profile_source = None
+            self._z_profile_time = None
+            self.z_profile.clear_profile()
+            self.z_profile_state_label.setText("unavailable")
+            self.update_status(f"Could not compute Z profile: {error}", "red")
+            return
+        finally:
+            self.z_profile_refresh_btn.setEnabled(True)
+
+        self._z_profile_source = source
+        self._z_profile_time = time_index
+        self.z_profile.set_profile(values)
+        self._sync_z_profile_cuts(self.z_cuts_input.text())
+        time_text = f"t={time_index}" if source.ndim == 4 else ""
+        self.z_profile_state_label.setText(time_text)
+
+    def _z_profile_time_index(self, source: Image) -> int:
+        if source.ndim != 4:
+            return 0
+        steps = self.viewer.dims.current_step
+        value = int(steps[-4]) if len(steps) >= 4 else 0
+        return min(max(value, 0), int(source.data.shape[0]) - 1)
+
+    def _sync_z_profile_cuts(self, text: str) -> None:
+        try:
+            cuts = parse_z_cuts(text)
+        except ValueError:
+            cuts = ()
+        self.z_profile.set_cuts(cuts)
+
+    def _toggle_z_profile_cut(self, cut: int) -> None:
+        try:
+            cuts = set(parse_z_cuts(self.z_cuts_input.text()))
+        except ValueError as error:
+            self.update_status(
+                f"Fix Z cuts before using the plot: {error}", "orange"
+            )
+            return
+        if cut in cuts:
+            cuts.remove(cut)
+        else:
+            cuts.add(cut)
+        source = self.z_image_combo.currentData()
+        if not isinstance(source, Image):
+            return
+        ordered = tuple(sorted(cuts))
+        build_z_layer_ranges(int(source.data.shape[-3]), ordered)
+        self.z_cuts_input.setText(",".join(str(value) for value in ordered))
+
+    def split_z_layers(self) -> None:
+        """Create runtime Image slices and synchronize Labels and boxes."""
+        try:
+            self._create_z_layers()
+        except Exception as error:  # noqa: BLE001 - Qt callback boundary
+            QMessageBox.critical(
+                self,
+                "Invalid Z layers",
+                f"Could not split the selected layers:\n{error}",
+            )
+            self.update_status("Z-layer split failed", "red")
+
+    def _create_z_layers(self) -> None:
+        source = self.z_image_combo.currentData()
+        if not isinstance(source, Image) or isinstance(source, Labels):
+            raise RuntimeError("Select a 3D or 4D Image layer")
+        if self.current_layer is None:
+            raise RuntimeError("Select a Labels layer")
+        self._validate_z_layer_sources(source, self.current_layer)
+
+        cuts = parse_z_cuts(self.z_cuts_input.text())
+        ranges = build_z_layer_ranges(int(source.data.shape[-3]), cuts)
+        if not cuts:
+            raise ValueError("Enter at least one Z cut")
+
+        if self._z_ranges:
+            self._clear_z_layers()
+
+        self._z_source_image = source
+        self._z_ranges = ranges
+        self._z_source_image_visible = bool(source.visible)
+        self._z_source_labels_visible = bool(self.current_layer.visible)
+        self._z_source_labels_data = self.current_layer.data
+
+        try:
+            source.events.data.connect(self._on_z_source_image_data_changed)
+            for event_name in Z_SOURCE_GEOMETRY_EVENTS:
+                getattr(source.events, event_name).connect(
+                    self._on_z_source_geometry_changed
+                )
+                getattr(self.current_layer.events, event_name).connect(
+                    self._on_z_source_geometry_changed
+                )
+            source_index = list(self.viewer.layers).index(source)
+            for z_range in ranges:
+                derived = self.viewer.add_image(
+                    slice_z_range(source.data, z_range),
+                    name=f"{source.name} – Layer {z_range.index + 1}",
+                    colormap=source.colormap,
+                    contrast_limits=tuple(source.contrast_limits),
+                    gamma=float(source.gamma),
+                    opacity=float(source.opacity),
+                    blending="additive",
+                    rendering=source.rendering,
+                    depiction=source.depiction,
+                    attenuation=float(source.attenuation),
+                    iso_threshold=float(source.iso_threshold),
+                    projection_mode=source.projection_mode,
+                    interpolation2d=source.interpolation2d,
+                    interpolation3d=source.interpolation3d,
+                    rgb=source.rgb,
+                    scale=tuple(source.scale),
+                    translate=shifted_z_translation(
+                        tuple(source.translate),
+                        tuple(source.scale),
+                        z_range.start,
+                    ),
+                    axis_labels=tuple(source.axis_labels),
+                    units=tuple(source.units),
+                    metadata={
+                        ROLE_KEY: ROLE_Z_IMAGE,
+                        "z_layer_index": z_range.index,
+                        "z_start": z_range.start,
+                        "z_stop": z_range.stop,
+                        "z_session": self._z_session_token,
+                    },
+                )
+                self._z_image_layers.append(derived)
+                current_index = list(self.viewer.layers).index(derived)
+                target_index = source_index + len(self._z_image_layers)
+                if current_index != target_index:
+                    self.viewer.layers.move(current_index, target_index)
+
+            first_range = ranges[0]
+            self._z_labels_proxy = self.viewer.add_labels(
+                slice_z_range(self.current_layer.data, first_range),
+                name=f"{self.current_layer.name} – Z view",
+                colormap=self.current_layer.colormap,
+                opacity=float(self.current_layer.opacity),
+                blending=self.current_layer.blending,
+                rendering=self.current_layer.rendering,
+                depiction=self.current_layer.depiction,
+                iso_gradient_mode=self.current_layer.iso_gradient_mode,
+                projection_mode=self.current_layer.projection_mode,
+                scale=tuple(self.current_layer.scale),
+                translate=shifted_z_translation(
+                    tuple(self.current_layer.translate),
+                    tuple(self.current_layer.scale),
+                    first_range.start,
+                ),
+                axis_labels=tuple(self.current_layer.axis_labels),
+                units=tuple(self.current_layer.units),
+                visible=False,
+                metadata={
+                    ROLE_KEY: ROLE_Z_LABELS,
+                    "z_layer_index": first_range.index,
+                    "z_start": first_range.start,
+                    "z_stop": first_range.stop,
+                    "z_session": self._z_session_token,
+                },
+            )
+            self._z_labels_proxy.editable = False
+            self._z_labels_proxy.contour = self.current_layer.contour
+            source.visible = False
+
+            self.z_view_combo.blockSignals(True)
+            self.z_view_combo.clear()
+            self.z_view_combo.addItem("All", None)
+            for z_range in ranges:
+                self.z_view_combo.addItem(
+                    f"Layer {z_range.index + 1} · "
+                    f"z {z_range.start}–{z_range.stop - 1}",
+                    z_range.index,
+                )
+            self.z_view_combo.setCurrentIndex(0)
+            self.z_view_combo.blockSignals(False)
+            self.z_view_combo.setEnabled(True)
+            self.clear_z_btn.setEnabled(True)
+            self.z_image_combo.setEnabled(False)
+            self._z_active_index = None
+            self._apply_z_view()
+            self._apply_label_opacity()
+        except Exception:
+            self._clear_z_layers()
+            raise
+
+        self.update_status(
+            f"Split {source.name} into {len(ranges)} Z layers",
+            "green",
+        )
+
+    def _validate_z_layer_sources(self, source: Image, labels: Labels) -> None:
+        if source.rgb:
+            raise ValueError("RGB Image layers are not supported")
+        if source.multiscale or labels.multiscale:
+            raise ValueError("Multiscale Image and Labels are not supported")
+        if source.depiction != "volume" or labels.depiction != "volume":
+            raise ValueError("Z layers support volume depiction only")
+        if len(source.experimental_clipping_planes) or len(
+            labels.experimental_clipping_planes
+        ):
+            raise ValueError(
+                "Z layers do not support experimental clipping planes"
+            )
+        if source.ndim not in (3, 4) or labels.ndim not in (3, 4):
+            raise ValueError("Image and Labels must use (z,y,x) or (t,z,y,x)")
+        if source.ndim != labels.ndim:
+            raise ValueError("Image and Labels dimensions do not match")
+        if tuple(source.data.shape) != tuple(labels.data.shape):
+            raise ValueError("Image and Labels shapes do not match")
+        if tuple(source.axis_labels) != tuple(labels.axis_labels):
+            raise ValueError("Image and Labels axis labels do not match")
+        if not np.array_equal(source.scale, labels.scale):
+            raise ValueError("Image and Labels scale do not match")
+        if not np.array_equal(source.translate, labels.translate):
+            raise ValueError("Image and Labels translation do not match")
+        if tuple(source.units) != tuple(labels.units):
+            raise ValueError("Image and Labels units do not match")
+        if not self._uses_axis_aligned_transform(source):
+            raise ValueError(
+                "Z layers require an axis-aligned Image transform"
+            )
+        if not self._uses_axis_aligned_transform(labels):
+            raise ValueError(
+                "Z layers require an axis-aligned Labels transform"
+            )
+        for layer in (source, labels):
+            data_module = type(layer.data).__module__.split(".", 1)[0]
+            if data_module == "zarr":
+                raise ValueError(
+                    "Direct Zarr arrays are not supported; wrap the array "
+                    "as a Dask array before splitting"
+                )
+
+    @staticmethod
+    def _uses_axis_aligned_transform(layer: Image | Labels) -> bool:
+        ndim = layer.ndim
+        return (
+            np.allclose(layer.rotate, np.eye(ndim))
+            and np.allclose(layer.shear, 0.0)
+            and np.allclose(layer.affine.affine_matrix, np.eye(ndim + 1))
+        )
+
+    def _on_z_source_image_data_changed(self, event=None) -> None:
+        del event
+        if self._z_ranges:
+            self._clear_z_layers()
+            self.update_status(
+                "Z layers cleared because the source Image changed",
+                "orange",
+            )
+
+    def _on_z_source_geometry_changed(self, event=None) -> None:
+        del event
+        if self._z_ranges:
+            self._clear_z_layers()
+            self.update_status(
+                "Z layers cleared because a source transform changed",
+                "orange",
+            )
+
+    def _on_z_view_changed(self, index: int) -> None:
+        del index
+        if not self._z_ranges:
+            return
+        value = self.z_view_combo.currentData()
+        self._z_active_index = None if value is None else int(value)
+        self._apply_z_view()
+
+    def _active_z_range(self) -> ZLayerRange | None:
+        if self._z_active_index is None:
+            return None
+        if not 0 <= self._z_active_index < len(self._z_ranges):
+            return None
+        return self._z_ranges[self._z_active_index]
+
+    def _apply_z_view(self) -> None:
+        if not self._z_ranges or self.current_layer is None:
+            return
+        active_range = self._active_z_range()
+        for z_range, layer in zip(
+            self._z_ranges, self._z_image_layers, strict=True
+        ):
+            layer.visible = (
+                active_range is None or z_range.index == active_range.index
+            )
+
+        if self._z_source_image is not None:
+            self._z_source_image.visible = False
+        if active_range is None:
+            self.current_layer.visible = True
+            if self._z_labels_proxy is not None:
+                self._z_labels_proxy.visible = False
+        elif self._z_labels_proxy is not None:
+            self.current_layer.visible = False
+            self._z_labels_proxy.data = slice_z_range(
+                self.current_layer.data, active_range
+            )
+            self._z_labels_proxy.editable = False
+            self._z_labels_proxy.translate = shifted_z_translation(
+                tuple(self.current_layer.translate),
+                tuple(self.current_layer.scale),
+                active_range.start,
+            )
+            self._z_labels_proxy.metadata.update(
+                {
+                    "z_layer_index": active_range.index,
+                    "z_start": active_range.start,
+                    "z_stop": active_range.stop,
+                }
+            )
+            self._z_labels_proxy.visible = True
+            self._clamp_z_to_active_layer(active_range)
+
+        self._refresh_selection_item_styles()
+        self._refresh_vector_layers()
+        self._update_info()
+
+    def _clamp_z_to_active_layer(self, z_range: ZLayerRange) -> None:
+        if self.viewer.dims.ndisplay != 2:
+            return
+        steps = list(self.viewer.dims.current_step)
+        if len(steps) < 3:
+            return
+        z_axis = len(steps) - 3
+        current_z = int(steps[z_axis])
+        if not z_range.start <= current_z < z_range.stop:
+            steps[z_axis] = (z_range.start + z_range.stop - 1) // 2
+            self.viewer.dims.current_step = tuple(steps)
+
+    def clear_z_layers(self) -> None:
+        """Remove runtime Z layers and restore source visibility."""
+        if not self._z_ranges:
+            return
+        self._clear_z_layers()
+        self.update_status("Z layers cleared", "green")
+
+    def _clear_z_layers(self) -> None:
+        source_image = self._z_source_image
+        source_labels = self.current_layer
+        image_visible = self._z_source_image_visible
+        labels_visible = self._z_source_labels_visible
+
+        if source_image is not None:
+            with suppress(TypeError, ValueError):
+                source_image.events.data.disconnect(
+                    self._on_z_source_image_data_changed
+                )
+            for event_name in Z_SOURCE_GEOMETRY_EVENTS:
+                with suppress(TypeError, ValueError):
+                    getattr(source_image.events, event_name).disconnect(
+                        self._on_z_source_geometry_changed
+                    )
+        if source_labels is not None:
+            for event_name in Z_SOURCE_GEOMETRY_EVENTS:
+                with suppress(TypeError, ValueError):
+                    getattr(source_labels.events, event_name).disconnect(
+                        self._on_z_source_geometry_changed
+                    )
+
+        self._z_cleanup = True
+        try:
+            managed = [
+                layer
+                for layer in self.viewer.layers
+                if layer in self._z_image_layers
+                or layer is self._z_labels_proxy
+                or (
+                    layer.metadata.get(ROLE_KEY) in MANAGED_Z_ROLES
+                    and layer.metadata.get("z_session")
+                    == self._z_session_token
+                )
+            ]
+            for layer in managed:
+                if layer in self.viewer.layers:
+                    self.viewer.layers.remove(layer)
+        finally:
+            self._z_cleanup = False
+
+        if (
+            source_image is not None
+            and source_image in self.viewer.layers
+            and image_visible is not None
+        ):
+            source_image.visible = image_visible
+        if (
+            source_labels is not None
+            and source_labels in self.viewer.layers
+            and labels_visible is not None
+        ):
+            source_labels.visible = labels_visible
+
+        self._z_ranges = ()
+        self._z_source_image = None
+        self._z_image_layers.clear()
+        self._z_labels_proxy = None
+        self._z_active_index = None
+        self._z_source_image_visible = None
+        self._z_source_labels_visible = None
+        self._z_source_labels_data = None
+
+        self.z_view_combo.blockSignals(True)
+        self.z_view_combo.clear()
+        self.z_view_combo.addItem("All", None)
+        self.z_view_combo.blockSignals(False)
+        self.z_view_combo.setEnabled(False)
+        self.clear_z_btn.setEnabled(False)
+        self._refresh_image_layers()
+        self._refresh_label_layers()
+        self._refresh_selection_item_styles()
+        self._refresh_vector_layers()
+        self._update_info()
+
     def _on_layer_changed(self, layer_name: str) -> None:
-        if self.current_layer is not None and self.current_layer.name == layer_name:
+        if (
+            self.current_layer is not None
+            and self.current_layer.name == layer_name
+        ):
             return
 
+        if self._z_ranges:
+            self._clear_z_layers()
         self._detach_current_layer(restore=True)
         self._remove_vector_layers()
         if not layer_name or layer_name == "No Labels layers available":
@@ -414,6 +1030,7 @@ class LabelManager(QWidget):
             self.checked_ids.clear()
             self.active_id = None
             self._rebuild_selection_items()
+            self._sync_annotation_ids()
             self._remove_vector_layers()
             self.update_status("No Labels layer selected", "orange")
             return
@@ -432,6 +1049,7 @@ class LabelManager(QWidget):
         self._original_opacity = float(layer.opacity)
         self._base_colors.clear()
         layer.events.data.connect(self._on_label_data_changed)
+        layer.events.labels_update.connect(self._on_label_data_changed)
         self.checked_ids.clear()
         self.active_id = None
         self._refresh_available_ids(select_first=True)
@@ -452,6 +1070,10 @@ class LabelManager(QWidget):
             self.current_layer.events.data.disconnect(
                 self._on_label_data_changed
             )
+        with suppress(TypeError, ValueError):
+            self.current_layer.events.labels_update.disconnect(
+                self._on_label_data_changed
+            )
         if restore:
             self._restore_layer_display()
         self.current_layer = None
@@ -463,22 +1085,42 @@ class LabelManager(QWidget):
         if self._closed:
             return
         removed = getattr(event, "value", None)
+        metadata = getattr(removed, "metadata", {})
+        role = metadata.get(ROLE_KEY)
+        if role in MANAGED_Z_ROLES:
+            if (
+                metadata.get("z_session") == self._z_session_token
+                and not self._z_cleanup
+            ):
+                self._clear_z_layers()
+            return
         if (
             isinstance(removed, Vectors)
             and removed.metadata.get(ROLE_KEY) in MANAGED_VECTOR_ROLES
         ):
             return
+        if removed is self._z_source_image or removed is self.current_layer:
+            self._clear_z_layers()
         if removed is self.current_layer:
             self._detach_current_layer(restore=False)
         self._refresh_label_layers()
+        self._refresh_image_layers()
 
     def _on_label_data_changed(self, event=None) -> None:
         del event
+        if (
+            self._z_ranges
+            and self.current_layer is not None
+            and self.current_layer.data is not self._z_source_labels_data
+        ):
+            self._clear_z_layers()
         if self.roi_dataset is None:
             self._refresh_available_ids(select_first=False)
         else:
             self._cache_base_colors(self._available_ids)
             self._apply_label_opacity()
+        if self._z_labels_proxy is not None:
+            self._z_labels_proxy.refresh()
         self._refresh_vector_layers()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -492,6 +1134,7 @@ class LabelManager(QWidget):
         self._closed = True
         self._disconnect_viewer_events()
         self._unbind_keys()
+        self._clear_z_layers()
         self._detach_current_layer(restore=True)
         self._remove_vector_layers()
 
@@ -516,6 +1159,7 @@ class LabelManager(QWidget):
 
         self._cache_base_colors(ids)
         self._rebuild_selection_items()
+        self._sync_annotation_ids()
         self._apply_label_opacity()
 
     def _exact_label_ids(self) -> list[int]:
@@ -539,9 +1183,7 @@ class LabelManager(QWidget):
         unique_values = np.unique(data)
         background = self._background_value()
         return sorted(
-            int(value)
-            for value in unique_values
-            if int(value) != background
+            int(value) for value in unique_values if int(value) != background
         )
 
     def _background_value(self) -> int:
@@ -623,13 +1265,14 @@ class LabelManager(QWidget):
 
     def _refresh_selection_item_styles(self) -> None:
         names = self._annotation_names()
-        valid_ids = set(self._valid_navigation_ids())
+        valid_time_ids = set(self._valid_time_ids())
         self._ui_sync = True
         try:
             for display_id in self._available_ids:
                 self._style_selection_item(
                     display_id,
-                    valid=display_id in valid_ids,
+                    valid_at_time=display_id in valid_time_ids,
+                    in_active_layer=self._id_in_active_z_layer(display_id),
                     biological_name=names.get(display_id, ""),
                 )
             if self.active_id is None:
@@ -647,14 +1290,17 @@ class LabelManager(QWidget):
         self,
         display_id: int,
         *,
-        valid: bool | None = None,
+        valid_at_time: bool | None = None,
+        in_active_layer: bool | None = None,
         biological_name: str = "",
     ) -> None:
         item = self._selection_items.get(display_id)
         if item is None:
             return
-        if valid is None:
-            valid = display_id in set(self._valid_navigation_ids())
+        if valid_at_time is None:
+            valid_at_time = display_id in set(self._valid_time_ids())
+        if in_active_layer is None:
+            in_active_layer = self._id_in_active_z_layer(display_id)
         if not biological_name:
             biological_name = self._annotation_names().get(display_id, "")
 
@@ -662,7 +1308,7 @@ class LabelManager(QWidget):
         text = f"{prefix} {display_id}"
         if biological_name:
             text += f" · {biological_name}"
-        if self.roi_dataset is not None and not valid:
+        if self.roi_dataset is not None and not valid_at_time:
             text += " (missing)"
         item.setText(1, text)
         item.setCheckState(
@@ -672,7 +1318,7 @@ class LabelManager(QWidget):
         font = item.font(1)
         font.setBold(display_id == self.active_id)
         item.setFont(1, font)
-        if valid:
+        if valid_at_time and in_active_layer:
             rgba = self._display_color(display_id)
             color = QColor.fromRgbF(*rgba[:3])
         else:
@@ -743,14 +1389,33 @@ class LabelManager(QWidget):
         self._update_info()
 
     def _valid_navigation_ids(self) -> list[int]:
+        return [
+            display_id
+            for display_id in self._valid_time_ids()
+            if self._id_in_active_z_layer(display_id)
+        ]
+
+    def _valid_time_ids(self) -> list[int]:
         if self.roi_dataset is None:
             return list(self._available_ids)
         return self.roi_dataset.valid_ids(self._viewer_time())
 
+    def _id_in_active_z_layer(self, display_id: int) -> bool:
+        active_range = self._active_z_range()
+        if active_range is None or self.roi_dataset is None:
+            return True
+        box = self.roi_dataset.get_box(self._viewer_time(), display_id)
+        if box is None:
+            return False
+        owner = find_z_layer(box.center_zyx[0], self._z_ranges)
+        return owner is not None and owner.index == active_range.index
+
     def navigate(self, step: int) -> None:
         valid_ids = self._valid_navigation_ids()
         if not valid_ids:
-            self.update_status("No valid neuron at the current volume", "orange")
+            self.update_status(
+                "No valid neuron at the current volume", "orange"
+            )
             return
         if self.active_id not in valid_ids:
             next_id = valid_ids[0] if step >= 0 else valid_ids[-1]
@@ -820,8 +1485,12 @@ class LabelManager(QWidget):
         direct = cmap.direct_colormap(colors)
         direct.background_value = self._background_value()
         direct.name = "neuron_roi_visibility"
-        self.current_layer.colormap = direct
-        self.current_layer.opacity = 1.0
+        targets = [self.current_layer]
+        if self._z_labels_proxy is not None:
+            targets.append(self._z_labels_proxy)
+        for layer in targets:
+            layer.colormap = direct
+            layer.opacity = 1.0
 
     def _restore_layer_display(self) -> None:
         if self.current_layer is None:
@@ -946,6 +1615,16 @@ class LabelManager(QWidget):
     def _on_dims_changed(self, event=None) -> None:
         del event
         if (
+            self._z_profile_source is not None
+            and self._z_profile_source.ndim == 4
+            and self._z_profile_time is not None
+            and self._z_profile_time_index(self._z_profile_source)
+            != self._z_profile_time
+        ):
+            self.z_profile_state_label.setText(
+                f"t={self._z_profile_time} · Refresh"
+            )
+        if (
             self.roi_dataset is not None
             and self.current_layer is not None
             and self.current_layer in self.viewer.layers
@@ -1058,10 +1737,13 @@ class LabelManager(QWidget):
             box = self.roi_dataset.get_box(viewer_t, neuron_id)
             if box is None:
                 continue
+            active_range = self._active_z_range()
+            if active_range is not None:
+                owner = find_z_layer(box.center_zyx[0], self._z_ranges)
+                if owner is None or owner.index != active_range.index:
+                    continue
             if self.viewer.dims.ndisplay == 2:
-                geometry = box_vectors_2d(
-                    box, z_index, shape_zyx=shape_zyx
-                )
+                geometry = box_vectors_2d(box, z_index, shape_zyx=shape_zyx)
             else:
                 geometry = box_vectors_3d(box, shape_zyx=shape_zyx)
             if self.current_layer.ndim == 4:
@@ -1069,9 +1751,7 @@ class LabelManager(QWidget):
             if len(geometry):
                 if neuron_id in self.checked_ids:
                     selected_vectors.append(geometry)
-                    selected_neuron_ids.extend(
-                        [neuron_id] * len(geometry)
-                    )
+                    selected_neuron_ids.extend([neuron_id] * len(geometry))
                 if neuron_id == self.active_id:
                     active_vectors.append(geometry)
                     active_ids.extend([neuron_id] * len(geometry))
@@ -1121,6 +1801,12 @@ class LabelManager(QWidget):
                 f"Neuron {self.active_id} is missing at this volume", "orange"
             )
             return
+        if not self._id_in_active_z_layer(self.active_id):
+            self.update_status(
+                f"Neuron {self.active_id} is outside the current Z layer",
+                "orange",
+            )
+            return
 
         z, y, x = box.center_zyx
         steps = list(self.viewer.dims.current_step)
@@ -1154,7 +1840,9 @@ class LabelManager(QWidget):
                 item_id = int(digital.text())
             except ValueError:
                 continue
-            names[item_id] = biological.text() if biological is not None else ""
+            names[item_id] = (
+                biological.text() if biological is not None else ""
+            )
         return names
 
     def _annotation_rows(
@@ -1200,36 +1888,19 @@ class LabelManager(QWidget):
             self._ui_sync = False
         self._refresh_selection_item_styles()
 
-    def fill_annotation_range(self) -> None:
-        try:
-            start = int(self.annotation_start_input.text())
-            end = int(self.annotation_end_input.text())
-        except ValueError:
-            QMessageBox.warning(
-                self, "Invalid range", "Start and end must be integers."
-            )
-            return
-        if start > end:
-            QMessageBox.warning(
-                self, "Invalid range", "Start cannot be greater than end."
-            )
-            return
-        existing = self._annotation_rows()
-        rows = [
-            (item_id, *existing.get(item_id, ("", "")))
-            for item_id in range(start, end + 1)
-        ]
-        self._set_annotation_rows(rows)
-
-    def load_current_ids_to_annotation(self) -> None:
+    def _sync_annotation_ids(self) -> int:
         existing = self._annotation_rows()
         rows = [
             (item_id, *existing.get(item_id, ("", "")))
             for item_id in self._available_ids
         ]
         self._set_annotation_rows(rows)
+        return len(rows)
+
+    def load_current_ids_to_annotation(self) -> None:
+        count = self._sync_annotation_ids()
         self.update_status(
-            f"Loaded {len(rows)} identities into annotation table", "green"
+            f"Loaded {count} identities into annotation table", "green"
         )
 
     def _sync_annotation_to_active(self) -> None:
@@ -1290,7 +1961,9 @@ class LabelManager(QWidget):
             return
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
-        sheet_name = self.sheet_name_input.text().strip() or "Neuron Annotations"
+        sheet_name = (
+            self.sheet_name_input.text().strip() or "Neuron Annotations"
+        )
 
         try:
             if Path(path).exists():
@@ -1318,11 +1991,18 @@ class LabelManager(QWidget):
                 cell.alignment = Alignment(
                     horizontal="center", vertical="center"
                 )
-            for item_id, (biological, annotation) in self._annotation_rows().items():
+            for item_id, (
+                biological,
+                annotation,
+            ) in self._annotation_rows().items():
                 sheet.append([item_id, biological, annotation])
             for column in sheet.columns:
                 width = max(
-                    (len(str(cell.value)) for cell in column if cell.value is not None),
+                    (
+                        len(str(cell.value))
+                        for cell in column
+                        if cell.value is not None
+                    ),
                     default=0,
                 )
                 sheet.column_dimensions[column[0].column_letter].width = (
@@ -1378,10 +2058,14 @@ class LabelManager(QWidget):
                     continue
                 item_id = int(numeric_id)
                 biological = (
-                    "" if len(values) < 2 or values[1] is None else str(values[1])
+                    ""
+                    if len(values) < 2 or values[1] is None
+                    else str(values[1])
                 )
                 annotation = (
-                    "" if len(values) < 3 or values[2] is None else str(values[2])
+                    ""
+                    if len(values) < 3 or values[2] is None
+                    else str(values[2])
                 )
                 rows.append((item_id, biological, annotation))
             workbook.close()
@@ -1406,6 +2090,15 @@ class LabelManager(QWidget):
             f"Active: {self.active_id if self.active_id is not None else 'none'}\n"
             f"Checked: {checked[:12]}"
         )
+        active_range = self._active_z_range()
+        if self._z_ranges:
+            z_view = (
+                "All"
+                if active_range is None
+                else f"Layer {active_range.index + 1} "
+                f"[{active_range.start},{active_range.stop})"
+            )
+            text += f"\nZ view: {z_view}"
         if len(checked) > 12:
             text += f" … (+{len(checked) - 12})"
         self.info_text.setText(text)

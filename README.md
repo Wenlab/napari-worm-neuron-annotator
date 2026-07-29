@@ -23,6 +23,7 @@ Original ROI arrays and Labels data are never modified.
 - Dynamic 2D bounding rectangles on the current z slice.
 - Dynamic 3D 12-edge wireframes for the current volume.
 - Active-neuron highlighting and view centering.
+- Zero-copy Z-layer display synchronized across Image, Labels, and boxes.
 - Zero-based ROI annotation with optional Excel import/export.
 - Automatic restoration of the original Labels colormap and opacity when the
   widget closes or switches to another Labels layer.
@@ -81,6 +82,43 @@ than 10 million voxels. Load an ROI NPY file in those cases.
 
 Labels-only discovery cannot recover an identity that has already been
 completely overwritten in a dense mask.
+
+## Z-layer display
+
+The compact **Z Layers** panel separates a 3D volume along Z so individual
+depth ranges can be rendered without the other ranges obscuring them:
+
+1. Select a compatible Image layer.
+2. Inspect the current-time curve showing how many pixels in each Z slice are
+   strictly above the editable threshold (default `170`). Click the curve to
+   add or remove a cut, or enter explicit cuts such as `4,10`.
+3. Click **Split**.
+4. Use **Show** to select `All` or one generated layer.
+
+Cuts use half-open Python ranges. For a volume with 18 Z slices, `4,10`
+creates `[0,4)`, `[4,10)`, and `[10,18)`. A boundary slice belongs to the
+following layer.
+
+**All** displays every generated Image layer using additive blending, the
+complete Labels layer, and all currently valid checked boxes. **Layer k**
+displays only that Image
+range, the corresponding read-only Labels slice, and boxes whose center Z
+belongs to the range. A box that crosses a cut is shown whole in the one
+layer containing its center.
+
+Checked and active neuron identities remain global. In an individual layer,
+Q/W navigates only neurons assigned to that layer; other neurons remain in
+the list, are shown in gray, and keep operable checkboxes. Activating a gray
+row does not move the view outside the selected Z layer.
+
+Generated Image layers use slices of NumPy arrays, memory maps, or Dask
+arrays rather than full-size zero-filled copies. Direct Zarr arrays should
+be wrapped as Dask arrays before splitting. The Image and Labels sources
+must have matching `(z,y,x)` or `(t,z,y,x)` shape, axis labels, scale,
+translation, and units, with axis-aligned volume depiction and no clipping
+planes. **Clear** removes all generated Z layers and restores the original
+source visibility. Normal napari eye icons may still override visibility
+until the next **Show** selection.
 
 ### Launch the validated 20260417_w2 dataset
 
@@ -177,9 +215,14 @@ the widget closes and are not saved as a separate annotation format.
 In ROI mode, the `digital` column always stores the zero-based `neuron_id`.
 In Labels-only mode, it stores the raw Labels value.
 
+The table automatically follows the current identities. Existing biological
+names and annotation text are preserved by identity when the source changes.
 Activating a neuron selects its annotation row. Selecting a table row checks
 and activates the corresponding neuron without clearing other checked IDs.
 The `biological` value is also displayed in the neuron list.
+
+The complete navigator is vertically scrollable when the napari dock is
+shorter than its controls.
 
 Excel operations support `.xlsx` workbooks. Saving and loading do not apply an
 implicit `+1` or `-1` conversion.

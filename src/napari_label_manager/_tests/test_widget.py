@@ -30,8 +30,7 @@ def _managed_layer(viewer, role):
     return next(
         layer
         for layer in viewer.layers
-        if isinstance(layer, Vectors)
-        and layer.metadata.get(ROLE_KEY) == role
+        if isinstance(layer, Vectors) and layer.metadata.get(ROLE_KEY) == role
     )
 
 
@@ -114,7 +113,7 @@ def test_selection_changes_alpha_without_changing_rgb(
 
 
 def test_direct_colormap_rgb_is_preserved_and_navigation_wraps(
-    make_napari_viewer
+    make_napari_viewer,
 ):
     viewer = make_napari_viewer()
     direct = cmap.direct_colormap(
@@ -354,8 +353,10 @@ def test_annotation_sync_uses_zero_based_roi_ids(
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()
-    widget.load_current_ids_to_annotation()
 
+    assert not hasattr(widget, "annotation_start_input")
+    assert not hasattr(widget, "annotation_end_input")
+    assert not hasattr(widget, "fill_annotation_btn")
     assert widget.annotation_table.item(0, 0).text() == "0"
     assert widget.annotation_table.item(1, 0).text() == "1"
     widget.annotation_table.item(0, 1).setText("AVA")
