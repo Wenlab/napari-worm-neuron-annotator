@@ -51,10 +51,10 @@ testing = [
 napari-label-manager = "napari_label_manager:napari.yaml"
 
 [project.urls]
-"Bug Tracker" = "https://github.com/Wenlab/napari-label-manager/issues"
-"Documentation" = "https://github.com/Wenlab/napari-label-manager#README.md"
-"Source Code" = "https://github.com/Wenlab/napari-label-manager"
-"User Support" = "https://github.com/Wenlab/napari-label-manager/issues"
+"Bug Tracker" = "https://github.com/Wenlab/napari-worm-neuron-annotator/issues"
+"Documentation" = "https://github.com/Wenlab/napari-worm-neuron-annotator#README.md"
+"Source Code" = "https://github.com/Wenlab/napari-worm-neuron-annotator"
+"User Support" = "https://github.com/Wenlab/napari-worm-neuron-annotator/issues"
 
 [build-system]
 requires = ["setuptools>=77.0.0", "wheel", "setuptools_scm"]
