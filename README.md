@@ -72,6 +72,7 @@ clears the active state; unchecking another ID does not change the active
 neuron.
 
 The **Labels Layer** panel also controls checked and unchecked label alpha.
+The defaults are `0.50` for checked labels and `0.00` for unchecked labels.
 Hide the entire mask with the normal eye icon in napari's layer list. The
 original Labels colormap and opacity are restored automatically when the
 widget closes or switches to another Labels layer.

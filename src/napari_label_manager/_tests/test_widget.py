@@ -69,6 +69,10 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
         widget.selected_opacity_slider.parentWidget()
         is widget.labels_layer_group
     )
+    assert widget.selected_opacity_slider.value() == 50
+    assert widget.selected_opacity_label.text() == "0.50"
+    assert widget.other_opacity_slider.value() == 0
+    assert widget.other_opacity_label.text() == "0.00"
     assert widget.current_layer is layer
     assert widget._available_ids == [1, 2]
     assert set(widget._selection_items) == {1, 2}
@@ -113,8 +117,8 @@ def test_selection_changes_alpha_without_changing_rgb(
 
     np.testing.assert_allclose(_rgba(layer, 1)[:3], rgb_before[1])
     np.testing.assert_allclose(_rgba(layer, 2)[:3], rgb_before[2])
-    assert _rgba(layer, 1)[3] == pytest.approx(1.0)
-    assert _rgba(layer, 2)[3] == pytest.approx(0.2)
+    assert _rgba(layer, 1)[3] == pytest.approx(0.5)
+    assert _rgba(layer, 2)[3] == pytest.approx(0.0)
 
     qtbot.mouseClick(
         widget.selection_tree.viewport(),
@@ -125,7 +129,7 @@ def test_selection_changes_alpha_without_changing_rgb(
     )
     assert widget.checked_ids == {1, 2}
     assert widget.active_id == 2
-    assert _rgba(layer, 2)[3] == pytest.approx(1.0)
+    assert _rgba(layer, 2)[3] == pytest.approx(0.5)
 
     widget.shutdown()
     assert layer.colormap is original_colormap
@@ -179,7 +183,7 @@ def test_label_data_change_invalidates_button_ids(make_napari_viewer):
     assert widget._available_ids == [1, 2]
     assert set(widget._selection_items) == {1, 2}
     np.testing.assert_allclose(_rgba(layer, 2)[:3], rgb_two)
-    assert _rgba(layer, 2)[3] == pytest.approx(0.2)
+    assert _rgba(layer, 2)[3] == pytest.approx(0.0)
 
 
 def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(

@@ -386,8 +386,8 @@ class LabelManager(QWidget):
         selected_layout.addWidget(QLabel("Checked label opacity:"))
         self.selected_opacity_slider = QSlider(Qt.Horizontal)
         self.selected_opacity_slider.setRange(0, 100)
-        self.selected_opacity_slider.setValue(100)
-        self.selected_opacity_label = QLabel("1.00")
+        self.selected_opacity_slider.setValue(50)
+        self.selected_opacity_label = QLabel("0.50")
         self.selected_opacity_slider.valueChanged.connect(
             self._on_opacity_changed
         )
@@ -399,8 +399,8 @@ class LabelManager(QWidget):
         other_layout.addWidget(QLabel("Unchecked label opacity:"))
         self.other_opacity_slider = QSlider(Qt.Horizontal)
         self.other_opacity_slider.setRange(0, 100)
-        self.other_opacity_slider.setValue(20)
-        self.other_opacity_label = QLabel("0.20")
+        self.other_opacity_slider.setValue(0)
+        self.other_opacity_label = QLabel("0.00")
         self.other_opacity_slider.valueChanged.connect(
             self._on_opacity_changed
         )
