@@ -4,7 +4,7 @@ except ImportError:
     from importlib.metadata import PackageNotFoundError, version
 
     try:
-        __version__ = version("napari-label-manager")
+        __version__ = version("napari-worm-neuron-annotator")
     except PackageNotFoundError:
         __version__ = "0+unknown"
 

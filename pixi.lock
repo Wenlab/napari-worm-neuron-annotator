@@ -2528,23 +2528,6 @@ packages:
   - pkg:pypi/napari-console?source=hash-mapping
   size: 15655
   timestamp: 1760544595269
-- pypi: ./
-  name: napari-label-manager
-  version: 0.1.5.dev1+g36d2dad06.d20260728
-  sha256: 53d32bed14b5ec01d53e92b244582ec6343860c8d02e988fddd7b4fa6d4fa3f8
-  requires_dist:
-  - napari>=0.8,<0.9
-  - numpy
-  - qtpy
-  - napari[all]>=0.8,<0.9 ; extra == 'all'
-  - openpyxl>=3.1 ; extra == 'excel'
-  - tox ; extra == 'testing'
-  - pytest ; extra == 'testing'
-  - pytest-cov ; extra == 'testing'
-  - pytest-qt ; extra == 'testing'
-  - napari[pyqt6]>=0.8,<0.9 ; extra == 'testing'
-  requires_python: '>=3.11,<3.15'
-  editable: true
 - conda: https://conda.anaconda.org/conda-forge/noarch/napari-metadata-0.4.0-pyhc364b38_0.conda
   sha256: 2b9e2f2f7d3762cfd731b49c6286ae052919012ea3aa30b8300ad532b11647a8
   md5: 1148655200b8a59f170aeb88a8b47864
@@ -2604,6 +2587,23 @@ packages:
   - pkg:pypi/napari-svg?source=hash-mapping
   size: 19988
   timestamp: 1736862579398
+- pypi: ./
+  name: napari-worm-neuron-annotator
+  version: 0.1.5.dev10+ge18e06b43.d20260729
+  sha256: e83e4e08adb672cf85594fe38b78d3f1e1a72e4183bfc9bfc86723bfe03c62be
+  requires_dist:
+  - napari>=0.8,<0.9
+  - numpy
+  - qtpy
+  - napari[all]>=0.8,<0.9 ; extra == 'all'
+  - openpyxl>=3.1 ; extra == 'excel'
+  - tox ; extra == 'testing'
+  - pytest ; extra == 'testing'
+  - pytest-cov ; extra == 'testing'
+  - pytest-qt ; extra == 'testing'
+  - napari[pyqt6]>=0.8,<0.9 ; extra == 'testing'
+  requires_python: '>=3.11,<3.15'
+  editable: true
 - conda: https://conda.anaconda.org/conda-forge/noarch/nest-asyncio-1.6.0-pyhd8ed1ab_1.conda
   sha256: bb7b21d7fd0445ddc0631f64e66d91a179de4ba920b8381f29b9d006a42788c0
   md5: 598fd7d4d0de2455fb74f56063969a97

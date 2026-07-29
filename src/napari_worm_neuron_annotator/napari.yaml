@@ -1,5 +1,5 @@
 name: napari-label-manager
-display_name: Neuron ROI Navigator
+display_name: Worm Neuron Annotator
 # use 'hidden' to remove plugin from napari hub search results
 visibility: public
 # see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
@@ -7,8 +7,8 @@ categories: ["Utilities"]
 contributions:
   commands:
     - id: napari-label-manager.LabelManager
-      python_name: napari_label_manager._widget:LabelManager
-      title: Neuron ROI Navigator
+      python_name: napari_worm_neuron_annotator._widget:LabelManager
+      title: Worm Neuron Annotator
   widgets:
     - command: napari-label-manager.LabelManager
-      display_name: Neuron ROI Navigator
+      display_name: Worm Neuron Annotator

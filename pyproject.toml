@@ -1,5 +1,5 @@
 [project]
-name = "napari-label-manager"
+name = "napari-worm-neuron-annotator"
 dynamic = ["version"]
 description = "Navigate neuron box ROIs and control Labels visibility in napari"
 readme = "README.md"
@@ -36,7 +36,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Allow easily installation with the full, default napari installation
-# (including Qt backend) using napari-label-manager[all].
+# (including Qt backend) using napari-worm-neuron-annotator[all].
 all = ["napari[all]>=0.8,<0.9"]
 excel = ["openpyxl>=3.1"]
 testing = [
@@ -48,7 +48,7 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-napari-label-manager = "napari_label_manager:napari.yaml"
+napari-label-manager = "napari_worm_neuron_annotator:napari.yaml"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/Wenlab/napari-worm-neuron-annotator/issues"
@@ -70,7 +70,7 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.setuptools_scm]
-write_to = "src/napari_label_manager/_version.py"
+write_to = "src/napari_worm_neuron_annotator/_version.py"
 fallback_version = "0.0.1+nogit"
 
 [tool.black]
@@ -129,7 +129,7 @@ channels = ["conda-forge"]
 platforms = ["win-64"]
 
 [tool.pixi.pypi-dependencies]
-napari-label-manager = { path = ".", editable = true }
+napari-worm-neuron-annotator = { path = ".", editable = true }
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

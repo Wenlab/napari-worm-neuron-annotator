@@ -5,7 +5,7 @@ from pathlib import Path
 import napari
 import numpy as np
 
-from napari_label_manager import LabelManager
+from napari_worm_neuron_annotator import LabelManager
 
 DATA_DIR = Path(
     r"H:\Process_temporary\WJH\zephir_modifypoints\data\20260417_w2_npy"
@@ -27,7 +27,7 @@ def main() -> None:
             "Expected matching (t,z,y,x) volumes and Labels arrays"
         )
 
-    viewer = napari.Viewer(title="20260417_w2 – Neuron ROI Navigator")
+    viewer = napari.Viewer(title="20260417_w2 – Worm Neuron Annotator")
     viewer.add_image(
         volumes,
         name="20260417_w2 volumes",
@@ -47,7 +47,7 @@ def main() -> None:
     widget = LabelManager(viewer)
     viewer.window.add_dock_widget(
         widget,
-        name="Neuron ROI Navigator",
+        name="Worm Neuron Annotator",
         area="right",
     )
     widget.z_divisor_spin.setValue(Z_DIVISOR)

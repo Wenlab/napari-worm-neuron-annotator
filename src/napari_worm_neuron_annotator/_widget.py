@@ -67,6 +67,8 @@ except ImportError:
     EXCEL_AVAILABLE = False
 
 
+# Preserve the legacy metadata namespace so managed layers from earlier
+# releases remain identifiable during cleanup.
 ROLE_KEY = "napari_label_manager.role"
 ROLE_SELECTED = "roi_boxes_selected"
 LEGACY_ROLE_ALL = "roi_boxes_all"
@@ -142,7 +144,7 @@ class LabelManager(QWidget):
         self.scroll_content = QWidget()
         layout = QVBoxLayout(self.scroll_content)
 
-        header = QLabel("Neuron ROI Navigator")
+        header = QLabel("Worm Neuron Annotator")
         header.setFont(QFont("Arial", 12, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)

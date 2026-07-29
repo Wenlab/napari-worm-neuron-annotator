@@ -6,7 +6,7 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import QComboBox, QTreeWidget
 
-from napari_label_manager._widget import (
+from napari_worm_neuron_annotator._widget import (
     EXCEL_AVAILABLE,
     ROLE_ACTIVE,
     ROLE_BOX_LABELS,
@@ -206,7 +206,7 @@ def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
     roi_path = tmp_path / "neuron_pt_tuple.npy"
     np.save(roi_path, _roi_data())
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(roi_path), "NumPy arrays (*.npy)"),
     )
 
@@ -277,7 +277,7 @@ def test_optional_box_labels_use_biological_name_with_id_fallback(
     np.testing.assert_allclose(_box_label_rgba(box_labels), [1, 1, 1, 1])
 
     monkeypatch.setattr(
-        "napari_label_manager._widget.QColorDialog.getColor",
+        "napari_worm_neuron_annotator._widget.QColorDialog.getColor",
         lambda *args, **kwargs: QColor("#123456"),
     )
     widget.box_label_color_btn.click()
@@ -288,7 +288,7 @@ def test_optional_box_labels_use_biological_name_with_id_fallback(
     )
 
     monkeypatch.setattr(
-        "napari_label_manager._widget.QColorDialog.getColor",
+        "napari_worm_neuron_annotator._widget.QColorDialog.getColor",
         lambda *args, **kwargs: QColor(),
     )
     widget.box_label_color_btn.click()
@@ -405,7 +405,7 @@ def test_navigation_skips_missing_roi_at_current_time(
     roi_path = tmp_path / "roi.npy"
     np.save(roi_path, _roi_data())
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()
@@ -436,12 +436,12 @@ def test_switching_3d_and_4d_labels_recreates_managed_vectors(
     roi_path = tmp_path / "roi.npy"
     np.save(roi_path, _roi_data())
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()
     monkeypatch.setattr(
-        "napari_label_manager._widget.QColorDialog.getColor",
+        "napari_worm_neuron_annotator._widget.QColorDialog.getColor",
         lambda *args, **kwargs: QColor("#abcdef"),
     )
     widget.box_label_color_btn.click()
@@ -489,7 +489,7 @@ def test_annotation_sync_uses_zero_based_roi_ids(
     roi_path = tmp_path / "roi.npy"
     np.save(roi_path, _roi_data())
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()
@@ -519,13 +519,13 @@ def test_excel_round_trip_preserves_roi_identity(
     path = tmp_path / "annotations.xlsx"
 
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getSaveFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getSaveFileName",
         lambda *args, **kwargs: (str(path), ""),
     )
     widget.save_annotation_to_excel()
     widget._set_annotation_rows([])
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(path), ""),
     )
     widget.load_excel_to_annotation()
@@ -550,7 +550,7 @@ def test_shutdown_restores_layer_and_removes_managed_roi_layers(
     roi_path = tmp_path / "roi.npy"
     np.save(roi_path, _roi_data()[:1])
     monkeypatch.setattr(
-        "napari_label_manager._widget.QFileDialog.getOpenFileName",
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()

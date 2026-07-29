@@ -11,7 +11,7 @@ from qtpy.QtWidgets import (
     QPushButton,
 )
 
-from napari_label_manager._widget import (
+from napari_worm_neuron_annotator._widget import (
     ROLE_ACTIVE,
     ROLE_BOX_LABELS,
     ROLE_KEY,
@@ -650,11 +650,11 @@ def test_split_rejects_transform_mismatch_without_partial_layers(
     widget = LabelManager(viewer)
     messages = []
     monkeypatch.setattr(
-        "napari_label_manager._widget.QMessageBox.warning",
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
         lambda *args, **kwargs: messages.append(str(args[2])),
     )
     monkeypatch.setattr(
-        "napari_label_manager._widget.QMessageBox.critical",
+        "napari_worm_neuron_annotator._widget.QMessageBox.critical",
         lambda *args, **kwargs: messages.append(str(args[2])),
     )
 

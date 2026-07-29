@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from napari_label_manager._z_layers import (
+from napari_worm_neuron_annotator._z_layers import (
     ZLayerRange,
     build_z_layer_ranges,
     find_z_layer,
