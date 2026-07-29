@@ -7,13 +7,14 @@ from pathlib import Path
 
 import napari
 import numpy as np
-from napari.layers import Image, Labels, Vectors
+from napari.layers import Image, Labels, Points, Vectors
 from napari.utils import colormaps as cmap
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -40,6 +41,8 @@ from qtpy.QtWidgets import (
 from ._roi import (
     NeuronBoxDataset,
     add_time_axis,
+    box_label_point_2d,
+    box_label_point_3d,
     box_vectors_2d,
     box_vectors_3d,
     neuron_id_to_label_value,
@@ -68,7 +71,9 @@ ROLE_KEY = "napari_label_manager.role"
 ROLE_SELECTED = "roi_boxes_selected"
 LEGACY_ROLE_ALL = "roi_boxes_all"
 ROLE_ACTIVE = "roi_box_active"
+ROLE_BOX_LABELS = "roi_box_labels"
 MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
+MANAGED_ROI_ROLES = (*MANAGED_VECTOR_ROLES, ROLE_BOX_LABELS)
 ROLE_Z_IMAGE = "z_layer_image"
 ROLE_Z_LABELS = "z_layer_labels"
 MANAGED_Z_ROLES = (ROLE_Z_IMAGE, ROLE_Z_LABELS)
@@ -99,6 +104,7 @@ class LabelManager(QWidget):
         self._base_colors: dict[int, tuple[float, float, float, float]] = {}
         self._original_colormap = None
         self._original_opacity: float | None = None
+        self._box_label_color = "#ffffff"
         self._ui_sync = False
         self._closed = False
         self._keys_bound: list[str] = []
@@ -305,6 +311,28 @@ class LabelManager(QWidget):
         controls_layout.addStretch(1)
         group_layout.addLayout(controls_layout)
 
+        self.show_box_labels_checkbox = QCheckBox(
+            "Show selected box labels"
+        )
+        self.show_box_labels_checkbox.toggled.connect(
+            self._refresh_roi_layers
+        )
+        group_layout.addWidget(self.show_box_labels_checkbox)
+
+        box_label_color_layout = QHBoxLayout()
+        box_label_color_layout.addWidget(QLabel("Text color:"))
+        self.box_label_color_btn = QPushButton()
+        self.box_label_color_btn.setToolTip(
+            "Choose the color of selected neuron box text."
+        )
+        self.box_label_color_btn.clicked.connect(
+            self._choose_box_label_color
+        )
+        box_label_color_layout.addWidget(self.box_label_color_btn)
+        box_label_color_layout.addStretch(1)
+        group_layout.addLayout(box_label_color_layout)
+        self._update_box_label_color_button()
+
         self.selection_tree = QTreeWidget()
         self.selection_tree.setColumnCount(2)
         self.selection_tree.setHeaderLabels(["", "Neuron"])
@@ -327,6 +355,29 @@ class LabelManager(QWidget):
         group_layout.addWidget(self.selection_tree)
         group.setLayout(group_layout)
         return group
+
+    def _choose_box_label_color(self) -> None:
+        color = QColorDialog.getColor(
+            QColor(self._box_label_color),
+            self,
+            "Select box label text color",
+        )
+        if not color.isValid():
+            return
+        self._box_label_color = color.name()
+        self._update_box_label_color_button()
+        box_label_layer = self._managed_box_label_layer()
+        if box_label_layer is not None:
+            box_label_layer.text.color = self._box_label_color
+            box_label_layer.refresh()
+
+    def _update_box_label_color_button(self) -> None:
+        color = QColor(self._box_label_color)
+        foreground = "#000000" if color.lightness() > 127 else "#ffffff"
+        self.box_label_color_btn.setText(color.name().upper())
+        self.box_label_color_btn.setStyleSheet(
+            f"background-color: {color.name()}; color: {foreground};"
+        )
 
     def _add_labels_appearance_controls(
         self, group_layout: QVBoxLayout
@@ -915,7 +966,7 @@ class LabelManager(QWidget):
             self._clamp_z_to_active_layer(active_range)
 
         self._refresh_selection_item_styles()
-        self._refresh_vector_layers()
+        self._refresh_roi_layers()
         self._update_info()
 
     def _clamp_z_to_active_layer(self, z_range: ZLayerRange) -> None:
@@ -1010,7 +1061,7 @@ class LabelManager(QWidget):
         self._refresh_image_layers()
         self._refresh_label_layers()
         self._refresh_selection_item_styles()
-        self._refresh_vector_layers()
+        self._refresh_roi_layers()
         self._update_info()
 
     def _on_layer_changed(self, layer_name: str) -> None:
@@ -1023,7 +1074,7 @@ class LabelManager(QWidget):
         if self._z_ranges:
             self._clear_z_layers()
         self._detach_current_layer(restore=True)
-        self._remove_vector_layers()
+        self._remove_roi_layers()
         if not layer_name or layer_name == "No Labels layers available":
             self.current_layer = None
             self._available_ids = []
@@ -1031,7 +1082,7 @@ class LabelManager(QWidget):
             self.active_id = None
             self._rebuild_selection_items()
             self._sync_annotation_ids()
-            self._remove_vector_layers()
+            self._remove_roi_layers()
             self.update_status("No Labels layer selected", "orange")
             return
 
@@ -1054,13 +1105,13 @@ class LabelManager(QWidget):
         self.active_id = None
         self._refresh_available_ids(select_first=True)
         if self.roi_dataset is not None and layer.ndim in (3, 4):
-            self._ensure_vector_layers()
+            self._ensure_roi_layers()
         elif self.roi_dataset is not None:
             self.update_status(
                 "ROI overlays require a (z,y,x) or (t,z,y,x) Labels layer",
                 "orange",
             )
-        self._refresh_vector_layers()
+        self._refresh_roi_layers()
         self.update_status(f"Selected layer: {layer.name}", "blue")
 
     def _detach_current_layer(self, *, restore: bool) -> None:
@@ -1095,8 +1146,8 @@ class LabelManager(QWidget):
                 self._clear_z_layers()
             return
         if (
-            isinstance(removed, Vectors)
-            and removed.metadata.get(ROLE_KEY) in MANAGED_VECTOR_ROLES
+            isinstance(removed, Points | Vectors)
+            and removed.metadata.get(ROLE_KEY) in MANAGED_ROI_ROLES
         ):
             return
         if removed is self._z_source_image or removed is self.current_layer:
@@ -1121,7 +1172,7 @@ class LabelManager(QWidget):
             self._apply_label_opacity()
         if self._z_labels_proxy is not None:
             self._z_labels_proxy.refresh()
-        self._refresh_vector_layers()
+        self._refresh_roi_layers()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.shutdown()
@@ -1136,7 +1187,7 @@ class LabelManager(QWidget):
         self._unbind_keys()
         self._clear_z_layers()
         self._detach_current_layer(restore=True)
-        self._remove_vector_layers()
+        self._remove_roi_layers()
 
     # ------------------------------------------------------------------
     # ID discovery, checkable selection, and navigation
@@ -1382,7 +1433,7 @@ class LabelManager(QWidget):
     def _selection_changed(self, *, locate: bool) -> None:
         self._refresh_selection_item_styles()
         self._apply_label_opacity()
-        self._refresh_vector_layers()
+        self._refresh_roi_layers()
         self._sync_annotation_to_active()
         if locate:
             self._locate_active_box()
@@ -1545,8 +1596,8 @@ class LabelManager(QWidget):
         self.active_id = None
         self.checked_ids.clear()
         self._refresh_available_ids(select_first=True)
-        self._ensure_vector_layers()
-        self._refresh_vector_layers()
+        self._ensure_roi_layers()
+        self._refresh_roi_layers()
         self._update_roi_info()
         self.update_status(f"Loaded ROI: {source_path.name}", "green")
 
@@ -1555,7 +1606,7 @@ class LabelManager(QWidget):
         self.roi_path_input.clear()
         self.unload_roi_btn.setEnabled(False)
         self._set_roi_config_enabled(True)
-        self._remove_vector_layers()
+        self._remove_roi_layers()
         self.active_id = None
         self.checked_ids.clear()
         self.roi_info_label.setText("No ROI loaded; IDs come from Labels")
@@ -1631,9 +1682,9 @@ class LabelManager(QWidget):
         ):
             self._update_roi_info()
             self._refresh_selection_item_styles()
-            self._refresh_vector_layers()
+            self._refresh_roi_layers()
 
-    def _ensure_vector_layers(self) -> None:
+    def _ensure_roi_layers(self) -> None:
         if (
             self.current_layer is None
             or self.roi_dataset is None
@@ -1641,8 +1692,10 @@ class LabelManager(QWidget):
         ):
             return
         ndim = self.current_layer.ndim
-        empty = np.empty((0, 2, ndim), dtype=float)
+        empty_vectors = np.empty((0, 2, ndim), dtype=float)
+        empty_points = np.empty((0, ndim), dtype=float)
         axis_labels = tuple(self.current_layer.axis_labels)
+        units = tuple(self.current_layer.units)
 
         legacy_layer = self._managed_vector_layer(LEGACY_ROLE_ALL)
         if legacy_layer is not None and legacy_layer in self.viewer.layers:
@@ -1650,7 +1703,7 @@ class LabelManager(QWidget):
 
         if self._managed_vector_layer(ROLE_SELECTED) is None:
             self.viewer.add_vectors(
-                empty,
+                empty_vectors,
                 ndim=ndim,
                 name="Neuron boxes – selected",
                 vector_style="line",
@@ -1661,11 +1714,12 @@ class LabelManager(QWidget):
                 scale=tuple(self.current_layer.scale),
                 translate=tuple(self.current_layer.translate),
                 axis_labels=axis_labels,
+                units=units,
                 metadata={ROLE_KEY: ROLE_SELECTED},
             )
         if self._managed_vector_layer(ROLE_ACTIVE) is None:
             self.viewer.add_vectors(
-                empty,
+                empty_vectors,
                 ndim=ndim,
                 name="Neuron box – active",
                 vector_style="line",
@@ -1676,8 +1730,38 @@ class LabelManager(QWidget):
                 scale=tuple(self.current_layer.scale),
                 translate=tuple(self.current_layer.translate),
                 axis_labels=axis_labels,
+                units=units,
                 metadata={ROLE_KEY: ROLE_ACTIVE},
             )
+        if self._managed_box_label_layer() is None:
+            box_label_layer = self.viewer.add_points(
+                empty_points,
+                ndim=ndim,
+                name="Neuron labels – selected",
+                size=1,
+                face_color="transparent",
+                border_color="transparent",
+                border_width=0,
+                opacity=1.0,
+                blending="translucent",
+                features={
+                    "neuron_id": np.empty(0, dtype=int),
+                    "display_text": np.empty(0, dtype=str),
+                },
+                text={
+                    "string": "{display_text}",
+                    "color": self._box_label_color,
+                    "size": 12,
+                    "anchor": "center",
+                },
+                visible=self.show_box_labels_checkbox.isChecked(),
+                scale=tuple(self.current_layer.scale),
+                translate=tuple(self.current_layer.translate),
+                axis_labels=axis_labels,
+                units=units,
+                metadata={ROLE_KEY: ROLE_BOX_LABELS},
+            )
+            box_label_layer.editable = False
 
     def _managed_vector_layer(self, role: str) -> Vectors | None:
         for layer in self.viewer.layers:
@@ -1688,18 +1772,28 @@ class LabelManager(QWidget):
                 return layer
         return None
 
-    def _remove_vector_layers(self) -> None:
+    def _managed_box_label_layer(self) -> Points | None:
+        for layer in self.viewer.layers:
+            if (
+                isinstance(layer, Points)
+                and layer.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
+            ):
+                return layer
+        return None
+
+    def _remove_roi_layers(self) -> None:
         managed = [
             layer
             for layer in self.viewer.layers
-            if isinstance(layer, Vectors)
-            and layer.metadata.get(ROLE_KEY) in MANAGED_VECTOR_ROLES
+            if isinstance(layer, Points | Vectors)
+            and layer.metadata.get(ROLE_KEY) in MANAGED_ROI_ROLES
         ]
         for layer in managed:
             if layer in self.viewer.layers:
                 self.viewer.layers.remove(layer)
 
-    def _refresh_vector_layers(self) -> None:
+    def _refresh_roi_layers(self, event=None) -> None:
+        del event
         if (
             self.roi_dataset is None
             or self.current_layer is None
@@ -1708,12 +1802,15 @@ class LabelManager(QWidget):
             return
         selected_layer = self._managed_vector_layer(ROLE_SELECTED)
         active_layer = self._managed_vector_layer(ROLE_ACTIVE)
+        box_label_layer = self._managed_box_label_layer()
         if selected_layer is None or active_layer is None:
             return
 
         if not self._view_axes_supported():
             self._set_vector_data(selected_layer, [], [])
             self._set_vector_data(active_layer, [], [], active=True)
+            if box_label_layer is not None:
+                self._set_box_label_data(box_label_layer, [], [], [])
             self.update_status(
                 "ROI overlays require spatial y/x axes in 2D or z/y/x axes in 3D",
                 "orange",
@@ -1727,6 +1824,14 @@ class LabelManager(QWidget):
         selected_neuron_ids: list[int] = []
         active_vectors: list[np.ndarray] = []
         active_ids: list[int] = []
+        label_points: list[np.ndarray] = []
+        label_neuron_ids: list[int] = []
+        display_texts: list[str] = []
+        biological_names = self._annotation_names()
+        show_box_labels = (
+            box_label_layer is not None
+            and self.show_box_labels_checkbox.isChecked()
+        )
 
         for neuron_id in self.roi_dataset.valid_ids(viewer_t):
             if (
@@ -1744,14 +1849,29 @@ class LabelManager(QWidget):
                     continue
             if self.viewer.dims.ndisplay == 2:
                 geometry = box_vectors_2d(box, z_index, shape_zyx=shape_zyx)
+                label_point = box_label_point_2d(
+                    box, z_index, shape_zyx=shape_zyx
+                )
             else:
                 geometry = box_vectors_3d(box, shape_zyx=shape_zyx)
+                label_point = box_label_point_3d(box, shape_zyx=shape_zyx)
             if self.current_layer.ndim == 4:
                 geometry = add_time_axis(geometry, viewer_t)
+                if label_point is not None:
+                    label_point = np.concatenate(
+                        ([float(viewer_t)], label_point)
+                    )
             if len(geometry):
                 if neuron_id in self.checked_ids:
                     selected_vectors.append(geometry)
                     selected_neuron_ids.extend([neuron_id] * len(geometry))
+                    if show_box_labels and label_point is not None:
+                        label_points.append(
+                            np.asarray(label_point, dtype=float)
+                        )
+                        label_neuron_ids.append(neuron_id)
+                        biological = biological_names.get(neuron_id, "").strip()
+                        display_texts.append(biological or str(neuron_id))
                 if neuron_id == self.active_id:
                     active_vectors.append(geometry)
                     active_ids.extend([neuron_id] * len(geometry))
@@ -1762,6 +1882,13 @@ class LabelManager(QWidget):
         self._set_vector_data(
             active_layer, active_vectors, active_ids, active=True
         )
+        if box_label_layer is not None:
+            self._set_box_label_data(
+                box_label_layer,
+                label_points,
+                label_neuron_ids,
+                display_texts,
+            )
 
     def _set_vector_data(
         self,
@@ -1787,6 +1914,26 @@ class LabelManager(QWidget):
             )
         else:
             layer.edge_color = "white"
+
+    def _set_box_label_data(
+        self,
+        layer: Points,
+        points: list[np.ndarray],
+        neuron_ids: list[int],
+        display_texts: list[str],
+    ) -> None:
+        ndim = layer.ndim
+        layer.data = (
+            np.asarray(points, dtype=float).reshape(-1, ndim)
+            if points
+            else np.empty((0, ndim), dtype=float)
+        )
+        layer.features = {
+            "neuron_id": np.asarray(neuron_ids, dtype=int),
+            "display_text": np.asarray(display_texts, dtype=str),
+        }
+        layer.editable = False
+        layer.visible = self.show_box_labels_checkbox.isChecked()
 
     def _locate_active_box(self) -> None:
         if (
@@ -1887,6 +2034,7 @@ class LabelManager(QWidget):
             self.annotation_table.blockSignals(False)
             self._ui_sync = False
         self._refresh_selection_item_styles()
+        self._refresh_roi_layers()
 
     def _sync_annotation_ids(self) -> int:
         existing = self._annotation_rows()
@@ -1944,6 +2092,7 @@ class LabelManager(QWidget):
             return
         if item.column() in (0, 1):
             self._refresh_selection_item_styles()
+            self._refresh_roi_layers()
 
     def save_annotation_to_excel(self) -> None:
         if not EXCEL_AVAILABLE:

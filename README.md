@@ -184,9 +184,9 @@ source_t = volume_start + viewer_t * volume_stride
 
 Configure `volume_start` and `volume_stride` before loading the NPY.
 
-The derived Vectors layers copy scale, translation, and axis labels from the
-controlled Labels layer. Do not apply the z scale a second time in the ROI
-coordinates.
+The derived ROI overlay layers copy scale, translation, axis labels, and
+units from the controlled Labels layer. Do not apply the z scale a second
+time in the ROI coordinates.
 
 ## 2D and 3D box display
 
@@ -196,9 +196,16 @@ Two managed Vectors layers are created after loading an ROI file:
 - `Neuron box – active`: the active box with a thick yellow outline.
 
 Initially only the first valid neuron is checked and active. **All** includes
-all IDs in the selected layer, while **None** empties both derived layers.
-Checked identities that are missing at the current time remain checked but are
-temporarily omitted from the geometry.
+all IDs in the selected layer, while **None** empties both box layers and the
+optional text overlay. Checked identities that are missing at the current time
+remain checked but are temporarily omitted from the geometry.
+
+Enable **Show selected box labels** to place one text label at the center of
+each currently rendered checked box. The text uses the annotation table's
+`biological` value when present and otherwise falls back to the zero-based
+`neuron_id`. The third `annotation` column is not used for box labels. The
+option is off by default. Use **Text color** to choose a session-only label
+color that contrasts with the current Image colormap.
 
 In 2D mode, the plugin draws four rectangle edges only when the current z
 slice intersects the box's half-open z range.
@@ -207,8 +214,9 @@ In 3D mode, each box is represented by 12 vector edges. Overlapping boxes
 remain independent vector records with a `neuron_id` feature. They may overlap
 visually, but one box does not erase the identity of another.
 
-Vectors are derived display data. They are removed when the ROI is unloaded or
-the widget closes and are not saved as a separate annotation format.
+Vectors and the transparent Points text layer are derived display data. They
+are removed when the ROI is unloaded or the widget closes and are not saved
+as a separate annotation format.
 
 ## Annotation
 

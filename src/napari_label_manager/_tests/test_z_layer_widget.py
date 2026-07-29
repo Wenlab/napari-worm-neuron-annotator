@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from napari.layers import Labels, Vectors
+from napari.layers import Labels, Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -13,6 +13,7 @@ from qtpy.QtWidgets import (
 
 from napari_label_manager._widget import (
     ROLE_ACTIVE,
+    ROLE_BOX_LABELS,
     ROLE_KEY,
     ROLE_SELECTED,
     LabelManager,
@@ -35,6 +36,15 @@ def _managed_vector(viewer, role):
         layer
         for layer in viewer.layers
         if isinstance(layer, Vectors) and layer.metadata.get(ROLE_KEY) == role
+    )
+
+
+def _managed_box_labels(viewer):
+    return next(
+        layer
+        for layer in viewer.layers
+        if isinstance(layer, Points)
+        and layer.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
     )
 
 
@@ -414,20 +424,25 @@ def test_layer_view_filters_whole_boxes_by_center_and_navigation(
     widget.load_roi_path(roi_path)
     viewer.dims.ndisplay = 3
     widget.check_all()
+    widget.show_box_labels_checkbox.setChecked(True)
 
     _split(widget, qtbot, "3")
+    box_labels = _managed_box_labels(viewer)
+    assert set(box_labels.features["neuron_id"]) == {0, 1, 2}
     _select_z_layer(widget, 1)
 
     selected = _managed_vector(viewer, ROLE_SELECTED)
     active = _managed_vector(viewer, ROLE_ACTIVE)
     assert set(selected.features["neuron_id"]) == {0}
     assert set(active.features["neuron_id"]) == {0}
+    assert set(box_labels.features["neuron_id"]) == {0}
 
     _select_z_layer(widget, 2)
 
     assert widget.checked_ids == {0, 1, 2}
     assert widget.active_id == 0
     assert set(selected.features["neuron_id"]) == {1, 2}
+    assert set(box_labels.features["neuron_id"]) == {1, 2}
     assert len(active.data) == 0
 
     crossing = np.asarray(selected.data)[
@@ -488,11 +503,14 @@ def test_4d_time_change_recomputes_center_membership(
     widget.load_roi_path(roi_path)
     viewer.dims.ndisplay = 3
     widget.check_all()
+    widget.show_box_labels_checkbox.setChecked(True)
     _split(widget, qtbot, "3")
     _select_z_layer(widget, 1)
     selected = _managed_vector(viewer, ROLE_SELECTED)
+    box_labels = _managed_box_labels(viewer)
 
     assert set(selected.features["neuron_id"]) == {0}
+    assert set(box_labels.features["neuron_id"]) == {0}
 
     viewer.dims.current_step = (1, 0, 0, 0)
     qtbot.waitUntil(
@@ -501,6 +519,7 @@ def test_4d_time_change_recomputes_center_membership(
     )
     assert widget.checked_ids == {0, 1}
     assert widget.active_id == 0
+    assert set(box_labels.features["neuron_id"]) == {1}
 
     widget.navigate(1)
 

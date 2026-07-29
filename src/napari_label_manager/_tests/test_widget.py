@@ -1,13 +1,15 @@
 import numpy as np
 import pytest
-from napari.layers import Vectors
+from napari.layers import Points, Vectors
 from napari.utils import colormaps as cmap
 from qtpy.QtCore import Qt
+from qtpy.QtGui import QColor
 from qtpy.QtWidgets import QComboBox, QTreeWidget
 
 from napari_label_manager._widget import (
     EXCEL_AVAILABLE,
     ROLE_ACTIVE,
+    ROLE_BOX_LABELS,
     ROLE_KEY,
     ROLE_SELECTED,
     LabelManager,
@@ -34,6 +36,19 @@ def _managed_layer(viewer, role):
     )
 
 
+def _managed_box_labels(viewer):
+    return next(
+        layer
+        for layer in viewer.layers
+        if isinstance(layer, Points)
+        and layer.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
+    )
+
+
+def _box_label_rgba(layer):
+    return np.asarray(layer.text.color.constant, dtype=float)
+
+
 def test_widget_initializes_checkable_selection(make_napari_viewer):
     viewer = make_napari_viewer()
     labels = np.asarray([[0, 1], [2, 0]], dtype=np.int32)
@@ -45,6 +60,11 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     assert isinstance(widget.selection_tree, QTreeWidget)
     assert not widget.selection_tree.alternatingRowColors()
     assert widget.navigation_help_label.text() == "Q/W: last/next"
+    assert widget.show_box_labels_checkbox.text() == (
+        "Show selected box labels"
+    )
+    assert not widget.show_box_labels_checkbox.isChecked()
+    assert widget.box_label_color_btn.text() == "#FFFFFF"
     assert (
         widget.selected_opacity_slider.parentWidget()
         is widget.labels_layer_group
@@ -223,6 +243,100 @@ def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
     assert set(selected_layer.features["neuron_id"]) == {0, 1}
 
 
+def test_optional_box_labels_use_biological_name_with_id_fallback(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    labels_layer = viewer.add_labels(
+        np.zeros((2, 6, 24, 24), dtype=np.int32),
+        name="labels",
+        axis_labels=("t", "z", "y", "x"),
+        scale=(2, 5, 1, 1),
+        translate=(3, 4, 5, 6),
+        units=("s", "um", "um", "um"),
+    )
+    widget = LabelManager(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data())
+    widget.load_roi_path(roi_path)
+    viewer.dims.current_step = (0, 2, 0, 0)
+
+    box_labels = _managed_box_labels(viewer)
+    assert not widget.show_box_labels_checkbox.isChecked()
+    assert not box_labels.visible
+    assert box_labels.data.shape == (0, 4)
+    np.testing.assert_allclose(box_labels.scale, labels_layer.scale)
+    np.testing.assert_allclose(box_labels.translate, labels_layer.translate)
+    assert tuple(box_labels.axis_labels) == tuple(labels_layer.axis_labels)
+    assert tuple(box_labels.units) == tuple(labels_layer.units)
+    assert not box_labels.editable
+    np.testing.assert_allclose(_box_label_rgba(box_labels), [1, 1, 1, 1])
+
+    monkeypatch.setattr(
+        "napari_label_manager._widget.QColorDialog.getColor",
+        lambda *args, **kwargs: QColor("#123456"),
+    )
+    widget.box_label_color_btn.click()
+    assert widget.box_label_color_btn.text() == "#123456"
+    np.testing.assert_allclose(
+        _box_label_rgba(box_labels),
+        [0x12 / 255, 0x34 / 255, 0x56 / 255, 1],
+    )
+
+    monkeypatch.setattr(
+        "napari_label_manager._widget.QColorDialog.getColor",
+        lambda *args, **kwargs: QColor(),
+    )
+    widget.box_label_color_btn.click()
+    assert widget.box_label_color_btn.text() == "#123456"
+    np.testing.assert_allclose(
+        _box_label_rgba(box_labels),
+        [0x12 / 255, 0x34 / 255, 0x56 / 255, 1],
+    )
+
+    widget.show_box_labels_checkbox.setChecked(True)
+
+    assert widget.show_box_labels_checkbox.isChecked()
+    assert box_labels.visible
+    np.testing.assert_allclose(box_labels.data, [[0, 2, 10, 10]])
+    assert list(box_labels.features["neuron_id"]) == [0]
+    assert list(box_labels.features["display_text"]) == ["0"]
+    assert list(box_labels.text.values) == ["0"]
+    assert np.all(np.asarray(box_labels.face_color)[:, 3] == 0)
+    assert np.all(np.asarray(box_labels.border_color)[:, 3] == 0)
+
+    widget._set_annotation_rows([(0, "AVA", "note"), (1, "", "")])
+    assert list(box_labels.features["display_text"]) == ["AVA"]
+
+    widget.annotation_table.item(0, 1).setText("  AVA  ")
+    assert list(box_labels.features["display_text"]) == ["AVA"]
+    assert list(box_labels.text.values) == ["AVA"]
+
+    widget.annotation_table.item(0, 2).setText("ignored note")
+    assert list(box_labels.features["display_text"]) == ["AVA"]
+
+    widget.annotation_table.item(0, 1).setText("   ")
+    assert list(box_labels.features["display_text"]) == ["0"]
+
+    widget._selection_items[1].setCheckState(0, Qt.Checked)
+    assert set(box_labels.features["neuron_id"]) == {0, 1}
+    assert len(box_labels.data) == 2
+
+    viewer.dims.current_step = (1, 3, 0, 0)
+    assert list(box_labels.features["neuron_id"]) == [1]
+    np.testing.assert_allclose(box_labels.data, [[1, 3, 12, 12]])
+    viewer.dims.ndisplay = 3
+    np.testing.assert_allclose(box_labels.data, [[1, 3, 12, 12]])
+
+    expected_checked = set(widget.checked_ids)
+    expected_active = widget.active_id
+    widget.show_box_labels_checkbox.setChecked(False)
+    assert not box_labels.visible
+    assert box_labels.data.shape == (0, 4)
+    assert widget.checked_ids == expected_checked
+    assert widget.active_id == expected_active
+
+
 def test_row_click_checkbox_all_and_none_update_vector_layers(
     make_napari_viewer, qtbot, tmp_path
 ):
@@ -236,11 +350,14 @@ def test_row_click_checkbox_all_and_none_update_vector_layers(
     np.save(roi_path, _roi_data()[:1])
     widget.load_roi_path(roi_path)
     viewer.dims.ndisplay = 3
+    widget.show_box_labels_checkbox.setChecked(True)
 
     selected_layer = _managed_layer(viewer, ROLE_SELECTED)
     active_layer = _managed_layer(viewer, ROLE_ACTIVE)
+    box_labels = _managed_box_labels(viewer)
     assert selected_layer.data.shape == (12, 2, 4)
     assert active_layer.data.shape == (12, 2, 4)
+    assert list(box_labels.features["neuron_id"]) == [0]
 
     item_one = widget._selection_items[1]
     widget._on_selection_item_clicked(item_one, 1)
@@ -248,24 +365,28 @@ def test_row_click_checkbox_all_and_none_update_vector_layers(
     assert widget.active_id == 1
     assert item_one.font(1).bold()
     assert selected_layer.data.shape == (24, 2, 4)
+    assert set(box_labels.features["neuron_id"]) == {0, 1}
 
     item_one.setCheckState(0, Qt.Unchecked)
     assert widget.checked_ids == {0}
     assert widget.active_id is None
     assert active_layer.data.shape == (0, 2, 4)
     assert selected_layer.data.shape == (12, 2, 4)
+    assert list(box_labels.features["neuron_id"]) == [0]
 
     qtbot.mouseClick(widget.check_all_btn, Qt.LeftButton)
     assert widget.checked_ids == {0, 1}
     assert widget.active_id == 0
     assert selected_layer.data.shape == (24, 2, 4)
     assert active_layer.data.shape == (12, 2, 4)
+    assert set(box_labels.features["neuron_id"]) == {0, 1}
 
     qtbot.mouseClick(widget.check_none_btn, Qt.LeftButton)
     assert widget.checked_ids == set()
     assert widget.active_id is None
     assert selected_layer.data.shape == (0, 2, 4)
     assert active_layer.data.shape == (0, 2, 4)
+    assert box_labels.data.shape == (0, 4)
 
 
 def test_navigation_skips_missing_roi_at_current_time(
@@ -315,6 +436,11 @@ def test_switching_3d_and_4d_labels_recreates_managed_vectors(
         lambda *args, **kwargs: (str(roi_path), ""),
     )
     widget.load_roi_npy()
+    monkeypatch.setattr(
+        "napari_label_manager._widget.QColorDialog.getColor",
+        lambda *args, **kwargs: QColor("#abcdef"),
+    )
+    widget.box_label_color_btn.click()
 
     widget.layer_combo.setCurrentText(layer_3d.name)
     managed = [
@@ -325,6 +451,11 @@ def test_switching_3d_and_4d_labels_recreates_managed_vectors(
     ]
     assert len(managed) == 2
     assert all(layer.ndim == 3 for layer in managed)
+    assert _managed_box_labels(viewer).ndim == 3
+    np.testing.assert_allclose(
+        _box_label_rgba(_managed_box_labels(viewer)),
+        [0xAB / 255, 0xCD / 255, 0xEF / 255, 1],
+    )
 
     widget.layer_combo.setCurrentText(layer_4d.name)
     managed = [
@@ -335,6 +466,11 @@ def test_switching_3d_and_4d_labels_recreates_managed_vectors(
     ]
     assert len(managed) == 2
     assert all(layer.ndim == 4 for layer in managed)
+    assert _managed_box_labels(viewer).ndim == 4
+    np.testing.assert_allclose(
+        _box_label_rgba(_managed_box_labels(viewer)),
+        [0xAB / 255, 0xCD / 255, 0xEF / 255, 1],
+    )
 
 
 def test_annotation_sync_uses_zero_based_roi_ids(
@@ -396,7 +532,7 @@ def test_excel_round_trip_preserves_roi_identity(
     }
 
 
-def test_shutdown_restores_layer_and_removes_managed_vectors(
+def test_shutdown_restores_layer_and_removes_managed_roi_layers(
     make_napari_viewer, monkeypatch, tmp_path
 ):
     viewer = make_napari_viewer()
@@ -415,7 +551,17 @@ def test_shutdown_restores_layer_and_removes_managed_vectors(
     )
     widget.load_roi_npy()
     assert any(isinstance(item, Vectors) for item in viewer.layers)
+    assert _managed_box_labels(viewer) in viewer.layers
 
+    widget.unload_roi()
+    assert not any(
+        item.metadata.get(ROLE_KEY)
+        in (ROLE_SELECTED, ROLE_ACTIVE, ROLE_BOX_LABELS)
+        for item in viewer.layers
+    )
+
+    widget.load_roi_path(roi_path)
+    assert _managed_box_labels(viewer) in viewer.layers
     widget.shutdown()
 
     assert layer.colormap is original_colormap
@@ -423,5 +569,10 @@ def test_shutdown_restores_layer_and_removes_managed_vectors(
     assert not any(
         isinstance(item, Vectors)
         and item.metadata.get(ROLE_KEY) in (ROLE_SELECTED, ROLE_ACTIVE)
+        for item in viewer.layers
+    )
+    assert not any(
+        isinstance(item, Points)
+        and item.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
         for item in viewer.layers
     )

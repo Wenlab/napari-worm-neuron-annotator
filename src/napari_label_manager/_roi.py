@@ -223,6 +223,19 @@ def box_vectors_3d(
     )
 
 
+def box_label_point_3d(
+    box: NeuronBox,
+    *,
+    shape_zyx: tuple[int, int, int] | None = None,
+) -> tuple[float, float, float] | None:
+    """Return the center of the clipped 3D box, or ``None`` if not visible."""
+    bounds = _clipped_bounds(box, shape_zyx)
+    if bounds is None:
+        return None
+    center = (bounds[:, 0] + bounds[:, 1]) / 2.0
+    return tuple(float(value) for value in center)
+
+
 def box_vectors_2d(
     box: NeuronBox,
     z_index: float,
@@ -254,6 +267,27 @@ def box_vectors_2d(
             for start, end in edge_pairs
         ],
         dtype=float,
+    )
+
+
+def box_label_point_2d(
+    box: NeuronBox,
+    z_index: float,
+    *,
+    shape_zyx: tuple[int, int, int] | None = None,
+) -> tuple[float, float, float] | None:
+    """Return the clipped rectangle center on an intersecting z slice."""
+    bounds = _clipped_bounds(box, shape_zyx)
+    if bounds is None:
+        return None
+
+    (z_min, z_max), (y_min, y_max), (x_min, x_max) = bounds
+    if not z_min <= z_index < z_max:
+        return None
+    return (
+        float(z_index),
+        float((y_min + y_max) / 2.0),
+        float((x_min + x_max) / 2.0),
     )
 
 

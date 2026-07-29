@@ -5,6 +5,8 @@ from napari_label_manager._roi import (
     NeuronBox,
     NeuronBoxDataset,
     add_time_axis,
+    box_label_point_2d,
+    box_label_point_3d,
     box_vectors_2d,
     box_vectors_3d,
     label_value_to_neuron_id,
@@ -100,6 +102,98 @@ def test_box_geometry_has_four_2d_and_twelve_3d_edges():
         ),
     )
     assert box_vectors_2d(box, z_index=7).shape == (0, 2, 3)
+
+
+def test_box_label_point_3d_preserves_fractional_center():
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(4.25, 8.5, 12.75),
+        size_zyx=(2.5, 5.0, 7.5),
+    )
+    original_bounds = box.bounds_zyx
+
+    point = box_label_point_3d(box)
+
+    assert point == pytest.approx((4.25, 8.5, 12.75))
+    assert box.bounds_zyx == original_bounds
+
+
+def test_box_label_point_3d_uses_clipped_rendered_center():
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(1.0, 2.0, 8.5),
+        size_zyx=(4.0, 6.0, 5.0),
+    )
+
+    point = box_label_point_3d(box, shape_zyx=(6, 8, 10))
+
+    assert point == pytest.approx((1.5, 2.5, 8.0))
+
+
+def test_box_label_point_3d_returns_none_outside_volume():
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(3.0, 4.0, 12.0),
+        size_zyx=(2.0, 2.0, 2.0),
+    )
+
+    assert box_label_point_3d(box, shape_zyx=(6, 8, 10)) is None
+
+
+def test_box_label_point_2d_matches_clipped_rectangle_center():
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(2.5, 2.0, 8.5),
+        size_zyx=(3.0, 6.0, 5.0),
+    )
+
+    point = box_label_point_2d(
+        box,
+        z_index=2.25,
+        shape_zyx=(6, 8, 10),
+    )
+
+    assert point == pytest.approx((2.25, 2.5, 8.0))
+    assert box_vectors_2d(
+        box,
+        z_index=2.25,
+        shape_zyx=(6, 8, 10),
+    ).shape == (4, 2, 3)
+
+
+@pytest.mark.parametrize("z_index", [0.5, 4.0])
+def test_box_label_point_2d_excludes_nonintersecting_slices(z_index):
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(2.5, 4.0, 5.0),
+        size_zyx=(3.0, 2.0, 2.0),
+    )
+
+    assert box_label_point_2d(box, z_index) is None
+    assert box_vectors_2d(box, z_index).shape == (0, 2, 3)
+
+
+def test_box_label_point_2d_returns_none_outside_volume():
+    box = NeuronBox(
+        neuron_id=3,
+        source_t=1,
+        center_zyx=(2.5, 4.0, 12.0),
+        size_zyx=(3.0, 2.0, 2.0),
+    )
+
+    assert (
+        box_label_point_2d(
+            box,
+            z_index=2.5,
+            shape_zyx=(6, 8, 10),
+        )
+        is None
+    )
 
 
 def test_add_time_axis_preserves_geometry():
