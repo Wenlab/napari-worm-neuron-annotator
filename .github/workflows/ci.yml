@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - npe2
+  pull_request:
+    branches:
+      - main
+      - npe2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.platform }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up headless Qt display
+        uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+          wm: herbstluftwm
+
+      - name: Install test runner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install setuptools tox tox-gh-actions
+
+      - name: Test with tox
+        run: python -m tox
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v6
+
+  test-excel:
+    name: ubuntu-latest py3.13 excel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up headless Qt display
+        uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+          wm: herbstluftwm
+
+      - name: Install package with Excel and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[testing,excel]"
+
+      - name: Test Excel-enabled environment
+        run: python -m pytest -q
+
+      - name: Validate npe2 manifest
+        run: >-
+          python -m npe2 validate
+          src/napari_worm_neuron_annotator/napari.yaml
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
