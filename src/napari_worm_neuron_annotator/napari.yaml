@@ -1,4 +1,4 @@
-name: napari-label-manager
+name: napari-worm-neuron-annotator
 display_name: Worm Neuron Annotator
 # use 'hidden' to remove plugin from napari hub search results
 visibility: public
@@ -6,9 +6,9 @@ visibility: public
 categories: ["Utilities"]
 contributions:
   commands:
-    - id: napari-label-manager.LabelManager
+    - id: napari-worm-neuron-annotator.LabelManager
       python_name: napari_worm_neuron_annotator._widget:LabelManager
       title: Worm Neuron Annotator
   widgets:
-    - command: napari-label-manager.LabelManager
+    - command: napari-worm-neuron-annotator.LabelManager
       display_name: Worm Neuron Annotator

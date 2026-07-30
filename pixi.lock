@@ -2589,8 +2589,8 @@ packages:
   timestamp: 1736862579398
 - pypi: ./
   name: napari-worm-neuron-annotator
-  version: 0.1.5.dev10+ge18e06b43.d20260729
-  sha256: e83e4e08adb672cf85594fe38b78d3f1e1a72e4183bfc9bfc86723bfe03c62be
+  version: 0.2.0rc2.dev1+g86075a703.d20260730
+  sha256: 2a41628898b7759abba5130ffb76e2b4ca4b354d3892d9899899a3ac3a0d9b10
   requires_dist:
   - napari>=0.8,<0.9
   - numpy

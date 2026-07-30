@@ -48,7 +48,7 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-napari-label-manager = "napari_worm_neuron_annotator:napari.yaml"
+napari-worm-neuron-annotator = "napari_worm_neuron_annotator:napari.yaml"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/Wenlab/napari-worm-neuron-annotator/issues"
