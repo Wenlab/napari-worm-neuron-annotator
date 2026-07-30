@@ -1,6 +1,6 @@
-# napari-label-manager
+# napari-worm-neuron-annotator
 
-`napari-label-manager` is a napari plugin for navigating neuron bounding-box
+`napari-worm-neuron-annotator` is a napari plugin for navigating neuron bounding-box
 ROIs and controlling the visibility of checked IDs in a `Labels` layer.
 
 The plugin treats the two representations differently:
@@ -33,19 +33,19 @@ Original ROI arrays and Labels data are never modified.
 Install into an existing napari environment:
 
 ```text
-pip install napari-label-manager
+pip install napari-worm-neuron-annotator
 ```
 
 For a fresh environment, install napari with its default Qt 6 backend:
 
 ```text
-pip install "napari-label-manager[all]"
+pip install "napari-worm-neuron-annotator[all]"
 ```
 
 Excel support alone is available through:
 
 ```text
-pip install "napari-label-manager[excel]"
+pip install "napari-worm-neuron-annotator[excel]"
 ```
 
 The base plugin does not install or select a Qt binding. The napari
@@ -59,7 +59,7 @@ and compatibility decisions.
 ## Basic Labels workflow
 
 1. Open a `Labels` layer.
-2. Open `Plugins > Neuron ROI Navigator`.
+2. Open `Plugins > Worm Neuron Annotator`.
 3. Select the Labels layer in the widget.
 4. Click a row to check and activate that ID.
 5. Use the checkbox column to add or remove IDs from the persistent set.
@@ -247,8 +247,8 @@ pixi run ruff check .
 ```
 
 The repository uses a `src` layout. Pure ROI parsing and geometry live in
-`src/napari_label_manager/_roi.py`; Qt and napari lifecycle behavior live in
-`src/napari_label_manager/_widget.py`.
+`src/napari_worm_neuron_annotator/_roi.py`; Qt and napari lifecycle behavior
+live in `src/napari_worm_neuron_annotator/_widget.py`.
 
 ## License
 

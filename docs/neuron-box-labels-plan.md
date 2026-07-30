@@ -122,8 +122,8 @@ without changing Qt or napari layer behavior.
 ### Task 1.1: Add a 3D rendered-box center helper
 
 - **Location**:
-  - `src/napari_label_manager/_roi.py`
-  - `src/napari_label_manager/_tests/test_roi.py`
+  - `src/napari_worm_neuron_annotator/_roi.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_roi.py`
 - **Description**:
   - Add a small pure helper that reuses `_clipped_bounds()`.
   - Return the midpoint of each clipped `(z,y,x)` bound.
@@ -140,8 +140,8 @@ without changing Qt or napari layer behavior.
 ### Task 1.2: Add a 2D rendered-rectangle center helper
 
 - **Location**:
-  - `src/napari_label_manager/_roi.py`
-  - `src/napari_label_manager/_tests/test_roi.py`
+  - `src/napari_worm_neuron_annotator/_roi.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_roi.py`
 - **Description**:
   - Reuse `_clipped_bounds()` and the same half-open Z intersection rule as
     `box_vectors_2d()`.
@@ -158,7 +158,7 @@ without changing Qt or napari layer behavior.
 ### Task 1.3: Protect existing geometry behavior
 
 - **Location**:
-  - `src/napari_label_manager/_tests/test_roi.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_roi.py`
 - **Description**:
   - Retain explicit assertions for four 2D edges and twelve 3D edges while
     adding anchor tests.
@@ -169,7 +169,7 @@ without changing Qt or napari layer behavior.
   - Existing Vectors geometry tests pass unchanged.
   - Anchor computation allocates only small coordinate arrays.
 - **Validation**:
-  - Run `pixi run pytest src/napari_label_manager/_tests/test_roi.py -q`.
+  - Run `pixi run pytest src/napari_worm_neuron_annotator/_tests/test_roi.py -q`.
 
 ## Sprint 2: Optional Managed Points Text Layer
 
@@ -186,8 +186,8 @@ checked box.
 ### Task 2.1: Add the compact visibility control
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
 - **Description**:
   - Add `Show selected box labels` below the existing All/None controls in the
     Neuron Selection group.
@@ -208,8 +208,8 @@ checked box.
 ### Task 2.2: Define and create the managed Points layer
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
 - **Description**:
   - Import `napari.layers.Points`.
   - Add a dedicated metadata role such as `roi_box_labels`.
@@ -233,8 +233,8 @@ checked box.
 ### Task 2.3: Build one label record per rendered checked box
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
 - **Description**:
   - During the existing ROI iteration, collect one anchor per checked neuron
     after applying current-time validity, active Z-range membership, supported
@@ -258,8 +258,8 @@ checked box.
 ### Task 2.4: Refresh text after annotation changes
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
 - **Description**:
   - Refresh the Points data after a second-column edit.
   - Refresh after `_set_annotation_rows()` because it blocks item signals
@@ -291,9 +291,9 @@ changes, unload, and shutdown.
 ### Task 3.1: Synchronize dimensions and Z-layer filtering
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
-  - `src/napari_label_manager/_tests/test_z_layer_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_z_layer_widget.py`
 - **Description**:
   - Include Points refresh in the existing dimensions and Z-view refresh
     paths.
@@ -316,8 +316,8 @@ changes, unload, and shutdown.
 ### Task 3.2: Complete managed-layer cleanup
 
 - **Location**:
-  - `src/napari_label_manager/_widget.py`
-  - `src/napari_label_manager/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
 - **Description**:
   - Include the Points metadata role in managed ROI overlay discovery and
     cleanup.
@@ -338,8 +338,8 @@ changes, unload, and shutdown.
 ### Task 3.3: Add focused regression coverage
 
 - **Location**:
-  - `src/napari_label_manager/_tests/test_widget.py`
-  - `src/napari_label_manager/_tests/test_z_layer_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_widget.py`
+  - `src/napari_worm_neuron_annotator/_tests/test_z_layer_widget.py`
 - **Description**:
   - Assert unchanged selected/active Vectors edge counts and features while
     text is enabled and disabled.
@@ -399,13 +399,13 @@ changes, unload, and shutdown.
 Run from the repository root:
 
 ```powershell
-pixi run pytest src/napari_label_manager/_tests/test_roi.py -q
-pixi run pytest src/napari_label_manager/_tests/test_widget.py -q
-pixi run pytest src/napari_label_manager/_tests/test_z_layer_widget.py -q
+pixi run pytest src/napari_worm_neuron_annotator/_tests/test_roi.py -q
+pixi run pytest src/napari_worm_neuron_annotator/_tests/test_widget.py -q
+pixi run pytest src/napari_worm_neuron_annotator/_tests/test_z_layer_widget.py -q
 pixi run pytest -q
 pixi run -e excel pytest -q
 pixi run ruff check .
-$env:PYTHONUTF8='1'; pixi run npe2 validate src/napari_label_manager/napari.yaml
+$env:PYTHONUTF8='1'; pixi run npe2 validate src/napari_worm_neuron_annotator/napari.yaml
 git diff --check
 ```
 

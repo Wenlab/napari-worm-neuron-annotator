@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from napari_label_manager._roi import (
+from napari_worm_neuron_annotator._roi import (
     NeuronBox,
     NeuronBoxDataset,
     add_time_axis,

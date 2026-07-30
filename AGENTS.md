@@ -103,17 +103,17 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 
 ## Repository layout
 
-- `src/napari_label_manager/_roi.py`: read-only NPY parsing, ID mapping, pure
+- `src/napari_worm_neuron_annotator/_roi.py`: read-only NPY parsing, ID mapping, pure
   2D/3D box geometry, and clipped text-anchor coordinates.
-- `src/napari_label_manager/_z_layers.py`: pure Z-range, slicing, membership,
+- `src/napari_worm_neuron_annotator/_z_layers.py`: pure Z-range, slicing, membership,
   translation, and threshold-profile helpers.
-- `src/napari_label_manager/_z_profile.py`: compact Qt Z-profile plot and
+- `src/napari_worm_neuron_annotator/_z_profile.py`: compact Qt Z-profile plot and
   click-to-cut interaction.
-- `src/napari_label_manager/_widget.py`: widget state, layer selection,
+- `src/napari_worm_neuron_annotator/_widget.py`: widget state, layer selection,
   colormap/opacity control, navigation, optional box text/color, Z display,
   and managed-layer lifecycles.
-- `src/napari_label_manager/napari.yaml`: npe2 plugin manifest.
-- `src/napari_label_manager/_tests/`: pytest and pytest-qt tests.
+- `src/napari_worm_neuron_annotator/napari.yaml`: npe2 plugin manifest.
+- `src/napari_worm_neuron_annotator/_tests/`: pytest and pytest-qt tests.
 - `docs/napari-0.8-migration.md`: supported Python/napari/Qt policy.
 - `scripts/launch_20260417_w2.py`: read-only, memory-mapped real-data napari
   launcher used for manual acceptance.
@@ -290,7 +290,7 @@ Run from the repository root:
 pixi run pytest -q
 pixi run -e excel pytest -q
 pixi run ruff check .
-$env:PYTHONUTF8='1'; pixi run npe2 validate src/napari_label_manager/napari.yaml
+$env:PYTHONUTF8='1'; pixi run npe2 validate src/napari_worm_neuron_annotator/napari.yaml
 pixi run launch-actual
 ```
 
