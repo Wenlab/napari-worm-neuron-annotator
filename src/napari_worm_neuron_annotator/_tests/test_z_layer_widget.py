@@ -17,6 +17,7 @@ from napari_worm_neuron_annotator._widget import (
     ROLE_KEY,
     ROLE_SELECTED,
     LabelManager,
+    NeuronAnnotatorWidget,
 )
 
 ROLE_Z_IMAGE = "z_layer_image"
@@ -103,6 +104,11 @@ def _split(widget, qtbot, cuts):
     qtbot.mouseClick(widget.split_z_btn, Qt.LeftButton)
 
 
+def _bind_labels(widget, labels):
+    widget.labels_combo.setCurrentText(labels.name)
+    assert widget.current_labels is labels
+
+
 def _select_z_layer(widget, number):
     prefix = f"Layer {number} "
     index = next(
@@ -120,6 +126,55 @@ def _roi_data_by_z_center():
     data[0, 1] = [4, 4, 15, 2, 2, 20]  # center z=3, crosses cut
     data[0, 2] = [4, 4, 25, 2, 2, 5]  # center z=5, Layer 2
     return data
+
+
+def test_split_image_without_labels_creates_no_labels_proxy(
+    make_napari_viewer, qtbot
+):
+    viewer = make_napari_viewer()
+    source = viewer.add_image(
+        np.arange(6 * 4 * 5, dtype=np.uint16).reshape(6, 4, 5),
+        name="image",
+    )
+    widget = NeuronAnnotatorWidget(viewer)
+
+    _split(widget, qtbot, "2,4")
+
+    assert widget.current_image is source
+    assert len(_managed_layers(viewer, ROLE_Z_IMAGE)) == 3
+    assert _managed_layers(viewer, ROLE_Z_LABELS) == []
+    assert not source.visible
+
+
+def test_switching_image_during_split_preserves_roi_state(
+    make_napari_viewer, qtbot, tmp_path
+):
+    viewer = make_napari_viewer()
+    image_a = viewer.add_image(np.zeros((6, 8, 8)), name="image-a")
+    image_b = viewer.add_image(
+        np.zeros((6, 8, 8)), name="image-b", translate=(3, 4, 5)
+    )
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.image_combo.setCurrentText(image_a.name)
+    roi_path = tmp_path / "centers.npy"
+    np.save(roi_path, _roi_data_by_z_center())
+    widget.load_roi_path(roi_path)
+    widget.check_all()
+    widget.annotation_table.item(0, 1).setText("AVA")
+    active_before = widget.active_id
+
+    _split(widget, qtbot, "3")
+    widget.image_combo.setCurrentText(image_b.name)
+
+    assert widget.current_image is image_b
+    assert widget.image_combo.currentText() == image_b.name
+    assert not _managed_layers(viewer, ROLE_Z_IMAGE)
+    assert widget.checked_ids == {0, 1, 2}
+    assert widget.active_id == active_before
+    assert widget.annotation_table.item(0, 1).text() == "AVA"
+    np.testing.assert_allclose(
+        _managed_vector(viewer, ROLE_SELECTED).translate, image_b.translate
+    )
 
 
 def test_z_layer_controls_are_compact_and_filter_image_sources(
@@ -146,7 +201,7 @@ def test_z_layer_controls_are_compact_and_filter_image_sources(
     assert isinstance(widget.clear_z_btn, QPushButton)
     assert widget.scroll_area.widget() is widget.scroll_content
     assert widget.scroll_area.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
-    group = _ancestor_group(widget.z_image_combo)
+    group = _ancestor_group(widget.z_cuts_input)
     assert group is not None
     assert group.title() == "Z Layers"
     assert all(
@@ -161,7 +216,7 @@ def test_z_layer_controls_are_compact_and_filter_image_sources(
         )
     )
     descriptions = [label.text() for label in group.findChildren(QLabel)]
-    assert "Split image by z; sync Labels and boxes." in descriptions
+    assert "Split Image by z; sync optional Labels and boxes." in descriptions
     assert _combo_texts(widget.z_image_combo) == ["image-3d", "image-4d"]
     assert _combo_texts(widget.z_view_combo) == ["All"]
     assert not widget.z_view_combo.isEnabled()
@@ -251,8 +306,9 @@ def test_split_3d_and_4d_synchronizes_image_and_labels(
     )
     labels.contour = 1
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     labels_before = labels_data.copy()
-    label_rgb = np.asarray(labels.get_color(1), dtype=float)[:3]
+    label_color = np.asarray(labels.get_color(1), dtype=float)
 
     _split(widget, qtbot, "2,4")
 
@@ -300,10 +356,9 @@ def test_split_3d_and_4d_synchronizes_image_and_labels(
     np.testing.assert_allclose(proxy.translate, expected_translate)
     assert proxy.name not in _combo_texts(widget.layer_combo)
 
-    widget.selected_opacity_slider.setValue(35)
+    assert not widget.selected_opacity_slider.isEnabled()
     proxy_color = np.asarray(proxy.get_color(1), dtype=float)
-    np.testing.assert_allclose(proxy_color[:3], label_rgb)
-    assert proxy_color[3] == pytest.approx(0.35)
+    np.testing.assert_allclose(proxy_color, label_color)
     np.testing.assert_array_equal(labels.data, labels_before)
 
     widget.z_view_combo.setCurrentIndex(0)
@@ -332,12 +387,13 @@ def test_memmap_split_layers_keep_shared_storage(
         name="memmap-image",
         axis_labels=("z", "y", "x"),
     )
-    viewer.add_labels(
+    labels = viewer.add_labels(
         labels_data,
         name="memmap-labels",
         axis_labels=("z", "y", "x"),
     )
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
 
     _split(widget, qtbot, "2,4")
     _select_z_layer(widget, 2)
@@ -364,12 +420,13 @@ def test_dask_split_layers_remain_lazy(
         axis_labels=("z", "y", "x"),
         contrast_limits=(0, 1),
     )
-    viewer.add_labels(
+    labels = viewer.add_labels(
         labels_data,
         name="dask-labels",
         axis_labels=("z", "y", "x"),
     )
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
 
     _split(widget, qtbot, "2,4")
     _select_z_layer(widget, 2)
@@ -389,7 +446,7 @@ def test_direct_zarr_split_is_rejected_before_materialization(
     image_data = zarr.array(np.ones((6, 4, 5), dtype=np.float32))
     labels_data = zarr.array(np.ones((6, 4, 5), dtype=np.int16))
     viewer = make_napari_viewer()
-    viewer.add_image(
+    image = viewer.add_image(
         image_data,
         name="zarr-image",
         axis_labels=("z", "y", "x"),
@@ -401,11 +458,11 @@ def test_direct_zarr_split_is_rejected_before_materialization(
         axis_labels=("z", "y", "x"),
     )
     widget = LabelManager(viewer)
-    widget.z_cuts_input.setText("3")
 
     with pytest.raises(ValueError, match="Direct Zarr"):
-        widget._create_z_layers()
+        widget._validate_image_source(image)
 
+    assert widget.current_image is None
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
     assert not _managed_layers(viewer, ROLE_Z_LABELS)
 
@@ -540,6 +597,7 @@ def test_clear_restores_sources_and_preserves_global_selection(
         labels_visible=False,
     )
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     roi_path = tmp_path / "centers.npy"
     np.save(roi_path, _roi_data_by_z_center())
     widget.load_roi_path(roi_path)
@@ -615,6 +673,7 @@ def test_switching_controlled_labels_clears_then_allows_new_split(
         translate=tuple(labels_a.translate),
     )
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels_a)
     _split(widget, qtbot, "3")
 
     widget.layer_combo.setCurrentText(labels_b.name)
@@ -648,25 +707,19 @@ def test_split_rejects_transform_mismatch_without_partial_layers(
         scale=(3, 1, 1),
     )
     widget = LabelManager(viewer)
-    messages = []
-    monkeypatch.setattr(
-        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
-        lambda *args, **kwargs: messages.append(str(args[2])),
-    )
-    monkeypatch.setattr(
-        "napari_worm_neuron_annotator._widget.QMessageBox.critical",
-        lambda *args, **kwargs: messages.append(str(args[2])),
-    )
+    widget.labels_combo.setCurrentText(labels.name)
+    del qtbot, monkeypatch
 
-    _split(widget, qtbot, "3")
+    with pytest.raises(ValueError, match="scale"):
+        widget._validate_labels_binding(image, labels)
 
+    assert widget.current_labels is None
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
     assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert image.visible
     assert labels.visible
     assert not widget.z_view_combo.isEnabled()
-    feedback = " ".join([widget.status_label.text(), *messages]).lower()
-    assert "scale" in feedback or "match" in feedback
+    assert "scale" in widget.status_label.text().lower()
 
 
 def test_split_rejects_plane_depiction(
@@ -676,10 +729,9 @@ def test_split_rejects_plane_depiction(
     image, _, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     image.depiction = "plane"
     widget = LabelManager(viewer)
-    widget.z_cuts_input.setText("3")
 
     with pytest.raises(ValueError, match="volume depiction"):
-        widget._create_z_layers()
+        widget._validate_image_source(image)
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
     assert not _managed_layers(viewer, ROLE_Z_LABELS)
@@ -694,6 +746,7 @@ def test_source_data_replacement_clears_split_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
     assert _managed_layers(viewer, ROLE_Z_IMAGE)
 
@@ -717,6 +770,7 @@ def test_removing_one_derived_image_clears_the_split_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     _split(widget, qtbot, "2,4")
     derived = _managed_layers(viewer, ROLE_Z_IMAGE)
     assert len(derived) == 3
@@ -739,6 +793,7 @@ def test_removing_a_split_source_or_proxy_clears_the_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
     _select_z_layer(widget, 1)
     proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
@@ -762,6 +817,7 @@ def test_source_geometry_change_clears_the_split_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
 
     image.scale = (3, 1, 1)
@@ -780,6 +836,7 @@ def test_labels_update_refreshes_the_proxy_without_clearing_split(
     viewer = make_napari_viewer()
     _, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
+    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
     _select_z_layer(widget, 1)
     proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
@@ -791,7 +848,7 @@ def test_labels_update_refreshes_the_proxy_without_clearing_split(
     )
 
     assert proxy.data[1, 1, 1] == 2
-    assert widget._available_ids == [1, 2]
+    assert widget._available_ids == []
     assert _managed_layers(viewer, ROLE_Z_IMAGE)
     assert proxy.visible
     assert not proxy.editable
