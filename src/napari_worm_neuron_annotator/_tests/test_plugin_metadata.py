@@ -27,13 +27,21 @@ def test_manifest_identity_matches_distribution():
         "napari.yaml"
     )
     manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    command_id = f"{DISTRIBUTION_NAME}.LabelManager"
+    widget_command_id = f"{DISTRIBUTION_NAME}.NeuronAnnotatorWidget"
+    legacy_command_id = f"{DISTRIBUTION_NAME}.LabelManager"
 
     assert manifest["name"] == DISTRIBUTION_NAME
     assert manifest["display_name"] == "Worm Neuron Annotator"
     assert manifest["contributions"]["commands"] == [
         {
-            "id": command_id,
+            "id": widget_command_id,
+            "python_name": (
+                "napari_worm_neuron_annotator._widget:NeuronAnnotatorWidget"
+            ),
+            "title": "Worm Neuron Annotator",
+        },
+        {
+            "id": legacy_command_id,
             "python_name": (
                 "napari_worm_neuron_annotator._widget:LabelManager"
             ),
@@ -42,7 +50,14 @@ def test_manifest_identity_matches_distribution():
     ]
     assert manifest["contributions"]["widgets"] == [
         {
-            "command": command_id,
+            "command": widget_command_id,
             "display_name": "Worm Neuron Annotator",
         }
     ]
+
+
+def test_public_widget_export_keeps_label_manager_alias():
+    assert (
+        napari_worm_neuron_annotator.LabelManager
+        is napari_worm_neuron_annotator.NeuronAnnotatorWidget
+    )

@@ -6,9 +6,12 @@ visibility: public
 categories: ["Utilities"]
 contributions:
   commands:
+    - id: napari-worm-neuron-annotator.NeuronAnnotatorWidget
+      python_name: napari_worm_neuron_annotator._widget:NeuronAnnotatorWidget
+      title: Worm Neuron Annotator
     - id: napari-worm-neuron-annotator.LabelManager
       python_name: napari_worm_neuron_annotator._widget:LabelManager
       title: Worm Neuron Annotator
   widgets:
-    - command: napari-worm-neuron-annotator.LabelManager
+    - command: napari-worm-neuron-annotator.NeuronAnnotatorWidget
       display_name: Worm Neuron Annotator

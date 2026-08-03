@@ -8,6 +8,6 @@ except ImportError:
     except PackageNotFoundError:
         __version__ = "0+unknown"
 
-from ._widget import LabelManager
+from ._widget import LabelManager, NeuronAnnotatorWidget
 
-__all__ = ("LabelManager",)
+__all__ = ("NeuronAnnotatorWidget", "LabelManager")
