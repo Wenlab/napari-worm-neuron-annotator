@@ -1,7 +1,7 @@
 [project]
 name = "napari-worm-neuron-annotator"
 dynamic = ["version"]
-description = "Navigate neuron box ROIs and control Labels visibility in napari"
+description = "Navigate and annotate neuron box ROIs on image volumes in napari"
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -136,7 +136,7 @@ default = { solve-group = "default" }
 excel = { features = ["excel"], solve-group = "default" }
 
 [tool.pixi.tasks]
-launch-actual = "python scripts/launch_20260417_w2.py"
+launch-actual = "python scripts/launch_20260304_w3_immobile.py"
 
 [tool.pixi.dependencies]
 python = ">=3.11,<3.15"

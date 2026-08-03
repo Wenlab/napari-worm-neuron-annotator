@@ -427,8 +427,8 @@ Verify:
 - Enabling it shows one centered label for the initial checked neuron.
 - A populated biological name replaces its numeric ID immediately.
 - Clearing the biological name restores the zero-based ID.
-- All at time zero preserves `138 × 12 = 1656` selected edges and produces
-  exactly 138 text anchors when all 138 boxes are valid and visible.
+- All at time zero preserves `120 × 12 = 1440` selected edges and produces
+  exactly 120 text anchors when all 120 boxes are valid and visible.
 - None empties selected, active, and text overlays.
 - Q/W preserves prior checks and text follows the checked set.
 - 2D slice changes show labels only for intersecting rectangles.

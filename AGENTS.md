@@ -2,24 +2,26 @@
 
 ## Project purpose
 
-This repository provides a napari plugin for navigating read-only neuron
-bounding-box ROIs and managing `Labels` visibility. Its primary
-responsibilities are preserving ROI identity across overlapping boxes,
-changing checked/unchecked label alpha without changing RGB, and deriving
-2D/3D `Vectors` box overlays plus optional `Points` text overlays without
-modifying source data.
+This repository provides a napari plugin for navigating and annotating
+read-only neuron bounding-box ROIs on Image volumes. Its primary
+responsibilities are preserving ROI identity across overlapping boxes and
+deriving 2D/3D `Vectors` box overlays plus optional `Points` text overlays
+without modifying source data. A compatible `Labels` layer is an explicit,
+optional display overlay with checked/unchecked alpha control.
 
-Treat annotation and Excel features as secondary to correct label
-visualization.
+Treat optional Labels integration, annotation, and Excel features as secondary
+to correct Image + ROI navigation and visualization. The Image layer supplies
+spatial metadata; the ROI array supplies neuron identities and geometry.
 
 ## Current product behavior
 
 The plugin has two independent neuron-selection states:
 
 - `checked_ids`: persistent global identities selected by checkboxes. This set
-  controls Labels checked/unchecked alpha and the
-  `Neuron boxes – selected` Vectors layer. When box labels are enabled, it
-  also controls the `Neuron labels – selected` Points layer.
+  controls the `Neuron boxes – selected` Vectors layer and, when box labels
+  are enabled, the `Neuron labels – selected` Points layer. If a compatible
+  Labels layer is explicitly selected, it also controls checked/unchecked
+  label alpha.
 - `active_id`: the most recently activated identity. It controls the bold,
   current list row, annotation-table selection, view centering, and the yellow
   `Neuron box – active` Vectors layer.
@@ -39,10 +41,10 @@ Keep these states separate. The supported interactions are:
   remain listed and checked but are not rendered at that time point.
 
 The Neuron Selection control is a non-alternating `QTreeWidget`. Keep its
-visible help text concise (`Q/W: last/next`). Labels opacity controls belong
-inside the Labels Layer panel. Do not reintroduce `Show Labels context`,
-`Reset Display`, random-colormap controls, text ID entry, or Ctrl-click
-selection semantics.
+visible help text concise (`Q/W: last/next`). Keep optional Labels selection
+and opacity controls inside the Labels Layer panel. Do not reintroduce
+`Show Labels context`, `Reset Display`, random-colormap controls, text ID
+entry, Labels-only identity discovery, or Ctrl-click selection semantics.
 
 `Show selected box labels` is optional and off by default. When enabled:
 
@@ -57,11 +59,11 @@ selection semantics.
 
 ## Z-layer display behavior
 
-The compact Z Layers panel coordinates one compatible Image layer, the
-controlled Labels layer, and the runtime Neuron Boxes overlays:
+The compact Z Layers panel coordinates one Image layer, the runtime Neuron
+Boxes overlays, and an optional compatible Labels layer:
 
-- Support only matching `(z,y,x)` and `(t,z,y,x)` Image/Labels pairs with
-  matching shapes, axis labels, scale, translation, and units.
+- Support `(z,y,x)` and `(t,z,y,x)` Image layers. If the user explicitly binds
+  Labels, require matching shape, axis labels, scale, translation, and units.
 - Reject RGB, multiscale, direct Zarr, non-axis-aligned, plane-depiction, and
   clipped Image sources. Users may wrap Zarr data as Dask before splitting.
 - Users provide explicit, strictly increasing Z cuts. Ranges are half-open;
@@ -71,16 +73,23 @@ controlled Labels layer, and the runtime Neuron Boxes overlays:
   source array.
 - Every derived Image layer uses `additive` blending. Do not change the source
   Image layer's blending setting.
-- All shows every derived Image layer, the complete Labels layer, all
-  currently valid checked/active boxes, and enabled checked-box text.
-- Layer k shows only its derived Image, a read-only Labels slice, and whole
-  boxes and enabled text whose `center_z` belongs to that range. Do not clip a
-  crossing box or duplicate it or its text across ranges.
+- With no Labels bound, All/Layer k manage only derived Images, checked/active
+  Vectors, and enabled Points text.
+- With compatible Labels bound, Split creates read-only view or lazy-slice
+  proxies. All shows the complete source Labels and hides the proxies. Layer k
+  hides the source Labels and shows only the matching proxy slice.
+- Layer k shows whole boxes and enabled text whose `center_z` belongs to that
+  range. Do not clip a crossing box or duplicate it or its text across ranges.
 - `checked_ids` and `active_id` remain global. In Layer k mode, Q/W navigates
   only current-time boxes assigned to that range. The neuron tree still lists
   all IDs and grays IDs outside the active range without disabling checkboxes.
-- Clear removes all runtime Z layers and restores the source Image and Labels
-  visibility captured before splitting. Z configuration is session-only.
+- Clear removes all runtime Z layers and restores the source Image and any
+  bound Labels visibility captured before splitting. Z configuration is
+  session-only.
+
+Never use Labels as the source of ROI identities, colors, or spatial metadata.
+Do not require Labels for ROI loading, selection, rendering, annotation,
+centering, time navigation, or Z-layer display.
 
 The Z profile counts, for each slice at the current time point, pixels with
 intensity strictly greater than an editable threshold. The default threshold
@@ -98,8 +107,8 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 - Fix root causes without adding unnecessary abstractions or dependencies.
 - Preserve backward-compatible plugin behavior unless a change is documented.
 - Do not modify raw label arrays when a display-only colormap change is enough.
-- Keep UI code, label-statistics code, and file I/O behavior independently
-  testable where practical.
+- Keep UI code, ROI geometry, optional Labels display, and file I/O behavior
+  independently testable where practical.
 
 ## Repository layout
 
@@ -115,11 +124,11 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 - `src/napari_worm_neuron_annotator/napari.yaml`: npe2 plugin manifest.
 - `src/napari_worm_neuron_annotator/_tests/`: pytest and pytest-qt tests.
 - `docs/napari-0.8-migration.md`: supported Python/napari/Qt policy.
-- `scripts/launch_20260417_w2.py`: read-only, memory-mapped real-data napari
+- `scripts/launch_20260304_w3_immobile.py`: read-only, memory-mapped real-data napari
   launcher used for manual acceptance.
 - `pyproject.toml`: package metadata, dependencies, Ruff, Pixi, and test setup.
 
-## Napari Labels requirements
+## Optional Napari Labels requirements
 
 ### Colormaps and opacity
 
@@ -140,29 +149,25 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 
 ### Layer lifecycle and caching
 
-- Track only `napari.layers.Labels` instances in the selector.
+- Offer an explicit no-Labels choice and track only `napari.layers.Labels`
+  instances in the selector.
 - Connect layer-specific events when a layer is selected and disconnect them
   when it is replaced, removed, or the widget is destroyed.
-- Invalidate cached IDs and counts when label data changes, including painting,
-  undo/redo, replacement of `layer.data`, and relevant dimensional navigation.
-- Cache entries must be tied to both the layer and the data/view state used to
-  compute them. Never return stale IDs after an edit or layer switch.
 - Avoid duplicate event connections and duplicate selector instances.
+- Restore the selected Labels colormap and opacity when the widget switches
+  layers, clears the selection, or closes.
 
-### Dimensions and large data
+### Identity and large data
 
-- Do not infer that axis 0 is time merely because an array has three or more
-  dimensions. A 3D array is commonly a volumetric label image.
-- If current-view or current-time statistics are intended, obtain navigation
-  state from `viewer.dims` and explicitly define which axes are being sliced.
-- State whether an operation covers the full label volume or only the current
-  displayed slice/time point.
+- Derive the neuron list and annotation-table identities from the ROI array,
+  never by scanning Labels data.
+- Keep the only identity conversion at the explicit
+  `label_value = neuron_id + 1` boundary.
 - Preserve integer label IDs exactly; do not cast them through floating point.
 - For large NumPy, Dask, Zarr, or memory-mapped arrays, avoid unconditional
   full-array masks, copies, flattening, or `np.unique` calls.
-- Sampling may support approximate status information, but actions named
-  "All Current IDs" must not silently omit labels. Mark approximations clearly
-  and do not use them for destructive or authoritative operations.
+- Do not infer that axis 0 is time from dimensionality alone. Support only the
+  explicit `(z,y,x)` and `(t,z,y,x)` layouts shared with the source Image.
 
 ## Qt and concurrency
 
@@ -179,10 +184,10 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 
 ## Annotation and Excel behavior
 
-- Use one documented ID convention across the label layer, table, preservation
-  logic, and Excel files. If a displayed ID is offset, convert at explicit
-  boundaries and test round trips.
-- Populate the annotation table from Current IDs automatically when the source
+- Use the zero-based ROI `neuron_id` across the neuron list, table,
+  preservation logic, and Excel files. Convert to the optional Labels value
+  only at the explicit `label_value = neuron_id + 1` boundary.
+- Populate the annotation table from ROI Current IDs after the ROI source
   changes. Preserve matching biological names and text by identity.
 - Treat column two, `biological`, as the display name used by the neuron list
   and optional box text. Strip it only for display/fallback decisions; do not
@@ -191,7 +196,7 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
   labels.
 - Keep the manual Current IDs refresh, Load, and Save actions. Do not
   reintroduce Start, End, or Fill controls.
-- Reloading current IDs must preserve annotations by label identity, not row
+- Reloading current IDs must preserve annotations by neuron identity, not row
   position.
 - Saving and loading an unchanged workbook must preserve digital IDs and text.
 - Advertise only file formats that the installed reader can actually load.
@@ -213,6 +218,9 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
   rasterize multiple identities back into one dense Labels value.
 - `Neuron boxes – selected` uses metadata role `roi_boxes_selected` and contains
   only `checked_ids ∩ valid_ids` for the current time and view.
+- Give each selected box a deterministic color derived from its zero-based
+  `neuron_id`. Keep that color stable across time, selection changes, and
+  optional Labels bindings.
 - `Neuron box – active` uses metadata role `roi_box_active`, contains only the
   current valid `active_id`, and is always rendered as a thick yellow outline.
 - `Neuron labels – selected` is a transparent, non-editable Points layer with
@@ -224,11 +232,12 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 - In 3D, generate 12 edges per included box and place text at the center of
   the clipped rendered box.
 - Managed Vectors and Points layers are runtime-derived artifacts identified
-  by metadata. Remove them when unloading ROI, changing controlled Labels, or
+  by metadata. Remove them when unloading ROI, changing the source Image, or
   closing the widget, and disconnect viewer events during shutdown.
-- Support only explicit `(z,y,x)` and `(t,z,y,x)` controlled Labels layouts.
-- Copy scale, translation, axis labels, and units from the controlled Labels
-  layer.
+- Support only explicit `(z,y,x)` and `(t,z,y,x)` source Image layouts.
+- Copy scale, translation, axis labels, and units from the source Image layer.
+- Require an optional Labels overlay to match the source Image metadata. Never
+  use Labels as the spatial authority or as the source of ROI colors.
 - Do not save Vectors or Points as an annotation format or write ROI changes
   back to NPY.
 
@@ -240,8 +249,11 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
   migration changes this range.
 - Keep pytest, pytest-qt, coverage, and lint tools in development/testing
   dependencies only.
-- Keep `napari.yaml`, entry points, and package exports synchronized when
-  renaming widgets or commands.
+- Keep `NeuronAnnotatorWidget` as the public widget name and the only widget
+  shown in the npe2 manifest. Preserve `LabelManager` as a Python and command
+  compatibility alias until a documented migration removes it.
+- Keep `napari.yaml`, entry points, package exports, and metadata tests
+  synchronized when renaming widgets or commands.
 - Use the setuptools-scm generated version as the single version source.
 
 ## Testing expectations
@@ -251,25 +263,29 @@ arrays with explicit expected values.
 
 At minimum, test:
 
-- widget creation with zero, one, and multiple pre-existing Labels layers;
+- widget creation with zero, one, and multiple pre-existing Image or Labels
+  layers;
 - layer insertion, removal, rename, reorder, and selection;
+- Image + ROI loading, selection, rendering, annotation, and Z display with no
+  Labels layer;
 - initial checked/active state, row clicks, checkbox changes, Q/W wrap,
   All/None, and active cancellation;
 - opacity changes preserving RGB values for cyclic and direct colormaps;
 - checked default `0.50`, unchecked default `0.00`, background, and
   unknown-label opacity behavior;
-- cache invalidation after painting and `layer.data` replacement;
 - 2D four-edge rectangles, 3D 12-edge boxes, overlapping identity features,
   time changes, and missing observations;
+- deterministic selected-box colors that remain stable across time and do not
+  depend on optional Labels;
 - selected and active Vectors edge counts and managed-layer cleanup;
 - one Points text anchor per visible checked box, biological-name fallback,
   exact 2D/3D/4D coordinates, missing observations, text color selection and
   cancellation, read-only behavior, and cleanup;
 - Z-cut parsing, half-open membership, 3D/4D view-preserving slices, shifted
   translation, and per-Z threshold pixel counts;
-- All/Layer k synchronization across Image, Labels, Vectors, Points, Q/W
-  navigation, gray outside-range IDs, additive blending, and cleanup on source
-  changes;
+- All/Layer k synchronization across Image, Vectors, Points, Q/W navigation,
+  gray outside-range IDs, additive blending, and cleanup on source changes,
+  both without Labels and with a compatible optional Labels overlay;
 - editable threshold refresh, click-to-cut behavior, and vertical scrolling;
 - annotation preservation and Excel save/load round trips.
 
@@ -277,10 +293,11 @@ Tests must assert behavior and values, not only that widgets exist or buttons
 can be clicked.
 
 Automated tests are regression checks, not the primary product acceptance.
-For GUI changes, also exercise the real napari workflow and verify the
-selection list, Q/W, All/None, 2D/3D switching, time navigation, Labels alpha,
+For GUI changes, exercise the real napari Image + ROI workflow without Labels
+and verify the selection list, Q/W, All/None, 2D/3D switching, time navigation,
 box text fallback/color, layer visibility, Z threshold profile, additive
-blending, and dock scrolling.
+blending, and dock scrolling. Enable the launcher Labels toggle for a separate
+optional-overlay pass that covers Labels alpha and Z proxies.
 
 ## Validation commands
 
@@ -294,11 +311,14 @@ $env:PYTHONUTF8='1'; pixi run npe2 validate src/napari_worm_neuron_annotator/nap
 pixi run launch-actual
 ```
 
-`launch-actual` expects the local `20260417_w2_npy` dataset referenced by the
-launcher. It memory-maps image and Labels arrays and must never modify them.
-At time zero in 3D, the current reference data has 138 valid boxes: initial
+`launch-actual` expects the git-ignored local `20260304_w3_immobile_npy`
+dataset referenced by the
+launcher. By default it memory-maps only the Image and ROI arrays. An explicit
+disabled toggle loads the optional Labels array for a separate validation pass.
+The launcher must never modify any source array.
+At time zero in 3D, the current reference data has 120 valid boxes: initial
 selection produces 12 selected and 12 active edges, All produces
-`138 × 12 = 1656` selected edges and 138 text anchors when box labels are
+`120 × 12 = 1440` selected edges and 120 text anchors when box labels are
 enabled, and None empties both box layers plus the text layer.
 
 For packaging changes, also build the package and verify that napari discovers

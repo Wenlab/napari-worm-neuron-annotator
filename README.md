@@ -1,30 +1,38 @@
 # napari-worm-neuron-annotator
 
-`napari-worm-neuron-annotator` is a napari plugin for navigating neuron bounding-box
-ROIs and controlling the visibility of checked IDs in a `Labels` layer.
+`napari-worm-neuron-annotator` is a napari plugin for navigating and annotating
+read-only neuron bounding-box ROIs on 3D or 4D Image volumes.
 
-The plugin treats the two representations differently:
+The plugin keeps each data source in a separate role:
 
-- the ROI array is the authoritative neuron identity and box geometry;
-- the `Labels` layer is a display context in which label value
-  `neuron_id + 1` represents a zero-based neuron ID;
-- napari `Vectors` layers are generated at runtime to show overlapping boxes
-  without writing them into a dense integer mask.
+- the Image layer supplies the spatial axes, world transform, and Z-navigation
+  context;
+- the ROI array supplies neuron identity and box geometry;
+- runtime `Vectors` and `Points` layers show boxes and optional text without
+  writing them into a dense mask;
+- an explicitly selected `Labels` layer can add a compatible mask overlay and
+  checked/unchecked alpha control.
 
-Original ROI arrays and Labels data are never modified.
+The plugin does not modify Image, ROI, or optional Labels source data.
+
+> **Roadmap:** Plugin-managed Labels are planned for deprecation. The primary
+> workflow now uses Image + ROI-derived Vectors/Points, while an explicitly
+> selected Labels layer remains available for compatibility.
+> See [the deferred deprecation decision](#deferred-deprecation-of-plugin-managed-labels).
 
 ## Features
 
-- Checkable neuron list with a distinct active neuron.
+- Image + ROI operation without a Labels layer.
+- Read-only loading of `(T,N,K)` ROI NPY arrays.
+- Dynamic 2D bounding rectangles and 3D 12-edge wireframes.
+- Stable per-neuron box colors derived from zero-based ROI identity.
+- Checkable neuron list with a separate active neuron.
 - All/None controls and cumulative Q/W navigation.
-- Independent opacity for checked and unchecked Labels.
-- Exact RGB preservation when changing alpha.
-- Read-only loading of `neuron_pt_tuple.npy`.
-- Dynamic 2D bounding rectangles on the current z slice.
-- Dynamic 3D 12-edge wireframes for the current volume.
 - Active-neuron highlighting and view centering.
-- Zero-copy Z-layer display synchronized across Image, Labels, and boxes.
+- View-preserving Z-layer display synchronized across Image and ROI overlays.
 - Zero-based ROI annotation with optional Excel import/export.
+- Optional Labels overlay with independent checked/unchecked alpha and exact
+  RGB preservation.
 - Automatic restoration of the original Labels colormap and opacity when the
   widget closes or switches to another Labels layer.
 
@@ -56,12 +64,12 @@ This release targets Python 3.11–3.14 and napari 0.8.x. See the
 [napari 0.8 migration notes](docs/napari-0.8-migration.md) for the dependency
 and compatibility decisions.
 
-## Basic Labels workflow
+## Image + ROI workflow
 
-1. Open a `Labels` layer.
+1. Open an Image layer with `(z,y,x)` or `(t,z,y,x)` axes.
 2. Open `Plugins > Worm Neuron Annotator`.
-3. Select the Labels layer in the widget.
-4. Click a row to check and activate that ID.
+3. Select the Image layer, then load the ROI NPY file.
+4. Click a neuron row to check and activate that ID.
 5. Use the checkbox column to add or remove IDs from the persistent set.
 6. Use Q and W to check and activate the previous or next valid ID without
    clearing IDs already checked.
@@ -71,18 +79,32 @@ The active row is bold and remains the current row. Unchecking the active ID
 clears the active state; unchecking another ID does not change the active
 neuron.
 
-The **Labels Layer** panel also controls checked and unchecked label alpha.
-The defaults are `0.50` for checked labels and `0.00` for unchecked labels.
-Hide the entire mask with the normal eye icon in napari's layer list. The
-original Labels colormap and opacity are restored automatically when the
-widget closes or switches to another Labels layer.
+The ROI array defines the neuron list. You do not need a Labels layer for
+selection, box rendering, annotation, centering, time navigation, or Z-layer
+display.
 
-For small in-memory arrays, IDs are discovered exactly from the Labels data.
-The plugin intentionally does not scan out-of-core arrays or arrays larger
-than 10 million voxels. Load an ROI NPY file in those cases.
+## Optional Labels overlay
 
-Labels-only discovery cannot recover an identity that has already been
-completely overwritten in a dense mask.
+Select a Labels layer only when you need the mask overlay. Its shape, axes,
+scale, translation, and units must match the selected Image layer. The ROI
+array remains the identity source, and the Image layer remains the spatial
+authority.
+
+The **Labels Layer** panel controls checked and unchecked label alpha. The
+defaults are `0.50` and `0.00`. Alpha changes preserve each label's RGB value,
+and the widget restores the original colormap and opacity when it closes or
+switches to another Labels layer. The napari layer-list eye icon can hide the
+whole mask.
+
+## Deferred deprecation of plugin-managed Labels
+
+The current release keeps the optional Labels integration and the legacy
+`LabelManager` Python and command aliases for compatibility. The public widget
+name is `NeuronAnnotatorWidget`, and napari lists only that widget.
+
+A future compatibility migration may remove plugin-managed Labels after users
+have had time to move their Image + ROI workflows. No removal version is set.
+Source Labels data remains read-only during the migration period.
 
 ## Z-layer display
 
@@ -100,12 +122,15 @@ Cuts use half-open Python ranges. For a volume with 18 Z slices, `4,10`
 creates `[0,4)`, `[4,10)`, and `[10,18)`. A boundary slice belongs to the
 following layer.
 
-**All** displays every generated Image layer using additive blending, the
-complete Labels layer, and all currently valid checked boxes. **Layer k**
-displays only that Image
-range, the corresponding read-only Labels slice, and boxes whose center Z
-belongs to the range. A box that crosses a cut is shown whole in the one
-layer containing its center.
+**All** displays every generated Image layer using additive blending and all
+currently valid checked/active ROI overlays. **Layer k** displays only that
+Image range and the overlays whose box center Z belongs to the range. A box
+that crosses a cut is shown whole in the one layer containing its center.
+
+When you explicitly bind compatible Labels, **Split** creates read-only view
+or lazy-slice proxies. **All** shows the complete source Labels and hides the
+proxies. **Layer k** hides the source and shows its matching proxy slice. The
+plugin never allocates a dense Labels copy.
 
 Checked and active neuron identities remain global. In an individual layer,
 Q/W navigates only neurons assigned to that layer; other neurons remain in
@@ -114,25 +139,26 @@ row does not move the view outside the selected Z layer.
 
 Generated Image layers use slices of NumPy arrays, memory maps, or Dask
 arrays rather than full-size zero-filled copies. Direct Zarr arrays should
-be wrapped as Dask arrays before splitting. The Image and Labels sources
-must have matching `(z,y,x)` or `(t,z,y,x)` shape, axis labels, scale,
-translation, and units, with axis-aligned volume depiction and no clipping
-planes. **Clear** removes all generated Z layers and restores the original
-source visibility. Normal napari eye icons may still override visibility
-until the next **Show** selection.
+be wrapped as Dask arrays before splitting. The Image source must have
+`(z,y,x)` or `(t,z,y,x)` axes, axis-aligned volume depiction, and no clipping
+planes. Optional Labels must match its shape and spatial metadata. **Clear**
+removes generated Image and Labels layers and restores the source visibility
+captured before splitting. Normal napari eye icons may still override
+visibility until the next **Show** selection.
 
-### Launch the validated 20260417_w2 dataset
+### Launch the validated 20260304_w3_immobile dataset
 
-The repository includes a ready-to-use launcher for the local validation
-dataset:
+The repository includes a ready-to-use launcher for the git-ignored local
+dataset at `data/20260304_w3_immobile_npy`:
 
 ```text
 pixi run launch-actual
 ```
 
-It memory-maps `volumes.npy`, `neuron_mask.npy`, and
-`neuron_point_tuple.npy`, opens napari, docks the navigator, and loads all
-138 ROI identities automatically.
+It memory-maps `volumes.npy` and `neuron_point_tuple.npy`, opens napari, docks
+the navigator, and loads all 120 ROI identities. The launcher leaves its
+`LOAD_OPTIONAL_LABELS` validation toggle disabled by default. Enable it to
+memory-map `neuron_mask.npy` and exercise the optional Labels integration.
 
 ## ROI input format
 
@@ -163,7 +189,7 @@ the current time point.
 
 ### Coordinate and time mapping
 
-The plugin assumes the controlled Labels layer has one of these axis orders:
+The plugin requires the selected Image layer to have one of these axis orders:
 
 ```text
 (z, y, x)
@@ -186,14 +212,15 @@ source_t = volume_start + viewer_t * volume_stride
 Configure `volume_start` and `volume_stride` before loading the NPY.
 
 The derived ROI overlay layers copy scale, translation, axis labels, and
-units from the controlled Labels layer. Do not apply the z scale a second
-time in the ROI coordinates.
+units from the Image layer. Do not apply the z scale a second time in the ROI
+coordinates. Optional Labels never supply ROI colors or spatial metadata.
 
 ## 2D and 3D box display
 
 Two managed Vectors layers are created after loading an ROI file:
 
-- `Neuron boxes – selected`: checked, currently valid boxes at low opacity;
+- `Neuron boxes – selected`: checked, currently valid boxes colored by their
+  stable `neuron_id` palette;
 - `Neuron box – active`: the active box with a thick yellow outline.
 
 Initially only the first valid neuron is checked and active. **All** includes
@@ -221,11 +248,10 @@ as a separate annotation format.
 
 ## Annotation
 
-In ROI mode, the `digital` column always stores the zero-based `neuron_id`.
-In Labels-only mode, it stores the raw Labels value.
+The `digital` column stores the zero-based ROI `neuron_id`.
 
-The table automatically follows the current identities. Existing biological
-names and annotation text are preserved by identity when the source changes.
+The table follows the loaded ROI identities. Existing biological names and
+annotation text are preserved by identity when the ROI source changes.
 Activating a neuron selects its annotation row. Selecting a table row checks
 and activates the corresponding neuron without clearing other checked IDs.
 The `biological` value is also displayed in the neuron list.

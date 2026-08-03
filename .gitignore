@@ -80,6 +80,9 @@ venv/
 # OS
 .DS_Store
 
+# Local validation datasets
+/data/
+
 # written by setuptools_scm
 **/_version.py
 # pixi environments
