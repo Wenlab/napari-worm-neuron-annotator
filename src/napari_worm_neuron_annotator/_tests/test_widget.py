@@ -351,6 +351,7 @@ def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
     assert widget.checked_ids == {0}
     selected_layer = _managed_layer(viewer, ROLE_SELECTED)
     active_layer = _managed_layer(viewer, ROLE_ACTIVE)
+    assert active_layer.edge_width == 2.0
     assert selected_layer.data.shape == (4, 2, 4)
     assert active_layer.data.shape == (4, 2, 4)
     assert set(selected_layer.features["neuron_id"]) == {0}

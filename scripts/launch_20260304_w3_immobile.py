@@ -12,7 +12,7 @@ DATA_DIR = (
     Path(__file__).resolve().parents[1] / "data" / f"{DATASET_NAME}_npy"
 )
 IMAGE_PATH = DATA_DIR / "volumes.npy"
-LABELS_PATH = DATA_DIR / "neuron_mask.npy"
+LABELS_PATH = None
 ROI_PATH = DATA_DIR / "neuron_point_tuple.npy"
 
 # Set this to True only when validating the optional Labels integration.

@@ -1870,7 +1870,7 @@ class NeuronAnnotatorWidget(QWidget):
                 ndim=ndim,
                 name="Neuron box – active",
                 vector_style="line",
-                edge_width=3.0,
+                edge_width=2.0,
                 edge_color="yellow",
                 opacity=1.0,
                 blending="translucent",
