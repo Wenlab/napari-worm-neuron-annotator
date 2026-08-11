@@ -28,6 +28,7 @@ The plugin does not modify Image, ROI, or optional Labels source data.
 - Stable per-neuron box colors derived from zero-based ROI identity.
 - Checkable neuron list with a separate active neuron.
 - All/None controls and cumulative Q/W navigation.
+- Fixed canvas shortcuts for Z-slice and time-frame navigation.
 - Active-neuron highlighting and view centering.
 - View-preserving Z-layer display synchronized across Image and ROI overlays.
 - Zero-based ROI annotation with optional Excel import/export.
@@ -74,6 +75,12 @@ and compatibility decisions.
 6. Use Q and W to check and activate the previous or next valid ID without
    clearing IDs already checked.
 7. Use **All** or **None** to check every ID or clear all checked/active IDs.
+
+With the napari canvas focused, use G/H for the previous/next Z slice in 2D,
+J/K for the previous/next time frame of a 4D Image, and Shift-J/Shift-K to
+move backward/forward by 10 time frames. Navigation stops at the data bounds
+rather than wrapping. In an individual Z layer, G/H stays within that layer's
+half-open Z range.
 
 The active row is bold and remains the current row. Unchecking the active ID
 clears the active state; unchecking another ID does not change the active

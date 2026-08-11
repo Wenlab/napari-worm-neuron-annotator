@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from app_model.types import KeyBinding
 from napari.layers import Points, Vectors
 from napari.utils import colormaps as cmap
 from qtpy.QtCore import Qt
@@ -49,6 +50,10 @@ def _managed_box_labels(viewer):
 
 def _box_label_rgba(layer):
     return np.asarray(layer.text.color.constant, dtype=float)
+
+
+def _press_viewer_key(viewer, key):
+    viewer.keymap[KeyBinding.from_str(key)](viewer)
 
 
 def test_image_is_spatial_authority_and_roi_works_without_labels(
@@ -119,6 +124,72 @@ def test_widget_without_image_disables_roi_and_labels_controls(
     assert not widget.selected_opacity_slider.isEnabled()
     assert not widget.other_opacity_slider.isEnabled()
     assert not widget.hide_unchecked_checkbox.isEnabled()
+
+
+def test_g_h_navigate_z_only_in_2d_and_unbind_on_shutdown(
+    make_napari_viewer,
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((4, 3, 2)), name="image")
+    widget = NeuronAnnotatorWidget(viewer)
+    viewer.dims.current_step = (2, 0, 0)
+
+    _press_viewer_key(viewer, "G")
+    assert viewer.dims.current_step == (1, 0, 0)
+    _press_viewer_key(viewer, "G")
+    _press_viewer_key(viewer, "G")
+    assert viewer.dims.current_step == (0, 0, 0)
+
+    _press_viewer_key(viewer, "H")
+    assert viewer.dims.current_step == (1, 0, 0)
+    viewer.dims.current_step = (3, 0, 0)
+    _press_viewer_key(viewer, "H")
+    assert viewer.dims.current_step == (3, 0, 0)
+
+    viewer.dims.ndisplay = 3
+    _press_viewer_key(viewer, "G")
+    assert viewer.dims.current_step == (3, 0, 0)
+
+    widget.shutdown()
+    assert KeyBinding.from_str("G") not in viewer.keymap
+    assert KeyBinding.from_str("H") not in viewer.keymap
+
+
+def test_j_k_navigate_4d_time_with_shift_acceleration(
+    make_napari_viewer,
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((25, 4, 3, 2)), name="image-4d")
+    widget = NeuronAnnotatorWidget(viewer)
+    viewer.dims.current_step = (12, 2, 0, 0)
+
+    _press_viewer_key(viewer, "J")
+    assert viewer.dims.current_step == (11, 2, 0, 0)
+    _press_viewer_key(viewer, "K")
+    assert viewer.dims.current_step == (12, 2, 0, 0)
+
+    _press_viewer_key(viewer, "Shift-J")
+    assert viewer.dims.current_step == (2, 2, 0, 0)
+    _press_viewer_key(viewer, "Shift-J")
+    assert viewer.dims.current_step == (0, 2, 0, 0)
+    viewer.dims.current_step = (20, 2, 0, 0)
+    _press_viewer_key(viewer, "Shift-K")
+    _press_viewer_key(viewer, "Shift-K")
+    assert viewer.dims.current_step == (24, 2, 0, 0)
+
+    viewer.dims.ndisplay = 3
+    _press_viewer_key(viewer, "J")
+    assert viewer.dims.current_step == (23, 2, 0, 0)
+
+    viewer.add_image(np.zeros((4, 3, 2)), name="image-3d")
+    widget.image_combo.setCurrentText("image-3d")
+    before = viewer.dims.current_step
+    _press_viewer_key(viewer, "K")
+    assert viewer.dims.current_step == before
+
+    widget.shutdown()
+    for key in ("J", "K", "Shift-J", "Shift-K"):
+        assert KeyBinding.from_str(key) not in viewer.keymap
 
 
 def test_widget_initializes_checkable_selection(make_napari_viewer):

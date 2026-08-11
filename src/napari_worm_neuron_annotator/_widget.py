@@ -545,14 +545,23 @@ class NeuronAnnotatorWidget(QWidget):
                 emitter.disconnect(self._on_dims_changed)
 
     def _bind_keys(self) -> None:
-        bindings = (("Q", self._previous_key), ("W", self._next_key))
+        bindings = (
+            ("Q", self._previous_key),
+            ("W", self._next_key),
+            ("G", self._previous_z_key),
+            ("H", self._next_z_key),
+            ("J", self._previous_time_key),
+            ("K", self._next_time_key),
+            ("Shift-J", self._previous_time_fast_key),
+            ("Shift-K", self._next_time_fast_key),
+        )
         for key, callback in bindings:
             try:
                 self.viewer.bind_key(key, callback)
                 self._keys_bound.append(key)
             except ValueError:
                 self.update_status(
-                    f"Hotkey {key} is already assigned; button navigation remains available",
+                    f"Hotkey {key} is already assigned; existing controls remain available",
                     "orange",
                 )
 
@@ -1619,6 +1628,57 @@ class NeuronAnnotatorWidget(QWidget):
     def _next_key(self, viewer=None) -> None:
         del viewer
         self.navigate(1)
+
+    def _step_z(self, step: int) -> None:
+        if self.current_image is None or self.viewer.dims.ndisplay != 2:
+            return
+        steps = self.viewer.dims.current_step
+        if len(steps) < 3:
+            return
+        z_axis = len(steps) - 3
+        z_start = 0
+        z_stop = self._shape_zyx()[0] - 1
+        active_range = self._active_z_range()
+        if active_range is not None:
+            z_start = active_range.start
+            z_stop = active_range.stop - 1
+        target = int(np.clip(steps[z_axis] + step, z_start, z_stop))
+        self.viewer.dims.set_current_step(z_axis, target)
+
+    def _previous_z_key(self, viewer=None) -> None:
+        del viewer
+        self._step_z(-1)
+
+    def _next_z_key(self, viewer=None) -> None:
+        del viewer
+        self._step_z(1)
+
+    def _step_time(self, step: int) -> None:
+        if self.current_image is None or self.current_image.ndim != 4:
+            return
+        steps = self.viewer.dims.current_step
+        if len(steps) < 4:
+            return
+        time_axis = len(steps) - 4
+        time_stop = int(self.current_image.data.shape[0]) - 1
+        target = int(np.clip(steps[time_axis] + step, 0, time_stop))
+        self.viewer.dims.set_current_step(time_axis, target)
+
+    def _previous_time_key(self, viewer=None) -> None:
+        del viewer
+        self._step_time(-1)
+
+    def _next_time_key(self, viewer=None) -> None:
+        del viewer
+        self._step_time(1)
+
+    def _previous_time_fast_key(self, viewer=None) -> None:
+        del viewer
+        self._step_time(-10)
+
+    def _next_time_fast_key(self, viewer=None) -> None:
+        del viewer
+        self._step_time(10)
 
     # ------------------------------------------------------------------
     # Labels appearance
