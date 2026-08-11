@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from app_model.types import KeyBinding
 from napari.layers import Labels, Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
@@ -47,6 +48,10 @@ def _managed_box_labels(viewer):
         if isinstance(layer, Points)
         and layer.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
     )
+
+
+def _press_viewer_key(viewer, key):
+    viewer.keymap[KeyBinding.from_str(key)](viewer)
 
 
 def _combo_texts(combo):
@@ -250,6 +255,28 @@ def test_layer_selection_clamps_only_the_2d_z_position(
     _select_z_layer(widget, 2)
 
     assert viewer.dims.current_step == (1, 1, 0, 0)
+
+
+def test_g_h_stay_within_the_selected_z_layer(
+    make_napari_viewer,
+    qtbot,
+):
+    viewer = make_napari_viewer()
+    _add_matching_layers(viewer, (6, 4, 5))
+    widget = LabelManager(viewer)
+
+    _split(widget, qtbot, "3")
+    _select_z_layer(widget, 2)
+
+    _press_viewer_key(viewer, "G")
+    assert viewer.dims.current_step[0] == 3
+    _press_viewer_key(viewer, "G")
+    assert viewer.dims.current_step[0] == 3
+
+    _press_viewer_key(viewer, "H")
+    _press_viewer_key(viewer, "H")
+    _press_viewer_key(viewer, "H")
+    assert viewer.dims.current_step[0] == 5
 
 
 def test_z_profile_refresh_uses_the_current_4d_time(
