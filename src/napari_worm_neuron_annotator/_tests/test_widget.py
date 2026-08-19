@@ -52,6 +52,13 @@ def _box_label_rgba(layer):
     return np.asarray(layer.text.color.constant, dtype=float)
 
 
+def _camera_orientation2d(viewer):
+    return tuple(
+        getattr(value, "value", value)
+        for value in viewer.camera.orientation2d
+    )
+
+
 def _press_viewer_key(viewer, key):
     viewer.keymap[KeyBinding.from_str(key)](viewer)
 
@@ -124,6 +131,148 @@ def test_widget_without_image_disables_roi_and_labels_controls(
     assert not widget.selected_opacity_slider.isEnabled()
     assert not widget.other_opacity_slider.isEnabled()
     assert not widget.hide_unchecked_checkbox.isEnabled()
+    assert not widget.orientation_group.isEnabled()
+
+
+def test_orientation_controls_apply_absolute_viewer_transform_and_reset(
+    make_napari_viewer,
+):
+    viewer = make_napari_viewer()
+    image_data = np.arange(3 * 4 * 5).reshape(3, 4, 5)
+    image = viewer.add_image(image_data, name="image")
+    viewer.camera.orientation2d = ("up", "left")
+    widget = NeuronAnnotatorWidget(viewer)
+    viewer.camera.center = (1.0, 2.0, 3.0)
+    viewer.camera.zoom = 2.5
+    baseline_center = tuple(viewer.camera.center)
+    baseline_zoom = viewer.camera.zoom
+
+    assert widget.orientation_group.isEnabled()
+    assert not widget.orientation_reset_btn.isEnabled()
+    assert widget.orientation_rotation_combo.currentData() == 0
+
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(90)
+    )
+
+    assert tuple(viewer.dims.order) == (0, 2, 1)
+    assert _camera_orientation2d(viewer) == ("up", "right")
+    assert widget.orientation_reset_btn.isEnabled()
+
+    widget.flip_horizontal_checkbox.setChecked(True)
+    widget.flip_vertical_checkbox.setChecked(True)
+
+    assert tuple(viewer.dims.order) == (0, 2, 1)
+    assert _camera_orientation2d(viewer) == ("down", "left")
+    assert tuple(viewer.camera.center) == baseline_center
+    assert viewer.camera.zoom == pytest.approx(baseline_zoom)
+    assert image.data is image_data
+
+    viewer.dims.ndisplay = 3
+    viewer.camera.angles = (10.0, 20.0, 30.0)
+    expected_angles = tuple(viewer.camera.angles)
+    widget.flip_vertical_checkbox.setChecked(False)
+    np.testing.assert_allclose(viewer.camera.angles, expected_angles)
+    assert widget.orientation_rotation_combo.currentData() == 90
+
+    widget.orientation_reset_btn.click()
+
+    assert tuple(viewer.dims.order) == (0, 1, 2)
+    assert _camera_orientation2d(viewer) == ("up", "left")
+    assert widget.orientation_rotation_combo.currentData() == 0
+    assert not widget.flip_horizontal_checkbox.isChecked()
+    assert not widget.flip_vertical_checkbox.isChecked()
+    assert not widget.orientation_reset_btn.isEnabled()
+
+
+def test_external_orientation_change_becomes_new_baseline(
+    make_napari_viewer,
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((3, 4, 5)), name="image")
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(90)
+    )
+    assert tuple(viewer.dims.order) == (0, 2, 1)
+
+    viewer.dims.transpose()
+
+    assert tuple(viewer.dims.order) == (0, 1, 2)
+    assert _camera_orientation2d(viewer) == ("down", "left")
+    assert widget.orientation_rotation_combo.currentData() == 0
+    assert not widget.orientation_reset_btn.isEnabled()
+
+    viewer.camera.orientation2d = ("up", "right")
+    widget.flip_horizontal_checkbox.setChecked(True)
+    assert _camera_orientation2d(viewer) == ("up", "left")
+    widget.reset_orientation()
+    assert tuple(viewer.dims.order) == (0, 1, 2)
+    assert _camera_orientation2d(viewer) == ("up", "right")
+
+
+def test_shutdown_restores_orientation_baseline(make_napari_viewer):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((3, 4, 5)), name="image")
+    viewer.camera.orientation2d = ("up", "left")
+    baseline_order = tuple(viewer.dims.order)
+    widget = NeuronAnnotatorWidget(viewer)
+
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(270)
+    )
+    widget.flip_vertical_checkbox.setChecked(True)
+    assert tuple(viewer.dims.order) != baseline_order
+
+    widget.shutdown()
+
+    assert tuple(viewer.dims.order) == baseline_order
+    assert _camera_orientation2d(viewer) == ("up", "left")
+
+
+def test_viewer_ndim_change_rebases_orientation(make_napari_viewer):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((3, 4, 5)), name="image-3d")
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(90)
+    )
+    assert widget.orientation_rotation_combo.currentData() == 90
+
+    image_4d = viewer.add_image(np.zeros((2, 3, 4, 5)), name="image-4d")
+
+    assert viewer.dims.ndim == 4
+    assert widget._orientation_baseline_ndim == 4
+    assert widget.orientation_rotation_combo.currentData() == 0
+    assert not widget.flip_horizontal_checkbox.isChecked()
+    assert not widget.flip_vertical_checkbox.isChecked()
+    assert widget._orientation_baseline_order == tuple(viewer.dims.order)
+
+    widget.image_combo.setCurrentText(image_4d.name)
+    assert widget.current_image is image_4d
+    assert widget.orientation_group.isEnabled()
+
+
+def test_same_ndim_image_switch_preserves_orientation(make_napari_viewer):
+    viewer = make_napari_viewer()
+    image_a = viewer.add_image(np.zeros((3, 4, 5)), name="image-a")
+    image_b = viewer.add_image(np.zeros((6, 7, 8)), name="image-b")
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.image_combo.setCurrentText(image_a.name)
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(90)
+    )
+    widget.flip_vertical_checkbox.setChecked(True)
+    expected_order = tuple(viewer.dims.order)
+    expected_camera = _camera_orientation2d(viewer)
+
+    widget.image_combo.setCurrentText(image_b.name)
+
+    assert widget.current_image is image_b
+    assert widget.orientation_rotation_combo.currentData() == 90
+    assert widget.flip_vertical_checkbox.isChecked()
+    assert tuple(viewer.dims.order) == expected_order
+    assert _camera_orientation2d(viewer) == expected_camera
 
 
 def test_g_h_navigate_z_only_in_2d_and_unbind_on_shutdown(
@@ -449,6 +598,86 @@ def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
     assert selected_layer.data.shape == (24, 2, 4)
     assert active_layer.data.shape == (12, 2, 4)
     assert set(selected_layer.features["neuron_id"]) == {0, 1}
+
+
+def test_native_yx_transpose_preserves_roi_vectors_points_and_centering(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(
+        np.zeros((2, 6, 24, 24), dtype=np.uint16),
+        name="image",
+        scale=(2, 5, 1, 1),
+        translate=(3, 4, 5, 6),
+    )
+    widget = NeuronAnnotatorWidget(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data())
+    widget.load_roi_path(roi_path)
+    viewer.dims.current_step = (0, 2, 0, 0)
+    widget.show_box_labels_checkbox.setChecked(True)
+
+    selected = _managed_layer(viewer, ROLE_SELECTED)
+    active = _managed_layer(viewer, ROLE_ACTIVE)
+    box_labels = _managed_box_labels(viewer)
+    expected_selected = np.asarray(selected.data).copy()
+    expected_active = np.asarray(active.data).copy()
+    expected_points = np.asarray(box_labels.data).copy()
+    expected_checked = set(widget.checked_ids)
+    expected_active_id = widget.active_id
+
+    viewer.dims.transpose()
+
+    assert tuple(viewer.dims.order) == (0, 1, 3, 2)
+    np.testing.assert_allclose(selected.data, expected_selected)
+    np.testing.assert_allclose(active.data, expected_active)
+    np.testing.assert_allclose(box_labels.data, expected_points)
+    assert list(selected.features["neuron_id"]) == [0] * 4
+    assert list(active.features["neuron_id"]) == [0] * 4
+    assert list(box_labels.features["neuron_id"]) == [0]
+    assert widget.checked_ids == expected_checked
+    assert widget.active_id == expected_active_id
+
+    widget.activate_id(0)
+    box = widget.roi_dataset.get_box(0, 0)
+    assert box is not None
+    world = image.data_to_world((0, *box.center_zyx))
+    np.testing.assert_allclose(viewer.camera.center, world[-3:])
+
+    viewer.dims.ndisplay = 3
+    assert selected.data.shape == (12, 2, 4)
+    assert active.data.shape == (12, 2, 4)
+    assert box_labels.data.shape == (1, 4)
+
+    viewer.dims.transpose()
+    assert tuple(viewer.dims.order) == (0, 1, 2, 3)
+    assert selected.data.shape == (12, 2, 4)
+    assert active.data.shape == (12, 2, 4)
+    assert box_labels.data.shape == (1, 4)
+
+
+def test_unsupported_spatial_roll_still_hides_roi(make_napari_viewer, tmp_path):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = NeuronAnnotatorWidget(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    viewer.dims.current_step = (2, 0, 0)
+    selected = _managed_layer(viewer, ROLE_SELECTED)
+    active = _managed_layer(viewer, ROLE_ACTIVE)
+    assert selected.data.shape == (4, 2, 3)
+
+    viewer.dims.order = (1, 2, 0)
+
+    assert selected.data.shape == (0, 2, 3)
+    assert active.data.shape == (0, 2, 3)
+    assert not widget.orientation_group.isEnabled()
+
+    viewer.dims.order = (0, 1, 2)
+    assert selected.data.shape == (4, 2, 3)
+    assert active.data.shape == (4, 2, 3)
+    assert widget.orientation_group.isEnabled()
 
 
 def test_optional_box_labels_use_biological_name_with_id_fallback(

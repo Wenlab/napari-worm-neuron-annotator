@@ -30,6 +30,7 @@ The plugin does not modify Image, ROI, or optional Labels source data.
 - All/None controls and cumulative Q/W navigation.
 - Fixed canvas shortcuts for Z-slice and time-frame navigation.
 - Active-neuron highlighting and view centering.
+- Session-only whole-viewer rotation and screen-axis flip controls.
 - View-preserving Z-layer display synchronized across Image and ROI overlays.
 - Zero-based ROI annotation with optional Excel import/export.
 - Optional Labels overlay with independent checked/unchecked alpha and exact
@@ -89,6 +90,19 @@ neuron.
 The ROI array defines the neuron list. You do not need a Labels layer for
 selection, box rendering, annotation, centering, time navigation, or Z-layer
 display.
+
+## Worm orientation
+
+The **Worm Orientation** panel rotates the complete viewer clockwise by 0°,
+90°, 180°, or 270° and can flip the final screen horizontally or vertically.
+Image, ROI boxes, optional text, Labels, and Z-layer views stay aligned because
+the controls change only napari's viewer axes and camera orientation. Source
+arrays and layer transforms are not modified.
+
+**Reset** restores the viewer orientation captured for the current session.
+Closing the widget also restores that orientation. If you use napari's native
+transpose or camera-orientation controls, the resulting view becomes the new
+session baseline and the plugin controls return to their default state.
 
 ## Optional Labels overlay
 

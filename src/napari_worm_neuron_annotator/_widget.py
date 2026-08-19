@@ -39,6 +39,12 @@ from qtpy.QtWidgets import (
 )
 
 from ._colors import neuron_color
+from ._orientation import (
+    ALLOWED_ROTATIONS,
+    Orientation2D,
+    OrientationState,
+    resolve_orientation,
+)
 from ._roi import (
     NeuronBoxDataset,
     add_time_axis,
@@ -124,6 +130,12 @@ class NeuronAnnotatorWidget(QWidget):
         self._z_session_token = f"{id(self):x}"
         self._z_profile_source: Image | None = None
         self._z_profile_time: int | None = None
+        self._orientation_state = OrientationState()
+        self._orientation_baseline_order: tuple[int, ...] | None = None
+        self._orientation_baseline_camera: Orientation2D | None = None
+        self._orientation_baseline_ndim: int | None = None
+        self._orientation_applying = False
+        self._orientation_ui_sync = False
 
         self._setup_ui()
         self._connect_viewer_events()
@@ -153,6 +165,8 @@ class NeuronAnnotatorWidget(QWidget):
 
         self.image_layer_group = self._build_image_layer_group()
         layout.addWidget(self.image_layer_group)
+        self.orientation_group = self._build_orientation_group()
+        layout.addWidget(self.orientation_group)
         self.labels_layer_group = self._build_labels_layer_group()
         layout.addWidget(self.labels_layer_group)
         layout.addWidget(self._build_z_layer_group())
@@ -181,6 +195,40 @@ class NeuronAnnotatorWidget(QWidget):
         group.setLayout(group_layout)
         # Compatibility for callers that previously used the Z-only selector.
         self.z_image_combo = self.image_combo
+        return group
+
+    def _build_orientation_group(self) -> QGroupBox:
+        group = QGroupBox("Worm Orientation")
+        group_layout = QGridLayout()
+
+        group_layout.addWidget(QLabel("Rotation (clockwise):"), 0, 0)
+        self.orientation_rotation_combo = QComboBox()
+        for rotation in ALLOWED_ROTATIONS:
+            self.orientation_rotation_combo.addItem(f"{rotation}°", rotation)
+        self.orientation_rotation_combo.currentIndexChanged.connect(
+            self._on_orientation_controls_changed
+        )
+        group_layout.addWidget(self.orientation_rotation_combo, 0, 1)
+
+        self.flip_horizontal_checkbox = QCheckBox("Flip screen horizontal")
+        self.flip_horizontal_checkbox.toggled.connect(
+            self._on_orientation_controls_changed
+        )
+        group_layout.addWidget(self.flip_horizontal_checkbox, 1, 0, 1, 2)
+
+        self.flip_vertical_checkbox = QCheckBox("Flip screen vertical")
+        self.flip_vertical_checkbox.toggled.connect(
+            self._on_orientation_controls_changed
+        )
+        group_layout.addWidget(self.flip_vertical_checkbox, 2, 0, 1, 2)
+
+        self.orientation_reset_btn = QPushButton("Reset")
+        self.orientation_reset_btn.clicked.connect(self.reset_orientation)
+        group_layout.addWidget(self.orientation_reset_btn, 3, 0, 1, 2)
+        group_layout.setColumnStretch(1, 1)
+
+        group.setLayout(group_layout)
+        group.setEnabled(False)
         return group
 
     def _build_labels_layer_group(self) -> QGroupBox:
@@ -516,7 +564,10 @@ class NeuronAnnotatorWidget(QWidget):
         dims_events = self.viewer.dims.events
         dims_events.point.connect(self._on_dims_changed)
         dims_events.ndisplay.connect(self._on_dims_changed)
-        dims_events.order.connect(self._on_dims_changed)
+        dims_events.order.connect(self._on_dims_order_changed)
+        self.viewer.camera.events.orientation.connect(
+            self._on_camera_orientation_changed
+        )
 
     def _disconnect_viewer_events(self) -> None:
         events = self.viewer.layers.events
@@ -539,10 +590,166 @@ class NeuronAnnotatorWidget(QWidget):
         for emitter in (
             dims_events.point,
             dims_events.ndisplay,
-            dims_events.order,
         ):
             with suppress(TypeError, ValueError):
                 emitter.disconnect(self._on_dims_changed)
+        with suppress(TypeError, ValueError):
+            dims_events.order.disconnect(self._on_dims_order_changed)
+        with suppress(TypeError, ValueError):
+            self.viewer.camera.events.orientation.disconnect(
+                self._on_camera_orientation_changed
+            )
+
+    def _capture_orientation_baseline(self) -> None:
+        self._orientation_baseline_order = tuple(self.viewer.dims.order)
+        self._orientation_baseline_camera = self._camera_orientation2d()
+        self._orientation_baseline_ndim = int(self.viewer.dims.ndim)
+
+    def _ensure_orientation_baseline(self) -> None:
+        if (
+            self._orientation_baseline_order is None
+            or self._orientation_baseline_camera is None
+            or self._orientation_baseline_ndim != int(self.viewer.dims.ndim)
+        ):
+            self._rebase_orientation()
+
+    def _rebase_orientation(self) -> None:
+        self._capture_orientation_baseline()
+        self._orientation_state = OrientationState()
+        self._sync_orientation_controls()
+        self._update_orientation_controls_enabled()
+
+    def _camera_orientation2d(self) -> Orientation2D:
+        vertical, horizontal = self.viewer.camera.orientation2d
+        return (
+            getattr(vertical, "value", vertical),
+            getattr(horizontal, "value", horizontal),
+        )
+
+    def _on_orientation_controls_changed(self, value=None) -> None:
+        del value
+        if self._orientation_ui_sync or self._closed:
+            return
+        rotation = self.orientation_rotation_combo.currentData()
+        if rotation is None:
+            return
+        self._orientation_state = OrientationState(
+            int(rotation),
+            self.flip_horizontal_checkbox.isChecked(),
+            self.flip_vertical_checkbox.isChecked(),
+        )
+        self._apply_orientation_state()
+
+    def _apply_orientation_state(self) -> None:
+        if self.current_image is None:
+            self._update_orientation_controls_enabled()
+            return
+        self._ensure_orientation_baseline()
+        if (
+            self._orientation_baseline_order is None
+            or self._orientation_baseline_camera is None
+        ):
+            return
+
+        ndim = int(self.viewer.dims.ndim)
+        target_order, target_camera = resolve_orientation(
+            self._orientation_baseline_order,
+            self._orientation_baseline_camera,
+            self._orientation_state,
+            y_axis=ndim - 2,
+            x_axis=ndim - 1,
+        )
+        self._write_viewer_orientation(target_order, target_camera)
+        self._update_orientation_controls_enabled()
+
+    def _write_viewer_orientation(
+        self,
+        order: tuple[int, ...],
+        camera: Orientation2D,
+    ) -> None:
+        center = tuple(self.viewer.camera.center)
+        zoom = float(self.viewer.camera.zoom)
+        angles = tuple(self.viewer.camera.angles)
+        current_step = tuple(self.viewer.dims.current_step)
+        self._orientation_applying = True
+        try:
+            if tuple(self.viewer.dims.order) != order:
+                self.viewer.dims.order = order
+            if self._camera_orientation2d() != camera:
+                self.viewer.camera.orientation2d = camera
+            if tuple(self.viewer.dims.current_step) != current_step:
+                self.viewer.dims.current_step = current_step
+            if not np.allclose(self.viewer.camera.center, center):
+                self.viewer.camera.center = center
+            if not np.isclose(self.viewer.camera.zoom, zoom):
+                self.viewer.camera.zoom = zoom
+            if not np.allclose(self.viewer.camera.angles, angles):
+                self.viewer.camera.angles = angles
+        finally:
+            self._orientation_applying = False
+
+    def reset_orientation(self) -> None:
+        """Restore the captured viewer orientation for this session."""
+        if self._orientation_baseline_order is None:
+            return
+        self._orientation_state = OrientationState()
+        self._sync_orientation_controls()
+        self._apply_orientation_state()
+
+    def _restore_orientation_baseline(self) -> None:
+        if (
+            self._orientation_baseline_order is None
+            or self._orientation_baseline_camera is None
+            or self._orientation_baseline_ndim != int(self.viewer.dims.ndim)
+        ):
+            return
+        self._orientation_state = OrientationState()
+        self._sync_orientation_controls()
+        self._write_viewer_orientation(
+            self._orientation_baseline_order,
+            self._orientation_baseline_camera,
+        )
+
+    def _sync_orientation_controls(self) -> None:
+        self._orientation_ui_sync = True
+        try:
+            index = self.orientation_rotation_combo.findData(
+                self._orientation_state.rotation_degrees
+            )
+            self.orientation_rotation_combo.setCurrentIndex(index)
+            self.flip_horizontal_checkbox.setChecked(
+                self._orientation_state.flip_horizontal
+            )
+            self.flip_vertical_checkbox.setChecked(
+                self._orientation_state.flip_vertical
+            )
+        finally:
+            self._orientation_ui_sync = False
+
+    def _update_orientation_controls_enabled(self) -> None:
+        enabled = (
+            self.current_image is not None
+            and self.current_image in self.viewer.layers
+            and self._orientation_baseline_order is not None
+            and self._view_axes_supported()
+        )
+        self.orientation_group.setEnabled(enabled)
+        self.orientation_reset_btn.setEnabled(
+            enabled and not self._orientation_state.is_identity
+        )
+
+    def _on_dims_order_changed(self, event=None) -> None:
+        if self._closed:
+            return
+        if not self._orientation_applying:
+            self._rebase_orientation()
+        self._on_dims_changed(event)
+
+    def _on_camera_orientation_changed(self, event=None) -> None:
+        del event
+        if self._closed or self._orientation_applying:
+            return
+        self._rebase_orientation()
 
     def _bind_keys(self) -> None:
         bindings = (
@@ -633,6 +840,8 @@ class NeuronAnnotatorWidget(QWidget):
         )
         if target is not current:
             self._set_current_image(target)
+        else:
+            self._update_orientation_controls_enabled()
 
     def _on_image_changed(self, index: int) -> None:
         del index
@@ -672,8 +881,10 @@ class NeuronAnnotatorWidget(QWidget):
             self.z_profile_state_label.clear()
             self.z_profile_refresh_btn.setEnabled(False)
             self._refresh_selection_item_styles()
+            self._update_orientation_controls_enabled()
             return
         self._validate_image_source(source)
+        self._ensure_orientation_baseline()
         source.events.data.connect(self._on_current_image_changed)
         for event_name in Z_SOURCE_GEOMETRY_EVENTS:
             getattr(source.events, event_name).connect(
@@ -690,6 +901,7 @@ class NeuronAnnotatorWidget(QWidget):
             self._refresh_roi_layers()
         self._refresh_selection_item_styles()
         self._update_roi_info()
+        self._update_orientation_controls_enabled()
 
     def _disconnect_current_image_events(self) -> None:
         source = self.current_image
@@ -1354,6 +1566,7 @@ class NeuronAnnotatorWidget(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._restore_orientation_baseline()
         self._disconnect_viewer_events()
         self._unbind_keys()
         self._clear_z_layers()
@@ -1866,12 +2079,25 @@ class NeuronAnnotatorWidget(QWidget):
             return False
         ndim = int(self.viewer.dims.ndim)
         order = tuple(self.viewer.dims.order)
+        y_axis = ndim - 2
+        x_axis = ndim - 1
         if self.viewer.dims.ndisplay == 2:
-            return order[-2:] == (ndim - 2, ndim - 1)
-        return order[-3:] == (ndim - 3, ndim - 2, ndim - 1)
+            return set(order[-2:]) == {y_axis, x_axis}
+        return (
+            order[-3] == ndim - 3
+            and set(order[-2:]) == {y_axis, x_axis}
+        )
 
     def _on_dims_changed(self, event=None) -> None:
         del event
+        if self._closed:
+            return
+        if (
+            self._orientation_baseline_ndim is not None
+            and self._orientation_baseline_ndim != int(self.viewer.dims.ndim)
+            and not self._orientation_applying
+        ):
+            self._rebase_orientation()
         if (
             self._z_profile_source is not None
             and self._z_profile_source.ndim == 4
@@ -1890,6 +2116,7 @@ class NeuronAnnotatorWidget(QWidget):
             self._update_roi_info()
             self._refresh_selection_item_styles()
             self._refresh_roi_layers()
+        self._update_orientation_controls_enabled()
 
     def _ensure_roi_layers(self) -> None:
         if (

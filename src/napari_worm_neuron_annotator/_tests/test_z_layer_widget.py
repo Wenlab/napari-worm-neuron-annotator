@@ -151,6 +151,64 @@ def test_split_image_without_labels_creates_no_labels_proxy(
     assert not source.visible
 
 
+def test_orientation_preserves_z_session_and_source_data(
+    make_napari_viewer, qtbot, tmp_path
+):
+    viewer = make_napari_viewer()
+    image, labels, image_data, labels_data = _add_matching_layers(
+        viewer, (6, 8, 8)
+    )
+    widget = NeuronAnnotatorWidget(viewer)
+    _bind_labels(widget, labels)
+    roi_path = tmp_path / "centers.npy"
+    np.save(roi_path, _roi_data_by_z_center())
+    widget.load_roi_path(roi_path)
+    viewer.dims.ndisplay = 3
+    widget.check_all()
+    widget.show_box_labels_checkbox.setChecked(True)
+    _split(widget, qtbot, "3")
+    _select_z_layer(widget, 2)
+    z_images = tuple(_managed_layers(viewer, ROLE_Z_IMAGE))
+    z_labels = tuple(_managed_layers(viewer, ROLE_Z_LABELS))
+    z_image_data = tuple(layer.data for layer in z_images)
+    z_label_data = tuple(layer.data for layer in z_labels)
+    selected = _managed_vector(viewer, ROLE_SELECTED)
+    box_labels = _managed_box_labels(viewer)
+    selected_data = np.asarray(selected.data).copy()
+    selected_ids = np.asarray(selected.features["neuron_id"]).copy()
+    box_label_data = np.asarray(box_labels.data).copy()
+    box_label_ids = np.asarray(box_labels.features["neuron_id"]).copy()
+
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(90)
+    )
+    widget.flip_horizontal_checkbox.setChecked(True)
+    widget.flip_vertical_checkbox.setChecked(True)
+
+    assert widget._z_ranges
+    assert tuple(_managed_layers(viewer, ROLE_Z_IMAGE)) == z_images
+    assert tuple(_managed_layers(viewer, ROLE_Z_LABELS)) == z_labels
+    assert all(
+        layer.data is data
+        for layer, data in zip(z_images, z_image_data, strict=True)
+    )
+    assert all(
+        layer.data is data
+        for layer, data in zip(z_labels, z_label_data, strict=True)
+    )
+    assert image.data is image_data
+    assert labels.data is labels_data
+    assert tuple(viewer.dims.order) == (0, 2, 1)
+    np.testing.assert_allclose(selected.data, selected_data)
+    np.testing.assert_array_equal(
+        selected.features["neuron_id"], selected_ids
+    )
+    np.testing.assert_allclose(box_labels.data, box_label_data)
+    np.testing.assert_array_equal(
+        box_labels.features["neuron_id"], box_label_ids
+    )
+
+
 def test_switching_image_during_split_preserves_roi_state(
     make_napari_viewer, qtbot, tmp_path
 ):
