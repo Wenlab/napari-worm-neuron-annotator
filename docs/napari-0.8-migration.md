@@ -20,20 +20,16 @@ This plugin targets napari `>=0.8,<0.9` and Python `>=3.11,<3.15`.
   by the npe2 manifest. The `LabelManager` Python name and command ID remain as
   compatibility aliases during this migration.
 - A `(z,y,x)` or `(t,z,y,x)` Image layer now supplies the spatial metadata for
-  ROI overlays and Z navigation. Image + ROI operation does not require a
-  Labels layer.
-- Label RGB values are read from the active napari colormap. The plugin does
-  not use the `color_dict_to_colormap` helper removed in napari 0.8. This
-  behavior applies only when the user explicitly selects compatible Labels.
+  ROI overlays and Z navigation. Plugin behavior is independent of Labels
+  layers that may coexist in the viewer.
 - Derived box overlays use the public `Viewer.add_vectors`, `Vectors.data`,
   `Vectors.features`, and dims event APIs.
 - Managed layer identity is stored in public layer metadata rather than in
   private napari objects or user-editable layer names.
 - 3D and 4D Image switching recreates Vectors with the correct dimensionality
   and does not retain duplicate managed layers.
-- Optional Labels must match the Image shape, axes, scale, translation, and
-  units. Z splitting uses read-only views or lazy slices and does not allocate
-  dense Labels copies.
+- Z splitting uses read-only Image views or lazy slices and does not allocate
+  dense copies.
 
 ## Verification baseline
 

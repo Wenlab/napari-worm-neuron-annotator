@@ -1,5 +1,10 @@
 # Plan: Display Selected Neuron Box Labels
 
+> **Historical plan:** The Points text-overlay work remains supported, but all
+> references below to controlled napari `Labels` layers describe the former
+> mask integration. Plugin-managed Labels support was removed on 2026-08-22;
+> Image layers now provide all spatial metadata.
+
 **Generated**: 2026-07-29
 **Estimated Complexity**: Medium
 

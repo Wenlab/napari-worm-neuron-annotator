@@ -9,8 +9,6 @@ from napari_worm_neuron_annotator._roi import (
     box_label_point_3d,
     box_vectors_2d,
     box_vectors_3d,
-    label_value_to_neuron_id,
-    neuron_id_to_label_value,
 )
 
 
@@ -55,18 +53,6 @@ def test_dataset_treats_invalid_observations_as_missing():
 
     assert dataset.valid_ids(0) == []
     assert dataset.get_box(10, 0) is None
-
-
-def test_id_mapping_is_explicit_and_round_trips():
-    assert neuron_id_to_label_value(0) == 1
-    assert neuron_id_to_label_value(22) == 23
-    assert label_value_to_neuron_id(1) == 0
-    assert label_value_to_neuron_id(23) == 22
-
-    with pytest.raises(ValueError):
-        neuron_id_to_label_value(-1)
-    with pytest.raises(ValueError):
-        label_value_to_neuron_id(0)
 
 
 def test_box_geometry_has_four_2d_and_twelve_3d_edges():

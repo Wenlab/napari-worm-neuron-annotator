@@ -12,11 +12,8 @@ DATA_DIR = (
     Path(__file__).resolve().parents[1] / "data" / f"{DATASET_NAME}_npy"
 )
 IMAGE_PATH = DATA_DIR / "volumes.npy"
-LABELS_PATH = None
 ROI_PATH = DATA_DIR / "neuron_point_tuple.npy"
 
-# Set this to True only when validating the optional Labels integration.
-LOAD_OPTIONAL_LABELS = False
 Z_DIVISOR = 5.0
 LAYER_SCALE_TZYX = (1.0, 5.0, 1.0, 1.0)
 IMAGE_CONTRAST_LIMITS = (89.0, 152.0)
@@ -36,17 +33,6 @@ def main() -> None:
         contrast_limits=IMAGE_CONTRAST_LIMITS,
         colormap="gray",
     )
-    labels_layer = None
-    if LOAD_OPTIONAL_LABELS:
-        labels = np.load(LABELS_PATH, mmap_mode="r", allow_pickle=False)
-        if labels.shape != volumes.shape:
-            raise ValueError("Expected Labels to match the Image shape")
-        labels_layer = viewer.add_labels(
-            labels,
-            name=f"{DATASET_NAME} neuron mask",
-            scale=LAYER_SCALE_TZYX,
-            axis_labels=("t", "z", "y", "x"),
-        )
     viewer.dims.current_step = (0, volumes.shape[1] // 2, 0, 0)
 
     widget = NeuronAnnotatorWidget(viewer)
@@ -58,10 +44,6 @@ def main() -> None:
     image_index = widget.image_combo.findData(image_layer)
     if image_index >= 0:
         widget.image_combo.setCurrentIndex(image_index)
-    if labels_layer is not None:
-        labels_index = widget.labels_combo.findData(labels_layer)
-        if labels_index >= 0:
-            widget.labels_combo.setCurrentIndex(labels_index)
     widget.z_divisor_spin.setValue(Z_DIVISOR)
     widget.load_roi_path(ROI_PATH)
     if widget.active_id is not None:

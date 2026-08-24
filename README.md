@@ -9,20 +9,15 @@ The plugin keeps each data source in a separate role:
   context;
 - the ROI array supplies neuron identity and box geometry;
 - runtime `Vectors` and `Points` layers show boxes and optional text without
-  writing them into a dense mask;
-- an explicitly selected `Labels` layer can add a compatible mask overlay and
-  checked/unchecked alpha control.
+  writing them into a dense mask.
 
-The plugin does not modify Image, ROI, or optional Labels source data.
-
-> **Roadmap:** Plugin-managed Labels are planned for deprecation. The primary
-> workflow now uses Image + ROI-derived Vectors/Points, while an explicitly
-> selected Labels layer remains available for compatibility.
-> See [the deferred deprecation decision](#deferred-deprecation-of-plugin-managed-labels).
+The plugin does not modify Image or ROI source data. Ordinary napari `Labels`
+layers may coexist in the viewer, but this plugin does not select, modify, or
+synchronize them.
 
 ## Features
 
-- Image + ROI operation without a Labels layer.
+- Image + ROI operation independent of Labels layers.
 - Read-only loading of `(T,N,K)` ROI NPY arrays.
 - Dynamic 2D bounding rectangles and 3D 12-edge wireframes.
 - Stable per-neuron box colors derived from zero-based ROI identity.
@@ -33,10 +28,6 @@ The plugin does not modify Image, ROI, or optional Labels source data.
 - Session-only whole-viewer rotation and screen-axis flip controls.
 - View-preserving Z-layer display synchronized across Image and ROI overlays.
 - Zero-based ROI annotation with optional Excel import/export.
-- Optional Labels overlay with independent checked/unchecked alpha and exact
-  RGB preservation.
-- Automatic restoration of the original Labels colormap and opacity when the
-  widget closes or switches to another Labels layer.
 
 ## Installation
 
@@ -87,7 +78,7 @@ The active row is bold and remains the current row. Unchecking the active ID
 clears the active state; unchecking another ID does not change the active
 neuron.
 
-The ROI array defines the neuron list. You do not need a Labels layer for
+The ROI array defines the neuron list. Labels layers are not used for
 selection, box rendering, annotation, centering, time navigation, or Z-layer
 display.
 
@@ -95,7 +86,7 @@ display.
 
 The **Worm Orientation** panel rotates the complete viewer clockwise by 0°,
 90°, 180°, or 270° and can flip the final screen horizontally or vertically.
-Image, ROI boxes, optional text, Labels, and Z-layer views stay aligned because
+Image, ROI boxes, optional text, and Z-layer views stay aligned because
 the controls change only napari's viewer axes and camera orientation. Source
 arrays and layer transforms are not modified.
 
@@ -104,28 +95,9 @@ Closing the widget also restores that orientation. If you use napari's native
 transpose or camera-orientation controls, the resulting view becomes the new
 session baseline and the plugin controls return to their default state.
 
-## Optional Labels overlay
-
-Select a Labels layer only when you need the mask overlay. Its shape, axes,
-scale, translation, and units must match the selected Image layer. The ROI
-array remains the identity source, and the Image layer remains the spatial
-authority.
-
-The **Labels Layer** panel controls checked and unchecked label alpha. The
-defaults are `0.50` and `0.00`. Alpha changes preserve each label's RGB value,
-and the widget restores the original colormap and opacity when it closes or
-switches to another Labels layer. The napari layer-list eye icon can hide the
-whole mask.
-
-## Deferred deprecation of plugin-managed Labels
-
-The current release keeps the optional Labels integration and the legacy
-`LabelManager` Python and command aliases for compatibility. The public widget
-name is `NeuronAnnotatorWidget`, and napari lists only that widget.
-
-A future compatibility migration may remove plugin-managed Labels after users
-have had time to move their Image + ROI workflows. No removal version is set.
-Source Labels data remains read-only during the migration period.
+The legacy `LabelManager` Python and command aliases remain available for
+compatibility. The public widget name is `NeuronAnnotatorWidget`, and napari
+lists only that widget.
 
 ## Z-layer display
 
@@ -148,11 +120,6 @@ currently valid checked/active ROI overlays. **Layer k** displays only that
 Image range and the overlays whose box center Z belongs to the range. A box
 that crosses a cut is shown whole in the one layer containing its center.
 
-When you explicitly bind compatible Labels, **Split** creates read-only view
-or lazy-slice proxies. **All** shows the complete source Labels and hides the
-proxies. **Layer k** hides the source and shows its matching proxy slice. The
-plugin never allocates a dense Labels copy.
-
 Checked and active neuron identities remain global. In an individual layer,
 Q/W navigates only neurons assigned to that layer; other neurons remain in
 the list, are shown in gray, and keep operable checkboxes. Activating a gray
@@ -162,10 +129,9 @@ Generated Image layers use slices of NumPy arrays, memory maps, or Dask
 arrays rather than full-size zero-filled copies. Direct Zarr arrays should
 be wrapped as Dask arrays before splitting. The Image source must have
 `(z,y,x)` or `(t,z,y,x)` axes, axis-aligned volume depiction, and no clipping
-planes. Optional Labels must match its shape and spatial metadata. **Clear**
-removes generated Image and Labels layers and restores the source visibility
-captured before splitting. Normal napari eye icons may still override
-visibility until the next **Show** selection.
+planes. **Clear** removes generated Image layers and restores the source Image
+visibility captured before splitting. Normal napari eye icons may still
+override visibility until the next **Show** selection.
 
 ### Launch the validated 20260304_w3_immobile dataset
 
@@ -177,9 +143,7 @@ pixi run launch-actual
 ```
 
 It memory-maps `volumes.npy` and `neuron_point_tuple.npy`, opens napari, docks
-the navigator, and loads all 120 ROI identities. The launcher leaves its
-`LOAD_OPTIONAL_LABELS` validation toggle disabled by default. Enable it to
-memory-map `neuron_mask.npy` and exercise the optional Labels integration.
+the navigator, and loads all 120 ROI identities.
 
 ## ROI input format
 
@@ -199,8 +163,6 @@ Additional fields are ignored. The neuron ID is the index on the `N` axis:
 
 ```text
 neuron_id = 0 ... N - 1
-label_value = neuron_id + 1
-background label_value = 0
 ```
 
 NaN, infinite values, non-positive sizes, and time points outside the source
@@ -234,7 +196,7 @@ Configure `volume_start` and `volume_stride` before loading the NPY.
 
 The derived ROI overlay layers copy scale, translation, axis labels, and
 units from the Image layer. Do not apply the z scale a second time in the ROI
-coordinates. Optional Labels never supply ROI colors or spatial metadata.
+coordinates.
 
 ## 2D and 3D box display
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from app_model.types import KeyBinding
-from napari.layers import Labels, Points, Vectors
+from napari.layers import Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
@@ -22,7 +22,6 @@ from napari_worm_neuron_annotator._widget import (
 )
 
 ROLE_Z_IMAGE = "z_layer_image"
-ROLE_Z_LABELS = "z_layer_labels"
 
 
 def _managed_layers(viewer, role):
@@ -109,11 +108,6 @@ def _split(widget, qtbot, cuts):
     qtbot.mouseClick(widget.split_z_btn, Qt.LeftButton)
 
 
-def _bind_labels(widget, labels):
-    widget.labels_combo.setCurrentText(labels.name)
-    assert widget.current_labels is labels
-
-
 def _select_z_layer(widget, number):
     prefix = f"Layer {number} "
     index = next(
@@ -133,7 +127,7 @@ def _roi_data_by_z_center():
     return data
 
 
-def test_split_image_without_labels_creates_no_labels_proxy(
+def test_split_image_creates_only_image_layers(
     make_napari_viewer, qtbot
 ):
     viewer = make_napari_viewer()
@@ -147,7 +141,7 @@ def test_split_image_without_labels_creates_no_labels_proxy(
 
     assert widget.current_image is source
     assert len(_managed_layers(viewer, ROLE_Z_IMAGE)) == 3
-    assert _managed_layers(viewer, ROLE_Z_LABELS) == []
+    assert all(layer.__class__.__name__ != "Labels" for layer in viewer.layers)
     assert not source.visible
 
 
@@ -159,7 +153,6 @@ def test_orientation_preserves_z_session_and_source_data(
         viewer, (6, 8, 8)
     )
     widget = NeuronAnnotatorWidget(viewer)
-    _bind_labels(widget, labels)
     roi_path = tmp_path / "centers.npy"
     np.save(roi_path, _roi_data_by_z_center())
     widget.load_roi_path(roi_path)
@@ -169,9 +162,7 @@ def test_orientation_preserves_z_session_and_source_data(
     _split(widget, qtbot, "3")
     _select_z_layer(widget, 2)
     z_images = tuple(_managed_layers(viewer, ROLE_Z_IMAGE))
-    z_labels = tuple(_managed_layers(viewer, ROLE_Z_LABELS))
     z_image_data = tuple(layer.data for layer in z_images)
-    z_label_data = tuple(layer.data for layer in z_labels)
     selected = _managed_vector(viewer, ROLE_SELECTED)
     box_labels = _managed_box_labels(viewer)
     selected_data = np.asarray(selected.data).copy()
@@ -187,14 +178,9 @@ def test_orientation_preserves_z_session_and_source_data(
 
     assert widget._z_ranges
     assert tuple(_managed_layers(viewer, ROLE_Z_IMAGE)) == z_images
-    assert tuple(_managed_layers(viewer, ROLE_Z_LABELS)) == z_labels
     assert all(
         layer.data is data
         for layer, data in zip(z_images, z_image_data, strict=True)
-    )
-    assert all(
-        layer.data is data
-        for layer, data in zip(z_labels, z_label_data, strict=True)
     )
     assert image.data is image_data
     assert labels.data is labels_data
@@ -279,7 +265,7 @@ def test_z_layer_controls_are_compact_and_filter_image_sources(
         )
     )
     descriptions = [label.text() for label in group.findChildren(QLabel)]
-    assert "Split Image by z; sync optional Labels and boxes." in descriptions
+    assert "Split Image by z; synchronize neuron boxes." in descriptions
     assert _combo_texts(widget.z_image_combo) == ["image-3d", "image-4d"]
     assert _combo_texts(widget.z_view_combo) == ["All"]
     assert not widget.z_view_combo.isEnabled()
@@ -380,7 +366,7 @@ def test_z_profile_refresh_uses_the_current_4d_time(
         (2, 6, 4, 5),
     ],
 )
-def test_split_3d_and_4d_synchronizes_image_and_labels(
+def test_split_3d_and_4d_synchronizes_image_and_leaves_labels_untouched(
     make_napari_viewer,
     qtbot,
     shape,
@@ -389,11 +375,9 @@ def test_split_3d_and_4d_synchronizes_image_and_labels(
     source, labels, image_data, labels_data = _add_matching_layers(
         viewer, shape
     )
-    labels.contour = 1
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     labels_before = labels_data.copy()
-    label_color = np.asarray(labels.get_color(1), dtype=float)
+    labels_visible_before = labels.visible
 
     _split(widget, qtbot, "2,4")
 
@@ -413,7 +397,7 @@ def test_split_3d_and_4d_synchronizes_image_and_labels(
     ]
     assert not source.visible
     assert all(layer.visible for layer in derived)
-    assert labels.visible
+    assert labels.visible is labels_visible_before
     assert widget.z_view_combo.isEnabled()
     assert widget.clear_z_btn.isEnabled()
     assert len(_combo_texts(widget.z_view_combo)) == 4
@@ -423,36 +407,13 @@ def test_split_3d_and_4d_synchronizes_image_and_labels(
 
     assert [layer.visible for layer in derived] == [False, True, False]
     assert not source.visible
-    assert not labels.visible
-    proxies = _managed_layers(viewer, ROLE_Z_LABELS)
-    assert len(proxies) == 1
-    proxy = proxies[0]
-    assert isinstance(proxy, Labels)
-    assert proxy.visible
-    assert not proxy.editable
-    assert proxy.contour == 1
-    assert proxy.data.shape[-3] == 2
-    assert np.shares_memory(proxy.data, labels_data)
-    np.testing.assert_array_equal(proxy.data, labels_data[..., 2:4, :, :])
-    assert tuple(proxy.axis_labels) == tuple(labels.axis_labels)
-    np.testing.assert_allclose(proxy.scale, labels.scale)
-    expected_translate = np.asarray(labels.translate, dtype=float)
-    expected_translate[-3] += 2 * float(labels.scale[-3])
-    np.testing.assert_allclose(proxy.translate, expected_translate)
-    assert proxy.name not in _combo_texts(widget.layer_combo)
-
-    assert not widget.selected_opacity_slider.isEnabled()
-    proxy_color = np.asarray(proxy.get_color(1), dtype=float)
-    np.testing.assert_allclose(proxy_color, label_color)
+    assert labels.visible is labels_visible_before
     np.testing.assert_array_equal(labels.data, labels_before)
 
     widget.z_view_combo.setCurrentIndex(0)
 
     assert all(layer.visible for layer in derived)
-    assert labels.visible
-    assert not any(
-        layer.visible for layer in _managed_layers(viewer, ROLE_Z_LABELS)
-    )
+    assert labels.visible is labels_visible_before
 
 
 def test_memmap_split_layers_keep_shared_storage(
@@ -461,24 +422,15 @@ def test_memmap_split_layers_keep_shared_storage(
     tmp_path,
 ):
     image_path = tmp_path / "image.npy"
-    labels_path = tmp_path / "labels.npy"
     np.save(image_path, np.ones((6, 4, 5), dtype=np.float32))
-    np.save(labels_path, np.ones((6, 4, 5), dtype=np.int16))
     image_data = np.load(image_path, mmap_mode="r", allow_pickle=False)
-    labels_data = np.load(labels_path, mmap_mode="r", allow_pickle=False)
     viewer = make_napari_viewer()
     viewer.add_image(
         image_data,
         name="memmap-image",
         axis_labels=("z", "y", "x"),
     )
-    labels = viewer.add_labels(
-        labels_data,
-        name="memmap-labels",
-        axis_labels=("z", "y", "x"),
-    )
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
 
     _split(widget, qtbot, "2,4")
     _select_z_layer(widget, 2)
@@ -487,8 +439,6 @@ def test_memmap_split_layers_keep_shared_storage(
         np.shares_memory(layer.data, image_data)
         for layer in _managed_layers(viewer, ROLE_Z_IMAGE)
     )
-    proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
-    assert np.shares_memory(proxy.data, labels_data)
 
 
 def test_dask_split_layers_remain_lazy(
@@ -497,7 +447,6 @@ def test_dask_split_layers_remain_lazy(
 ):
     da = pytest.importorskip("dask.array")
     image_data = da.ones((6, 4, 5), chunks=(2, 4, 5))
-    labels_data = da.ones((6, 4, 5), chunks=(2, 4, 5), dtype=np.int16)
     viewer = make_napari_viewer()
     viewer.add_image(
         image_data,
@@ -505,13 +454,7 @@ def test_dask_split_layers_remain_lazy(
         axis_labels=("z", "y", "x"),
         contrast_limits=(0, 1),
     )
-    labels = viewer.add_labels(
-        labels_data,
-        name="dask-labels",
-        axis_labels=("z", "y", "x"),
-    )
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
 
     _split(widget, qtbot, "2,4")
     _select_z_layer(widget, 2)
@@ -520,8 +463,6 @@ def test_dask_split_layers_remain_lazy(
         isinstance(layer.data, da.Array)
         for layer in _managed_layers(viewer, ROLE_Z_IMAGE)
     )
-    proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
-    assert isinstance(proxy.data, da.Array)
 
 
 def test_direct_zarr_split_is_rejected_before_materialization(
@@ -529,18 +470,12 @@ def test_direct_zarr_split_is_rejected_before_materialization(
 ):
     zarr = pytest.importorskip("zarr")
     image_data = zarr.array(np.ones((6, 4, 5), dtype=np.float32))
-    labels_data = zarr.array(np.ones((6, 4, 5), dtype=np.int16))
     viewer = make_napari_viewer()
     image = viewer.add_image(
         image_data,
         name="zarr-image",
         axis_labels=("z", "y", "x"),
         contrast_limits=(0, 1),
-    )
-    viewer.add_labels(
-        labels_data,
-        name="zarr-labels",
-        axis_labels=("z", "y", "x"),
     )
     widget = LabelManager(viewer)
 
@@ -549,7 +484,6 @@ def test_direct_zarr_split_is_rejected_before_materialization(
 
     assert widget.current_image is None
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
 
 
 def test_layer_view_filters_whole_boxes_by_center_and_navigation(
@@ -682,7 +616,6 @@ def test_clear_restores_sources_and_preserves_global_selection(
         labels_visible=False,
     )
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     roi_path = tmp_path / "centers.npy"
     np.save(roi_path, _roi_data_by_z_center())
     widget.load_roi_path(roi_path)
@@ -692,14 +625,13 @@ def test_clear_restores_sources_and_preserves_global_selection(
 
     _split(widget, qtbot, "3")
 
-    assert labels.visible
+    assert not labels.visible
     assert any(
         layer.visible for layer in _managed_layers(viewer, ROLE_Z_IMAGE)
     )
     qtbot.mouseClick(widget.clear_z_btn, Qt.LeftButton)
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert not image.visible
     assert not labels.visible
     assert widget.checked_ids == expected_checked
@@ -715,7 +647,6 @@ def test_clear_restores_sources_and_preserves_global_selection(
     _split(widget, qtbot, "2,4")
     widget.shutdown()
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert not image.visible
     assert not labels.visible
 
@@ -728,10 +659,7 @@ def test_resplit_replaces_the_existing_managed_layer_set(
     _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
     _split(widget, qtbot, "3")
-    old_layers = [
-        *_managed_layers(viewer, ROLE_Z_IMAGE),
-        *_managed_layers(viewer, ROLE_Z_LABELS),
-    ]
+    old_layers = list(_managed_layers(viewer, ROLE_Z_IMAGE))
     _select_z_layer(widget, 2)
 
     _split(widget, qtbot, "2,4")
@@ -742,69 +670,6 @@ def test_resplit_replaces_the_existing_managed_layer_set(
     assert [layer.data.shape[-3] for layer in new_images] == [2, 2, 2]
     assert all(layer.visible for layer in new_images)
     assert widget.z_view_combo.currentText() == "All"
-
-
-def test_switching_controlled_labels_clears_then_allows_new_split(
-    make_napari_viewer,
-    qtbot,
-):
-    viewer = make_napari_viewer()
-    image, labels_a, _, _ = _add_matching_layers(viewer, (6, 4, 5))
-    labels_b = viewer.add_labels(
-        np.zeros((6, 4, 5), dtype=np.int16),
-        name="labels-b",
-        axis_labels=tuple(labels_a.axis_labels),
-        scale=tuple(labels_a.scale),
-        translate=tuple(labels_a.translate),
-    )
-    widget = LabelManager(viewer)
-    _bind_labels(widget, labels_a)
-    _split(widget, qtbot, "3")
-
-    widget.layer_combo.setCurrentText(labels_b.name)
-
-    assert widget.current_layer is labels_b
-    assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
-    assert image.visible
-    assert labels_a.visible
-
-    _split(widget, qtbot, "2,4")
-
-    assert len(_managed_layers(viewer, ROLE_Z_IMAGE)) == 3
-    assert widget.current_layer is labels_b
-
-
-def test_split_rejects_transform_mismatch_without_partial_layers(
-    make_napari_viewer,
-    qtbot,
-    monkeypatch,
-):
-    viewer = make_napari_viewer()
-    image = viewer.add_image(
-        np.zeros((6, 4, 5)),
-        name="image",
-        scale=(2, 1, 1),
-    )
-    labels = viewer.add_labels(
-        np.zeros((6, 4, 5), dtype=int),
-        name="labels",
-        scale=(3, 1, 1),
-    )
-    widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(labels.name)
-    del qtbot, monkeypatch
-
-    with pytest.raises(ValueError, match="scale"):
-        widget._validate_labels_binding(image, labels)
-
-    assert widget.current_labels is None
-    assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
-    assert image.visible
-    assert labels.visible
-    assert not widget.z_view_combo.isEnabled()
-    assert "scale" in widget.status_label.text().lower()
 
 
 def test_split_rejects_plane_depiction(
@@ -819,33 +684,45 @@ def test_split_rejects_plane_depiction(
         widget._validate_image_source(image)
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
 
 
-@pytest.mark.parametrize("changed_source", ["image", "labels"])
-def test_source_data_replacement_clears_split_session(
+def test_image_data_replacement_clears_split_session(
     make_napari_viewer,
     qtbot,
-    changed_source,
 ):
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
     assert _managed_layers(viewer, ROLE_Z_IMAGE)
 
-    source = image if changed_source == "image" else labels
-    source.data = np.array(source.data, copy=True)
+    image.data = np.array(image.data, copy=True)
 
     qtbot.waitUntil(
         lambda: not _managed_layers(viewer, ROLE_Z_IMAGE),
         timeout=1000,
     )
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert image.visible
     assert labels.visible
     assert not widget.z_view_combo.isEnabled()
+
+
+def test_labels_changes_do_not_affect_split_session(
+    make_napari_viewer,
+    qtbot,
+):
+    viewer = make_napari_viewer()
+    _, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
+    widget = LabelManager(viewer)
+    _split(widget, qtbot, "3")
+    derived = tuple(_managed_layers(viewer, ROLE_Z_IMAGE))
+
+    labels.data = np.array(labels.data, copy=True)
+    labels.translate = (1, 0, 0)
+    viewer.layers.remove(labels)
+
+    assert tuple(_managed_layers(viewer, ROLE_Z_IMAGE)) == derived
+    assert widget.z_view_combo.isEnabled()
 
 
 def test_removing_one_derived_image_clears_the_split_session(
@@ -855,7 +732,6 @@ def test_removing_one_derived_image_clears_the_split_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     _split(widget, qtbot, "2,4")
     derived = _managed_layers(viewer, ROLE_Z_IMAGE)
     assert len(derived) == 3
@@ -863,36 +739,26 @@ def test_removing_one_derived_image_clears_the_split_session(
     viewer.layers.remove(derived[1])
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert image.visible
     assert labels.visible
     assert not widget.z_view_combo.isEnabled()
 
 
-@pytest.mark.parametrize("removed_role", ["image", "labels", "proxy"])
-def test_removing_a_split_source_or_proxy_clears_the_session(
+def test_removing_split_source_clears_the_session(
     make_napari_viewer,
     qtbot,
-    removed_role,
 ):
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
     _select_z_layer(widget, 1)
-    proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
-    removed = {"image": image, "labels": labels, "proxy": proxy}[removed_role]
 
-    viewer.layers.remove(removed)
+    viewer.layers.remove(image)
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert not widget.z_view_combo.isEnabled()
-    if image in viewer.layers:
-        assert image.visible
-    if labels in viewer.layers:
-        assert labels.visible
+    assert labels.visible
 
 
 def test_source_geometry_change_clears_the_split_session(
@@ -902,38 +768,11 @@ def test_source_geometry_change_clears_the_split_session(
     viewer = make_napari_viewer()
     image, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
     widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
     _split(widget, qtbot, "3")
 
     image.scale = (3, 1, 1)
 
     assert not _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert not _managed_layers(viewer, ROLE_Z_LABELS)
     assert image.visible
     assert labels.visible
     assert not widget.z_view_combo.isEnabled()
-
-
-def test_labels_update_refreshes_the_proxy_without_clearing_split(
-    make_napari_viewer,
-    qtbot,
-):
-    viewer = make_napari_viewer()
-    _, labels, _, _ = _add_matching_layers(viewer, (6, 4, 5))
-    widget = LabelManager(viewer)
-    _bind_labels(widget, labels)
-    _split(widget, qtbot, "3")
-    _select_z_layer(widget, 1)
-    proxy = _managed_layers(viewer, ROLE_Z_LABELS)[0]
-
-    labels.data[1, 1, 1] = 2
-    labels.events.labels_update(
-        data=np.asarray([[[2]]], dtype=labels.data.dtype),
-        offset=(1, 1, 1),
-    )
-
-    assert proxy.data[1, 1, 1] == 2
-    assert widget._available_ids == []
-    assert _managed_layers(viewer, ROLE_Z_IMAGE)
-    assert proxy.visible
-    assert not proxy.editable

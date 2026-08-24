@@ -2,10 +2,9 @@ import numpy as np
 import pytest
 from app_model.types import KeyBinding
 from napari.layers import Points, Vectors
-from napari.utils import colormaps as cmap
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
-from qtpy.QtWidgets import QComboBox, QTreeWidget
+from qtpy.QtWidgets import QTreeWidget
 
 from napari_worm_neuron_annotator._colors import neuron_color
 from napari_worm_neuron_annotator._widget import (
@@ -17,10 +16,6 @@ from napari_worm_neuron_annotator._widget import (
     LabelManager,
     NeuronAnnotatorWidget,
 )
-
-
-def _rgba(layer, label_value):
-    return np.asarray(layer.get_color(label_value), dtype=float)
 
 
 def _roi_data():
@@ -84,7 +79,6 @@ def test_image_is_spatial_authority_and_roi_works_without_labels(
 
     assert LabelManager is NeuronAnnotatorWidget
     assert widget.current_image is image
-    assert widget.current_labels is None
     assert widget._available_ids == [0, 1]
     assert widget.checked_ids == {0}
     selected = _managed_layer(viewer, ROLE_SELECTED)
@@ -94,33 +88,7 @@ def test_image_is_spatial_authority_and_roi_works_without_labels(
     np.testing.assert_allclose(selected.translate, image.translate)
 
 
-def test_labels_binding_is_explicit_and_must_match_current_image(
-    make_napari_viewer,
-):
-    viewer = make_napari_viewer()
-    image = viewer.add_image(np.zeros((6, 5, 4)), name="image")
-    matching = viewer.add_labels(
-        np.zeros((6, 5, 4), dtype=np.int32), name="matching"
-    )
-    viewer.add_labels(
-        np.zeros((6, 5, 3), dtype=np.int32), name="mismatch"
-    )
-
-    widget = NeuronAnnotatorWidget(viewer)
-
-    assert widget.current_image is image
-    assert widget.current_labels is None
-    assert widget.labels_combo.currentText() == "None"
-    widget.labels_combo.setCurrentText("matching")
-    assert widget.current_labels is matching
-    widget.labels_combo.setCurrentText("mismatch")
-    assert widget.current_labels is matching
-    assert widget.labels_combo.currentText() == "matching"
-
-
-def test_widget_without_image_disables_roi_and_labels_controls(
-    make_napari_viewer,
-):
+def test_widget_ignores_labels_layers_when_no_image_exists(make_napari_viewer):
     viewer = make_napari_viewer()
     viewer.add_labels(np.zeros((3, 2, 2), dtype=np.int32), name="labels")
 
@@ -128,9 +96,8 @@ def test_widget_without_image_disables_roi_and_labels_controls(
 
     assert widget.current_image is None
     assert not widget.load_roi_btn.isEnabled()
-    assert not widget.selected_opacity_slider.isEnabled()
-    assert not widget.other_opacity_slider.isEnabled()
-    assert not widget.hide_unchecked_checkbox.isEnabled()
+    assert not hasattr(widget, "labels_combo")
+    assert not hasattr(widget, "labels_layer_group")
     assert not widget.orientation_group.isEnabled()
 
 
@@ -344,14 +311,9 @@ def test_j_k_navigate_4d_time_with_shift_acceleration(
 def test_widget_initializes_checkable_selection(make_napari_viewer):
     viewer = make_napari_viewer()
     viewer.add_image(np.zeros((3, 2, 2)), name="image")
-    layer = viewer.add_labels(
-        np.zeros((3, 2, 2), dtype=np.int32), name="labels"
-    )
 
     widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(layer.name)
 
-    assert isinstance(widget.layer_combo, QComboBox)
     assert isinstance(widget.selection_tree, QTreeWidget)
     assert not widget.selection_tree.alternatingRowColors()
     assert widget.navigation_help_label.text() == "Q/W: last/next"
@@ -360,15 +322,6 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     )
     assert not widget.show_box_labels_checkbox.isChecked()
     assert widget.box_label_color_btn.text() == "#FFFFFF"
-    assert (
-        widget.selected_opacity_slider.parentWidget()
-        is widget.labels_layer_group
-    )
-    assert widget.selected_opacity_slider.value() == 50
-    assert widget.selected_opacity_label.text() == "0.50"
-    assert widget.other_opacity_slider.value() == 0
-    assert widget.other_opacity_label.text() == "0.00"
-    assert widget.current_layer is layer
     assert widget._available_ids == []
     assert widget.active_id is None
     assert widget.checked_ids == set()
@@ -376,176 +329,13 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     assert not hasattr(widget, "labels_visible_checkbox")
 
 
-def test_layer_selector_tracks_insertions_and_removals(make_napari_viewer):
-    viewer = make_napari_viewer()
-    viewer.add_image(np.zeros((3, 3, 3)), name="image")
-    widget = LabelManager(viewer)
-    assert not widget.layer_combo.isEnabled()
-
-    viewer.add_labels(np.zeros((3, 3, 3), dtype=int), name="first")
-    second = viewer.add_labels(np.ones((3, 3, 3), dtype=int), name="second")
-
-    assert widget.layer_combo.count() == 3
-    assert widget.current_layer is None
-    widget.layer_combo.setCurrentText("second")
-    assert widget.current_layer is second
-
-    viewer.layers.remove(second)
-    assert widget.current_layer is None
-    assert widget.layer_combo.currentText() == "None"
-
-
-def test_selection_changes_alpha_without_changing_rgb(
-    make_napari_viewer, qtbot, tmp_path
-):
-    viewer = make_napari_viewer()
-    viewer.add_image(np.zeros((2, 6, 24, 24)), name="image")
-    layer = viewer.add_labels(
-        np.zeros((2, 6, 24, 24), dtype=np.int32),
-        name="labels",
-        opacity=0.6,
-    )
-    original_colormap = layer.colormap
-    rgb_before = {value: _rgba(layer, value)[:3] for value in (1, 2)}
-
-    widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(layer.name)
-    roi_path = tmp_path / "roi.npy"
-    np.save(roi_path, _roi_data())
-    widget.load_roi_path(roi_path)
-
-    np.testing.assert_allclose(_rgba(layer, 1)[:3], rgb_before[1])
-    np.testing.assert_allclose(_rgba(layer, 2)[:3], rgb_before[2])
-    assert _rgba(layer, 1)[3] == pytest.approx(0.5)
-    assert _rgba(layer, 2)[3] == pytest.approx(0.0)
-
-    qtbot.mouseClick(
-        widget.selection_tree.viewport(),
-        Qt.LeftButton,
-        pos=widget.selection_tree.visualItemRect(
-            widget._selection_items[1]
-        ).center(),
-    )
-    assert widget.checked_ids == {0, 1}
-    assert widget.active_id == 1
-    assert _rgba(layer, 2)[3] == pytest.approx(0.5)
-
-    widget.shutdown()
-    assert layer.colormap is original_colormap
-    assert layer.opacity == pytest.approx(0.6)
-
-
-def test_direct_colormap_rgb_is_preserved_and_navigation_wraps(
-    make_napari_viewer, tmp_path
-):
-    viewer = make_napari_viewer()
-    direct = cmap.direct_colormap(
-        {
-            None: (0.0, 0.0, 0.0, 0.0),
-            0: (0.0, 0.0, 0.0, 0.0),
-            1: (0.1, 0.3, 0.8, 1.0),
-            2: (0.8, 0.2, 0.1, 1.0),
-        }
-    )
-    direct.background_value = 0
-    viewer.add_image(np.zeros((2, 6, 24, 24)), name="image")
-    layer = viewer.add_labels(
-        np.zeros((2, 6, 24, 24), dtype=np.int32),
-        name="direct",
-        colormap=direct,
-    )
-    rgb_before = {value: _rgba(layer, value)[:3] for value in (1, 2)}
-
-    widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(layer.name)
-    roi_path = tmp_path / "roi.npy"
-    np.save(roi_path, _roi_data())
-    widget.load_roi_path(roi_path)
-
-    assert widget.active_id == 0
-    widget.navigate(-1)
-    assert widget.active_id == 1
-    assert widget.checked_ids == {0, 1}
-    widget.navigate(1)
-    assert widget.active_id == 0
-    assert widget.checked_ids == {0, 1}
-    for value in (1, 2):
-        np.testing.assert_allclose(_rgba(layer, value)[:3], rgb_before[value])
-
-
-def test_incompatible_label_data_replacement_clears_binding(
-    make_napari_viewer,
-):
-    viewer = make_napari_viewer()
-    viewer.add_image(np.zeros((3, 2, 2)), name="image")
-    layer = viewer.add_labels(
-        np.zeros((3, 2, 2), dtype=np.int32), name="labels"
-    )
-    original_colormap = layer.colormap
-    widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(layer.name)
-    assert widget.current_labels is layer
-
-    layer.data = np.zeros((3, 2, 3), dtype=np.int32)
-
-    assert widget.current_labels is None
-    assert widget.labels_combo.currentText() == "None"
-    assert layer.colormap is original_colormap
-
-
-def test_spatial_invalidation_clears_optional_labels_binding(
-    make_napari_viewer,
-):
-    viewer = make_napari_viewer()
-    image = viewer.add_image(np.zeros((3, 2, 2)), name="image")
-    labels = viewer.add_labels(
-        np.zeros((3, 2, 2), dtype=np.int32), name="labels"
-    )
-    widget = NeuronAnnotatorWidget(viewer)
-    widget.labels_combo.setCurrentText(labels.name)
-
-    image.data = np.zeros((2, 2))
-
-    assert widget.current_image is None
-    assert widget.current_labels is None
-    assert not widget.load_roi_btn.isEnabled()
-    assert not widget.selected_opacity_slider.isEnabled()
-
-
-def test_labels_geometry_change_clears_binding_and_restores_display(
-    make_napari_viewer,
-):
-    viewer = make_napari_viewer()
-    viewer.add_image(np.zeros((3, 2, 2)), name="image")
-    labels = viewer.add_labels(
-        np.zeros((3, 2, 2), dtype=np.int32), name="labels", opacity=0.6
-    )
-    original_colormap = labels.colormap
-    widget = NeuronAnnotatorWidget(viewer)
-    widget.labels_combo.setCurrentText(labels.name)
-
-    labels.translate = (1, 0, 0)
-
-    assert widget.current_labels is None
-    assert widget.labels_combo.currentText() == "None"
-    assert labels.colormap is original_colormap
-    assert labels.opacity == pytest.approx(0.6)
-
-
 def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
     make_napari_viewer, qtbot, monkeypatch, tmp_path
 ):
     viewer = make_napari_viewer()
-    labels = np.zeros((2, 6, 24, 24), dtype=np.int32)
-    labels[0, 1:4, 8:12, 8:12] = 2
     viewer.add_image(
-        np.zeros_like(labels, dtype=np.uint16),
+        np.zeros((2, 6, 24, 24), dtype=np.uint16),
         name="image",
-        scale=(1, 5, 1, 1),
-    )
-    labels_layer = viewer.add_labels(
-        labels,
-        name="covered_labels",
         scale=(1, 5, 1, 1),
     )
     expected_rgb = {
@@ -553,7 +343,6 @@ def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(
         for neuron_id in (0, 1)
     }
     widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(labels_layer.name)
 
     roi_path = tmp_path / "neuron_pt_tuple.npy"
     np.save(roi_path, _roi_data())
@@ -953,7 +742,6 @@ def test_excel_round_trip_preserves_roi_identity(
     make_napari_viewer, monkeypatch, tmp_path
 ):
     viewer = make_napari_viewer()
-    viewer.add_labels(np.zeros((2, 2), dtype=np.int32), name="labels")
     widget = LabelManager(viewer)
     widget._set_annotation_rows([(0, "AVA", "head"), (1, "AVB", "tail")])
     path = tmp_path / "annotations.xlsx"
@@ -976,7 +764,7 @@ def test_excel_round_trip_preserves_roi_identity(
     }
 
 
-def test_shutdown_restores_layer_and_removes_managed_roi_layers(
+def test_shutdown_leaves_labels_untouched_and_removes_managed_roi_layers(
     make_napari_viewer, monkeypatch, tmp_path
 ):
     viewer = make_napari_viewer()
@@ -990,7 +778,6 @@ def test_shutdown_restores_layer_and_removes_managed_roi_layers(
     )
     original_colormap = layer.colormap
     widget = LabelManager(viewer)
-    widget.labels_combo.setCurrentText(layer.name)
     roi_path = tmp_path / "roi.npy"
     np.save(roi_path, _roi_data()[:1])
     monkeypatch.setattr(

@@ -1,4 +1,4 @@
-"""Napari widget for ROI-driven neuron navigation and label visibility."""
+"""Napari widget for ROI-driven neuron navigation and annotation."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ from pathlib import Path
 
 import napari
 import numpy as np
-from napari.layers import Image, Labels, Points, Vectors
-from napari.utils import colormaps as cmap
+from napari.layers import Image, Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont
 from qtpy.QtWidgets import (
@@ -27,7 +26,6 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -52,7 +50,6 @@ from ._roi import (
     box_label_point_3d,
     box_vectors_2d,
     box_vectors_3d,
-    neuron_id_to_label_value,
 )
 from ._z_layers import (
     ZLayerRange,
@@ -84,9 +81,7 @@ ROLE_BOX_LABELS = "roi_box_labels"
 MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
 MANAGED_ROI_ROLES = (*MANAGED_VECTOR_ROLES, ROLE_BOX_LABELS)
 ROLE_Z_IMAGE = "z_layer_image"
-ROLE_Z_LABELS = "z_layer_labels"
-MANAGED_Z_ROLES = (ROLE_Z_IMAGE, ROLE_Z_LABELS)
-MAX_EXACT_LABEL_PIXELS = 10_000_000
+MANAGED_Z_ROLES = (ROLE_Z_IMAGE,)
 Z_SOURCE_GEOMETRY_EVENTS = (
     "scale",
     "translate",
@@ -99,21 +94,17 @@ Z_SOURCE_GEOMETRY_EVENTS = (
 
 
 class NeuronAnnotatorWidget(QWidget):
-    """Navigate read-only neuron boxes on an Image with optional Labels."""
+    """Navigate read-only neuron boxes on an Image."""
 
     def __init__(self, napari_viewer: napari.Viewer, parent=None):
         super().__init__(parent)
         self.viewer = napari_viewer
         self.current_image: Image | None = None
-        self.current_labels: Labels | None = None
         self.roi_dataset: NeuronBoxDataset | None = None
         self.active_id: int | None = None
         self.checked_ids: set[int] = set()
         self._available_ids: list[int] = []
         self._selection_items: dict[int, QTreeWidgetItem] = {}
-        self._base_colors: dict[int, tuple[float, float, float, float]] = {}
-        self._original_colormap = None
-        self._original_opacity: float | None = None
         self._box_label_color = "#ffffff"
         self._ui_sync = False
         self._closed = False
@@ -121,11 +112,8 @@ class NeuronAnnotatorWidget(QWidget):
         self._z_ranges: tuple[ZLayerRange, ...] = ()
         self._z_source_image: Image | None = None
         self._z_image_layers: list[Image] = []
-        self._z_labels_proxy: Labels | None = None
         self._z_active_index: int | None = None
         self._z_source_image_visible: bool | None = None
-        self._z_source_labels_visible: bool | None = None
-        self._z_source_labels_data = None
         self._z_cleanup = False
         self._z_session_token = f"{id(self):x}"
         self._z_profile_source: Image | None = None
@@ -141,7 +129,6 @@ class NeuronAnnotatorWidget(QWidget):
         self._connect_viewer_events()
         self._bind_keys()
         self._refresh_image_layers()
-        self._refresh_label_layers()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -167,8 +154,6 @@ class NeuronAnnotatorWidget(QWidget):
         layout.addWidget(self.image_layer_group)
         self.orientation_group = self._build_orientation_group()
         layout.addWidget(self.orientation_group)
-        self.labels_layer_group = self._build_labels_layer_group()
-        layout.addWidget(self.labels_layer_group)
         layout.addWidget(self._build_z_layer_group())
         layout.addWidget(self._build_roi_group())
         layout.addWidget(self._build_selection_group())
@@ -231,20 +216,6 @@ class NeuronAnnotatorWidget(QWidget):
         group.setEnabled(False)
         return group
 
-    def _build_labels_layer_group(self) -> QGroupBox:
-        group = QGroupBox("Labels Layer")
-        group_layout = QVBoxLayout()
-        self.labels_combo = QComboBox()
-        self.labels_combo.currentIndexChanged.connect(
-            self._on_labels_changed
-        )
-        group_layout.addWidget(QLabel("Optional binding:"))
-        group_layout.addWidget(self.labels_combo)
-        self.layer_combo = self.labels_combo
-        self._add_labels_appearance_controls(group_layout)
-        group.setLayout(group_layout)
-        return group
-
     def _build_z_layer_group(self) -> QGroupBox:
         group = QGroupBox("Z Layers")
         group_layout = QVBoxLayout()
@@ -303,7 +274,7 @@ class NeuronAnnotatorWidget(QWidget):
         view_layout.addWidget(self.clear_z_btn)
         group_layout.addLayout(view_layout)
 
-        description = QLabel("Split Image by z; sync optional Labels and boxes.")
+        description = QLabel("Split Image by z; synchronize neuron boxes.")
         description.setToolTip(
             "Neuron boxes are assigned to one layer by center Z."
         )
@@ -442,42 +413,6 @@ class NeuronAnnotatorWidget(QWidget):
             f"background-color: {color.name()}; color: {foreground};"
         )
 
-    def _add_labels_appearance_controls(
-        self, group_layout: QVBoxLayout
-    ) -> None:
-        selected_layout = QHBoxLayout()
-        selected_layout.addWidget(QLabel("Checked label opacity:"))
-        self.selected_opacity_slider = QSlider(Qt.Horizontal)
-        self.selected_opacity_slider.setRange(0, 100)
-        self.selected_opacity_slider.setValue(50)
-        self.selected_opacity_label = QLabel("0.50")
-        self.selected_opacity_slider.valueChanged.connect(
-            self._on_opacity_changed
-        )
-        selected_layout.addWidget(self.selected_opacity_slider)
-        selected_layout.addWidget(self.selected_opacity_label)
-        group_layout.addLayout(selected_layout)
-
-        other_layout = QHBoxLayout()
-        other_layout.addWidget(QLabel("Unchecked label opacity:"))
-        self.other_opacity_slider = QSlider(Qt.Horizontal)
-        self.other_opacity_slider.setRange(0, 100)
-        self.other_opacity_slider.setValue(0)
-        self.other_opacity_label = QLabel("0.00")
-        self.other_opacity_slider.valueChanged.connect(
-            self._on_opacity_changed
-        )
-        other_layout.addWidget(self.other_opacity_slider)
-        other_layout.addWidget(self.other_opacity_label)
-        group_layout.addLayout(other_layout)
-
-        controls_layout = QHBoxLayout()
-        self.hide_unchecked_checkbox = QCheckBox("Hide unchecked labels")
-        self.hide_unchecked_checkbox.toggled.connect(self._on_opacity_changed)
-        controls_layout.addWidget(self.hide_unchecked_checkbox)
-        controls_layout.addStretch(1)
-        group_layout.addLayout(controls_layout)
-
     def _build_annotation_group(self) -> QGroupBox:
         group = QGroupBox("Neuron Annotation")
         group_layout = QVBoxLayout()
@@ -489,11 +424,11 @@ class NeuronAnnotatorWidget(QWidget):
         group_layout.addLayout(sheet_layout)
 
         controls = QHBoxLayout()
-        self.load_current_labels_btn = QPushButton("Current IDs")
-        self.load_current_labels_btn.clicked.connect(
+        self.load_current_ids_btn = QPushButton("Current IDs")
+        self.load_current_ids_btn.clicked.connect(
             self.load_current_ids_to_annotation
         )
-        controls.addWidget(self.load_current_labels_btn)
+        controls.addWidget(self.load_current_ids_btn)
 
         self.load_excel_btn = QPushButton("Load")
         self.load_excel_btn.clicked.connect(self.load_excel_to_annotation)
@@ -552,13 +487,10 @@ class NeuronAnnotatorWidget(QWidget):
     # ------------------------------------------------------------------
     def _connect_viewer_events(self) -> None:
         events = self.viewer.layers.events
-        events.inserted.connect(self._refresh_label_layers)
         events.inserted.connect(self._refresh_image_layers)
         events.removed.connect(self._on_layer_removed)
-        events.reordered.connect(self._refresh_label_layers)
         events.reordered.connect(self._refresh_image_layers)
         if hasattr(events, "renamed"):
-            events.renamed.connect(self._refresh_label_layers)
             events.renamed.connect(self._refresh_image_layers)
 
         dims_events = self.viewer.dims.events
@@ -572,17 +504,13 @@ class NeuronAnnotatorWidget(QWidget):
     def _disconnect_viewer_events(self) -> None:
         events = self.viewer.layers.events
         for emitter, callback in (
-            (events.inserted, self._refresh_label_layers),
             (events.inserted, self._refresh_image_layers),
             (events.removed, self._on_layer_removed),
-            (events.reordered, self._refresh_label_layers),
             (events.reordered, self._refresh_image_layers),
         ):
             with suppress(TypeError, ValueError):
                 emitter.disconnect(callback)
         if hasattr(events, "renamed"):
-            with suppress(TypeError, ValueError):
-                events.renamed.disconnect(self._refresh_label_layers)
             with suppress(TypeError, ValueError):
                 events.renamed.disconnect(self._refresh_image_layers)
 
@@ -778,34 +706,6 @@ class NeuronAnnotatorWidget(QWidget):
                 self.viewer.bind_key(key, None, overwrite=True)
         self._keys_bound.clear()
 
-    def _refresh_label_layers(self, event=None) -> None:
-        del event
-        if self._closed:
-            return
-        current = self.current_labels
-        layers = [
-            layer
-            for layer in self.viewer.layers
-            if isinstance(layer, Labels)
-            and layer.metadata.get(ROLE_KEY) != ROLE_Z_LABELS
-        ]
-
-        self.labels_combo.blockSignals(True)
-        self.labels_combo.clear()
-        self.labels_combo.addItem("None", None)
-        for layer in layers:
-            self.labels_combo.addItem(layer.name, layer)
-        if current in layers:
-            self.labels_combo.setCurrentIndex(layers.index(current) + 1)
-        else:
-            self.labels_combo.setCurrentIndex(0)
-        self.labels_combo.setEnabled(bool(layers))
-        self.labels_combo.blockSignals(False)
-
-        if current is not None and current not in layers:
-            self._detach_labels_layer(restore=False)
-        self._set_labels_controls_enabled()
-
     def _refresh_image_layers(self, event=None) -> None:
         del event
         if self._closed:
@@ -815,7 +715,6 @@ class NeuronAnnotatorWidget(QWidget):
             layer
             for layer in self.viewer.layers
             if isinstance(layer, Image)
-            and not isinstance(layer, Labels)
             and layer.metadata.get(ROLE_KEY) != ROLE_Z_IMAGE
             and self._is_compatible_image_source(layer)
         ]
@@ -847,9 +746,7 @@ class NeuronAnnotatorWidget(QWidget):
         del index
         source = self.image_combo.currentData()
         self._set_current_image(
-            source
-            if isinstance(source, Image) and not isinstance(source, Labels)
-            else None
+            source if isinstance(source, Image) else None
         )
 
     def _set_current_image(self, source: Image | None) -> None:
@@ -867,14 +764,7 @@ class NeuronAnnotatorWidget(QWidget):
             # Clearing an active Z session refreshes this selector against the
             # previous source. Re-sync it after the new authority is installed.
             self._refresh_image_layers()
-        if self.current_labels is not None:
-            try:
-                self._validate_labels_binding(source, self.current_labels)
-            except ValueError:
-                self._detach_labels_layer(restore=True)
-                self._refresh_label_layers()
-
-        if not isinstance(source, Image) or isinstance(source, Labels):
+        if not isinstance(source, Image):
             self._z_profile_source = None
             self._z_profile_time = None
             self.z_profile.clear_profile()
@@ -926,15 +816,6 @@ class NeuronAnnotatorWidget(QWidget):
             self._set_current_image(None)
             self._refresh_image_layers()
             return
-        if self.current_labels is not None:
-            try:
-                self._validate_labels_binding(source, self.current_labels)
-            except ValueError as error:
-                self._detach_labels_layer(restore=True)
-                self._refresh_label_layers()
-                self.update_status(
-                    f"Labels binding cleared: {error}", "orange"
-                )
         self._remove_roi_layers()
         self._ensure_roi_layers()
         self._refresh_roi_layers()
@@ -947,7 +828,7 @@ class NeuronAnnotatorWidget(QWidget):
         """Count above-threshold pixels per Z for the current Image and time."""
 
         source = self.z_image_combo.currentData()
-        if not isinstance(source, Image) or isinstance(source, Labels):
+        if not isinstance(source, Image):
             return
         time_index = self._z_profile_time_index(source)
         threshold = float(self.z_profile_threshold_spin.value())
@@ -1010,7 +891,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.z_cuts_input.setText(",".join(str(value) for value in ordered))
 
     def split_z_layers(self) -> None:
-        """Create runtime Image slices and synchronize Labels and boxes."""
+        """Create runtime Image slices and synchronize neuron boxes."""
         try:
             self._create_z_layers()
         except Exception as error:  # noqa: BLE001 - Qt callback boundary
@@ -1023,9 +904,9 @@ class NeuronAnnotatorWidget(QWidget):
 
     def _create_z_layers(self) -> None:
         source = self.current_image
-        if not isinstance(source, Image) or isinstance(source, Labels):
+        if not isinstance(source, Image):
             raise RuntimeError("Select a 3D or 4D Image layer")
-        self._validate_z_layer_sources(source, self.current_labels)
+        self._validate_image_source(source)
 
         cuts = parse_z_cuts(self.z_cuts_input.text())
         ranges = build_z_layer_ranges(int(source.data.shape[-3]), cuts)
@@ -1038,9 +919,6 @@ class NeuronAnnotatorWidget(QWidget):
         self._z_source_image = source
         self._z_ranges = ranges
         self._z_source_image_visible = bool(source.visible)
-        if self.current_labels is not None:
-            self._z_source_labels_visible = bool(self.current_labels.visible)
-            self._z_source_labels_data = self.current_labels.data
 
         try:
             source.events.data.connect(self._on_z_source_image_data_changed)
@@ -1048,10 +926,6 @@ class NeuronAnnotatorWidget(QWidget):
                 getattr(source.events, event_name).connect(
                     self._on_z_source_geometry_changed
                 )
-                if self.current_labels is not None:
-                    getattr(self.current_labels.events, event_name).connect(
-                        self._on_z_source_geometry_changed
-                    )
             source_index = list(self.viewer.layers).index(source)
             for z_range in ranges:
                 derived = self.viewer.add_image(
@@ -1092,37 +966,6 @@ class NeuronAnnotatorWidget(QWidget):
                 if current_index != target_index:
                     self.viewer.layers.move(current_index, target_index)
 
-            if self.current_labels is not None:
-                first_range = ranges[0]
-                self._z_labels_proxy = self.viewer.add_labels(
-                    slice_z_range(self.current_labels.data, first_range),
-                    name=f"{self.current_labels.name} – Z view",
-                    colormap=self.current_labels.colormap,
-                    opacity=float(self.current_labels.opacity),
-                    blending=self.current_labels.blending,
-                    rendering=self.current_labels.rendering,
-                    depiction=self.current_labels.depiction,
-                    iso_gradient_mode=self.current_labels.iso_gradient_mode,
-                    projection_mode=self.current_labels.projection_mode,
-                    scale=tuple(self.current_labels.scale),
-                    translate=shifted_z_translation(
-                        tuple(self.current_labels.translate),
-                        tuple(self.current_labels.scale),
-                        first_range.start,
-                    ),
-                    axis_labels=tuple(self.current_labels.axis_labels),
-                    units=tuple(self.current_labels.units),
-                    visible=False,
-                    metadata={
-                        ROLE_KEY: ROLE_Z_LABELS,
-                        "z_layer_index": first_range.index,
-                        "z_start": first_range.start,
-                        "z_stop": first_range.stop,
-                        "z_session": self._z_session_token,
-                    },
-                )
-                self._z_labels_proxy.editable = False
-                self._z_labels_proxy.contour = self.current_labels.contour
             source.visible = False
 
             self.z_view_combo.blockSignals(True)
@@ -1141,7 +984,6 @@ class NeuronAnnotatorWidget(QWidget):
             self.z_image_combo.setEnabled(False)
             self._z_active_index = None
             self._apply_z_view()
-            self._apply_label_opacity()
         except Exception:
             self._clear_z_layers()
             raise
@@ -1150,13 +992,6 @@ class NeuronAnnotatorWidget(QWidget):
             f"Split {source.name} into {len(ranges)} Z layers",
             "green",
         )
-
-    def _validate_z_layer_sources(
-        self, source: Image, labels: Labels | None
-    ) -> None:
-        self._validate_image_source(source)
-        if labels is not None:
-            self._validate_labels_binding(source, labels)
 
     def _validate_image_source(self, source: Image) -> None:
         if source.rgb:
@@ -1180,40 +1015,6 @@ class NeuronAnnotatorWidget(QWidget):
                 "as a Dask array before use"
             )
 
-    def _validate_labels_binding(
-        self, source: Image | None, labels: Labels
-    ) -> None:
-        if source is None:
-            raise ValueError("Select an Image before binding Labels")
-        if labels.multiscale:
-            raise ValueError("Multiscale Labels layers are not supported")
-        if labels.depiction != "volume":
-            raise ValueError("Only volume depiction is supported")
-        if len(labels.experimental_clipping_planes):
-            raise ValueError("Experimental clipping planes are not supported")
-        if labels.ndim not in (3, 4):
-            raise ValueError("Labels must use (z,y,x) or (t,z,y,x)")
-        if source.ndim != labels.ndim:
-            raise ValueError("Image and Labels dimensions do not match")
-        if tuple(source.data.shape) != tuple(labels.data.shape):
-            raise ValueError("Image and Labels shapes do not match")
-        if tuple(source.axis_labels) != tuple(labels.axis_labels):
-            raise ValueError("Image and Labels axis labels do not match")
-        if not np.array_equal(source.scale, labels.scale):
-            raise ValueError("Image and Labels scale do not match")
-        if not np.array_equal(source.translate, labels.translate):
-            raise ValueError("Image and Labels translation do not match")
-        if tuple(source.units) != tuple(labels.units):
-            raise ValueError("Image and Labels units do not match")
-        if not self._uses_axis_aligned_transform(labels):
-            raise ValueError("Labels transform must be axis-aligned")
-        data_module = type(labels.data).__module__.split(".", 1)[0]
-        if data_module == "zarr":
-            raise ValueError(
-                "Direct Zarr arrays are not supported; wrap the array "
-                "as a Dask array before use"
-            )
-
     def _is_compatible_image_source(self, source: Image) -> bool:
         try:
             self._validate_image_source(source)
@@ -1222,7 +1023,7 @@ class NeuronAnnotatorWidget(QWidget):
         return True
 
     @staticmethod
-    def _uses_axis_aligned_transform(layer: Image | Labels) -> bool:
+    def _uses_axis_aligned_transform(layer: Image) -> bool:
         ndim = layer.ndim
         return (
             np.allclose(layer.rotate, np.eye(ndim))
@@ -1276,30 +1077,6 @@ class NeuronAnnotatorWidget(QWidget):
 
         if self._z_source_image is not None:
             self._z_source_image.visible = False
-        if active_range is None:
-            if self.current_labels is not None:
-                self.current_labels.visible = True
-            if self._z_labels_proxy is not None:
-                self._z_labels_proxy.visible = False
-        elif self._z_labels_proxy is not None and self.current_labels is not None:
-            self.current_labels.visible = False
-            self._z_labels_proxy.data = slice_z_range(
-                self.current_labels.data, active_range
-            )
-            self._z_labels_proxy.editable = False
-            self._z_labels_proxy.translate = shifted_z_translation(
-                tuple(self.current_labels.translate),
-                tuple(self.current_labels.scale),
-                active_range.start,
-            )
-            self._z_labels_proxy.metadata.update(
-                {
-                    "z_layer_index": active_range.index,
-                    "z_start": active_range.start,
-                    "z_stop": active_range.stop,
-                }
-            )
-            self._z_labels_proxy.visible = True
         if active_range is not None:
             self._clamp_z_to_active_layer(active_range)
 
@@ -1328,9 +1105,7 @@ class NeuronAnnotatorWidget(QWidget):
 
     def _clear_z_layers(self) -> None:
         source_image = self._z_source_image
-        source_labels = self.current_labels
         image_visible = self._z_source_image_visible
-        labels_visible = self._z_source_labels_visible
 
         if source_image is not None:
             with suppress(TypeError, ValueError):
@@ -1342,20 +1117,12 @@ class NeuronAnnotatorWidget(QWidget):
                     getattr(source_image.events, event_name).disconnect(
                         self._on_z_source_geometry_changed
                     )
-        if source_labels is not None:
-            for event_name in Z_SOURCE_GEOMETRY_EVENTS:
-                with suppress(TypeError, ValueError):
-                    getattr(source_labels.events, event_name).disconnect(
-                        self._on_z_source_geometry_changed
-                    )
-
         self._z_cleanup = True
         try:
             managed = [
                 layer
                 for layer in self.viewer.layers
                 if layer in self._z_image_layers
-                or layer is self._z_labels_proxy
                 or (
                     layer.metadata.get(ROLE_KEY) in MANAGED_Z_ROLES
                     and layer.metadata.get("z_session")
@@ -1374,21 +1141,11 @@ class NeuronAnnotatorWidget(QWidget):
             and image_visible is not None
         ):
             source_image.visible = image_visible
-        if (
-            source_labels is not None
-            and source_labels in self.viewer.layers
-            and labels_visible is not None
-        ):
-            source_labels.visible = labels_visible
-
         self._z_ranges = ()
         self._z_source_image = None
         self._z_image_layers.clear()
-        self._z_labels_proxy = None
         self._z_active_index = None
         self._z_source_image_visible = None
-        self._z_source_labels_visible = None
-        self._z_source_labels_data = None
 
         self.z_view_combo.blockSignals(True)
         self.z_view_combo.clear()
@@ -1397,96 +1154,9 @@ class NeuronAnnotatorWidget(QWidget):
         self.z_view_combo.setEnabled(False)
         self.clear_z_btn.setEnabled(False)
         self._refresh_image_layers()
-        self._refresh_label_layers()
         self._refresh_selection_item_styles()
         self._refresh_roi_layers()
         self._update_info()
-
-    def _on_labels_changed(self, index: int) -> None:
-        layer = self.labels_combo.itemData(index) if index >= 0 else None
-        if layer is self.current_labels:
-            return
-        if not isinstance(layer, Labels):
-            if layer is not None:
-                self._set_labels_combo_layer(self.current_labels)
-                return
-        elif layer is not None:
-            try:
-                self._validate_labels_binding(self.current_image, layer)
-            except ValueError as error:
-                self._set_labels_combo_layer(self.current_labels)
-                self.update_status(f"Labels binding rejected: {error}", "red")
-                return
-
-        if self._z_ranges:
-            self._clear_z_layers()
-        self._detach_labels_layer(restore=True)
-        if layer is None:
-            self._reset_labels_combo_to_none()
-            self._set_labels_controls_enabled()
-            self.update_status("Labels binding cleared", "blue")
-            return
-        self.current_labels = layer
-        self._original_colormap = layer.colormap
-        self._original_opacity = float(layer.opacity)
-        self._base_colors.clear()
-        layer.events.data.connect(self._on_label_data_changed)
-        layer.events.labels_update.connect(self._on_label_data_changed)
-        for event_name in Z_SOURCE_GEOMETRY_EVENTS:
-            getattr(layer.events, event_name).connect(
-                self._on_bound_labels_geometry_changed
-            )
-        self._cache_base_colors(self._available_ids)
-        self._apply_label_opacity()
-        self._set_labels_combo_layer(layer)
-        self._set_labels_controls_enabled()
-        self.update_status(f"Bound Labels: {layer.name}", "blue")
-
-    def _reset_labels_combo_to_none(self) -> None:
-        self._set_labels_combo_layer(None)
-
-    def _set_labels_combo_layer(self, layer: Labels | None) -> None:
-        index = 0
-        if layer is not None:
-            for candidate in range(1, self.labels_combo.count()):
-                if self.labels_combo.itemData(candidate) is layer:
-                    index = candidate
-                    break
-        self.labels_combo.blockSignals(True)
-        self.labels_combo.setCurrentIndex(index)
-        self.labels_combo.blockSignals(False)
-
-    # Compatibility adapter for integrations using the previous callback.
-    def _on_layer_changed(self, layer_name: str) -> None:
-        index = self.labels_combo.findText(layer_name)
-        self.labels_combo.setCurrentIndex(index if index >= 0 else 0)
-
-    def _detach_labels_layer(self, *, restore: bool) -> None:
-        if self.current_labels is None:
-            return
-        with suppress(TypeError, ValueError):
-            self.current_labels.events.data.disconnect(
-                self._on_label_data_changed
-            )
-        with suppress(TypeError, ValueError):
-            self.current_labels.events.labels_update.disconnect(
-                self._on_label_data_changed
-            )
-        for event_name in Z_SOURCE_GEOMETRY_EVENTS:
-            with suppress(TypeError, ValueError):
-                getattr(self.current_labels.events, event_name).disconnect(
-                    self._on_bound_labels_geometry_changed
-                )
-        if restore:
-            self._restore_layer_display()
-        self.current_labels = None
-        self._original_colormap = None
-        self._original_opacity = None
-        self._base_colors.clear()
-        self._set_labels_controls_enabled()
-
-    def _detach_current_layer(self, *, restore: bool) -> None:
-        self._detach_labels_layer(restore=restore)
 
     def _on_layer_removed(self, event) -> None:
         if self._closed:
@@ -1506,56 +1176,11 @@ class NeuronAnnotatorWidget(QWidget):
             and removed.metadata.get(ROLE_KEY) in MANAGED_ROI_ROLES
         ):
             return
-        if removed is self._z_source_image or removed is self.current_labels:
+        if removed is self._z_source_image:
             self._clear_z_layers()
-        if removed is self.current_labels:
-            self._detach_labels_layer(restore=False)
-            self._reset_labels_combo_to_none()
         if removed is self.current_image:
             self._set_current_image(None)
-        self._refresh_label_layers()
         self._refresh_image_layers()
-
-    def _on_label_data_changed(self, event=None) -> None:
-        del event
-        if (
-            self._z_ranges
-            and self.current_labels is not None
-            and self.current_labels.data is not self._z_source_labels_data
-        ):
-            self._clear_z_layers()
-        if self.current_labels is not None:
-            try:
-                self._validate_labels_binding(
-                    self.current_image, self.current_labels
-                )
-            except ValueError as error:
-                self._detach_labels_layer(restore=True)
-                self._reset_labels_combo_to_none()
-                self.update_status(
-                    f"Labels binding cleared: {error}", "orange"
-                )
-                return
-        self._cache_base_colors(self._available_ids)
-        self._apply_label_opacity()
-        if self._z_labels_proxy is not None:
-            self._z_labels_proxy.refresh()
-        self._refresh_roi_layers()
-
-    def _on_bound_labels_geometry_changed(self, event=None) -> None:
-        del event
-        if self.current_labels is None:
-            return
-        try:
-            self._validate_labels_binding(
-                self.current_image, self.current_labels
-            )
-        except ValueError as error:
-            if self._z_ranges:
-                self._clear_z_layers()
-            self._detach_labels_layer(restore=True)
-            self._reset_labels_combo_to_none()
-            self.update_status(f"Labels binding cleared: {error}", "orange")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.shutdown()
@@ -1572,7 +1197,6 @@ class NeuronAnnotatorWidget(QWidget):
         self._clear_z_layers()
         self._disconnect_current_image_events()
         self.current_image = None
-        self._detach_current_layer(restore=True)
         self._remove_roi_layers()
 
     # ------------------------------------------------------------------
@@ -1595,60 +1219,8 @@ class NeuronAnnotatorWidget(QWidget):
             self.active_id = valid[0] if valid else ids[0]
             self.checked_ids = {self.active_id}
 
-        self._cache_base_colors(ids)
         self._rebuild_selection_items()
         self._sync_annotation_ids()
-        self._apply_label_opacity()
-        self._set_labels_controls_enabled()
-
-    def _background_value(self) -> int:
-        colormap = (
-            self._original_colormap
-            if self._original_colormap is not None
-            else getattr(self.current_labels, "colormap", None)
-        )
-        return int(getattr(colormap, "background_value", 0))
-
-    def _label_value(self, display_id: int) -> int:
-        return neuron_id_to_label_value(display_id)
-
-    def _cache_base_colors(self, display_ids: list[int]) -> None:
-        if self.current_labels is None or self._original_colormap is None:
-            return
-        label_values = {self._label_value(item_id) for item_id in display_ids}
-        data = self.current_labels.data
-        size = getattr(data, "size", None)
-        if (
-            isinstance(data, np.ndarray)
-            and size is not None
-            and int(size) <= MAX_EXACT_LABEL_PIXELS
-        ):
-            background = self._background_value()
-            label_values.update(
-                int(value)
-                for value in np.unique(data)
-                if int(value) != background
-            )
-
-        managed_colormap = self.current_labels.colormap
-        if managed_colormap is not self._original_colormap:
-            self.current_labels.colormap = self._original_colormap
-        try:
-            for label_value in label_values:
-                if label_value in self._base_colors:
-                    continue
-                mapped = np.asarray(
-                    self.current_labels.get_color(label_value), dtype=float
-                ).reshape(-1)
-                if mapped.size != 4 or not np.all(np.isfinite(mapped)):
-                    raise ValueError(
-                        "Labels colormap returned an invalid RGBA value "
-                        f"for label {label_value}"
-                    )
-                self._base_colors[label_value] = tuple(mapped)
-        finally:
-            if managed_colormap is not self._original_colormap:
-                self.current_labels.colormap = managed_colormap
 
     def _rebuild_selection_items(self) -> None:
         self._ui_sync = True
@@ -1791,7 +1363,6 @@ class NeuronAnnotatorWidget(QWidget):
 
     def _selection_changed(self, *, locate: bool) -> None:
         self._refresh_selection_item_styles()
-        self._apply_label_opacity()
         self._refresh_roi_layers()
         self._sync_annotation_to_active()
         if locate:
@@ -1894,80 +1465,6 @@ class NeuronAnnotatorWidget(QWidget):
         self._step_time(10)
 
     # ------------------------------------------------------------------
-    # Labels appearance
-    # ------------------------------------------------------------------
-    def _on_opacity_changed(self, value=None) -> None:
-        del value
-        self.selected_opacity_label.setText(
-            f"{self.selected_opacity_slider.value() / 100:.2f}"
-        )
-        self._set_labels_controls_enabled()
-        other = (
-            0.0
-            if self.hide_unchecked_checkbox.isChecked()
-            else self.other_opacity_slider.value() / 100
-        )
-        self.other_opacity_label.setText(f"{other:.2f}")
-        self._apply_label_opacity()
-
-    def _set_labels_controls_enabled(self) -> None:
-        enabled = self.current_labels is not None and self.roi_dataset is not None
-        self.selected_opacity_slider.setEnabled(enabled)
-        self.hide_unchecked_checkbox.setEnabled(enabled)
-        self.other_opacity_slider.setEnabled(
-            enabled and not self.hide_unchecked_checkbox.isChecked()
-        )
-
-    def _apply_label_opacity(self) -> None:
-        if (
-            self.current_labels is None
-            or self._original_colormap is None
-            or not self._available_ids
-        ):
-            return
-
-        selected_alpha = self.selected_opacity_slider.value() / 100
-        other_alpha = (
-            0.0
-            if self.hide_unchecked_checkbox.isChecked()
-            else self.other_opacity_slider.value() / 100
-        )
-        colors: dict[int | None, tuple[float, float, float, float]] = {
-            None: (0.0, 0.0, 0.0, 0.0)
-        }
-        for label_value, base in self._base_colors.items():
-            display_id = label_value - 1
-            rgba = list(base)
-            rgba[3] = (
-                selected_alpha
-                if display_id in self.checked_ids
-                else other_alpha
-            )
-            colors[label_value] = tuple(rgba)
-
-        direct = cmap.direct_colormap(colors)
-        direct.background_value = self._background_value()
-        direct.name = "neuron_roi_visibility"
-        targets = [self.current_labels]
-        if self._z_labels_proxy is not None:
-            targets.append(self._z_labels_proxy)
-        for layer in targets:
-            layer.colormap = direct
-            layer.opacity = 1.0
-
-    def _restore_layer_display(self) -> None:
-        if self.current_labels is None:
-            return
-        targets = [self.current_labels]
-        if self._z_labels_proxy is not None:
-            targets.append(self._z_labels_proxy)
-        for layer in targets:
-            if self._original_colormap is not None:
-                layer.colormap = self._original_colormap
-            if self._original_opacity is not None:
-                layer.opacity = self._original_opacity
-
-    # ------------------------------------------------------------------
     # ROI loading and geometry layers
     # ------------------------------------------------------------------
     def load_roi_npy(self) -> None:
@@ -2028,8 +1525,6 @@ class NeuronAnnotatorWidget(QWidget):
         self._available_ids = []
         self.roi_info_label.setText("No ROI loaded")
         self._rebuild_selection_items()
-        self._restore_layer_display()
-        self._set_labels_controls_enabled()
         self._update_info()
         self.update_status("ROI unloaded", "green")
 
@@ -2690,12 +2185,6 @@ class NeuronAnnotatorWidget(QWidget):
         self.status_label.setText(message)
         self.status_label.setStyleSheet(f"color: {color};")
 
-    @property
-    def current_layer(self) -> Labels | None:
-        """Compatibility alias for the optional controlled Labels layer."""
-        return self.current_labels
-
-
 LabelManager = NeuronAnnotatorWidget
 
 __all__ = (
@@ -2707,5 +2196,4 @@ __all__ = (
     "ROLE_KEY",
     "ROLE_SELECTED",
     "ROLE_Z_IMAGE",
-    "ROLE_Z_LABELS",
 )

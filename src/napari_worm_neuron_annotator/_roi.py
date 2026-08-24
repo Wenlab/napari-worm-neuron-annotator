@@ -145,20 +145,6 @@ class NeuronBoxDataset:
         ]
 
 
-def neuron_id_to_label_value(neuron_id: int) -> int:
-    """Map a zero-based neuron identity to a Labels layer value."""
-    if neuron_id < 0:
-        raise ValueError("neuron_id must be non-negative")
-    return int(neuron_id) + 1
-
-
-def label_value_to_neuron_id(label_value: int) -> int:
-    """Map a non-background Labels value to a zero-based neuron identity."""
-    if label_value <= 0:
-        raise ValueError("label_value must be positive")
-    return int(label_value) - 1
-
-
 def _clipped_bounds(
     box: NeuronBox,
     shape_zyx: tuple[int, int, int] | None,
