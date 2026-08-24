@@ -539,6 +539,27 @@ def test_layer_view_filters_whole_boxes_by_center_and_navigation(
     assert outside.flags() & Qt.ItemIsEnabled
     assert outside.checkState(0) == Qt.Checked
 
+    widget.neuron_search_input.setText("0")
+    z_index_before = widget._z_active_index
+    widget._activate_next_search_match()
+    assert widget.active_id == 0
+    assert widget._z_active_index == z_index_before
+    assert len(active.data) == 0
+
+    checked_before = set(widget.checked_ids)
+    widget.navigate_checked(1)
+    assert widget.active_id == 1
+    widget.navigate_checked(1)
+    assert widget.active_id == 2
+    widget.navigate_checked(1)
+    assert widget.active_id == 1
+    widget.navigate_checked(-1)
+    assert widget.active_id == 2
+    assert widget.checked_ids == checked_before
+
+    widget.active_id = 0
+    widget._selection_changed(locate=False)
+
     widget.navigate(1)
     assert widget.active_id == 1
     assert widget.checked_ids == {0, 1, 2}

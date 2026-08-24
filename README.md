@@ -22,7 +22,9 @@ synchronize them.
 - Dynamic 2D bounding rectangles and 3D 12-edge wireframes.
 - Stable per-neuron box colors derived from zero-based ROI identity.
 - Checkable neuron list with a separate active neuron.
-- All/None controls and cumulative Q/W navigation.
+- Digital/biological multi-neuron search with explicit match selection.
+- All/None controls, cumulative Q/W navigation, and checked-only Shift+Q/W.
+- Optional Biological, Digital, or combined selected-box text.
 - Fixed canvas shortcuts for Z-slice and time-frame navigation.
 - Active-neuron highlighting and view centering.
 - Session-only whole-viewer rotation and screen-axis flip controls.
@@ -98,6 +100,28 @@ session baseline and the plugin controls return to their default state.
 The legacy `LabelManager` Python and command aliases remain available for
 compatibility. The public widget name is `NeuronAnnotatorWidget`, and napari
 lists only that widget.
+
+## Neuron selection and search
+
+The neuron tree keeps persistent checked identities separate from the one
+active identity. Q/W moves through valid neurons and checks each activated
+identity. Shift+Q/W moves only through already checked neurons that are valid
+at the current time and, in Layer mode, belong to the active Z range. Both
+forms of navigation wrap in zero-based digital-ID order.
+
+The search field accepts comma-separated digital IDs and biological-name
+fragments. Numeric tokens match an ID exactly; other tokens use a
+case-insensitive biological-name substring match. Typing highlights every
+matching tree row without changing selection or moving the view. Enter cycles
+through matches one at a time, checking and making only that match active.
+**Check matches** adds all matches to the existing checked set without
+changing the active neuron.
+
+Search covers all global ROI identities, including observations missing at
+the current time or outside the active Z range. Those results remain gray and
+cannot move the current view until they become navigable. Search highlighting
+is confined to the tree; image highlighting continues to use the existing
+selected and active overlay layers.
 
 ## Z-layer display
 
@@ -212,11 +236,12 @@ optional text overlay. Checked identities that are missing at the current time
 remain checked but are temporarily omitted from the geometry.
 
 Enable **Show selected box labels** to place one text label at the center of
-each currently rendered checked box. The text uses the annotation table's
-`biological` value when present and otherwise falls back to the zero-based
-`neuron_id`. The third `annotation` column is not used for box labels. The
-option is off by default. Use **Text color** to choose a session-only label
-color that contrasts with the current Image colormap.
+each currently rendered checked box. **Label text** selects Biological,
+Digital, or `Digital + biological` text. Biological is the default and falls
+back to the zero-based `neuron_id` when empty; the combined form is written as
+`12 · AVA` and also falls back to the ID. The third `annotation` column is not
+used for box labels. The option is off by default. Use **Text color** to choose
+a session-only label color that contrasts with the current Image colormap.
 
 In 2D mode, the plugin draws four rectangle edges only when the current z
 slice intersects the box's half-open z range.

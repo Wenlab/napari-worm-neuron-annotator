@@ -4,7 +4,7 @@ from app_model.types import KeyBinding
 from napari.layers import Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
-from qtpy.QtWidgets import QTreeWidget
+from qtpy.QtWidgets import QComboBox, QLineEdit, QTreeWidget
 
 from napari_worm_neuron_annotator._colors import neuron_color
 from napari_worm_neuron_annotator._widget import (
@@ -15,6 +15,7 @@ from napari_worm_neuron_annotator._widget import (
     ROLE_SELECTED,
     LabelManager,
     NeuronAnnotatorWidget,
+    _match_neuron_ids,
 )
 
 
@@ -315,8 +316,18 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     widget = LabelManager(viewer)
 
     assert isinstance(widget.selection_tree, QTreeWidget)
+    assert isinstance(widget.neuron_search_input, QLineEdit)
+    assert isinstance(widget.box_label_mode_combo, QComboBox)
     assert not widget.selection_tree.alternatingRowColors()
     assert widget.navigation_help_label.text() == "Q/W: last/next"
+    assert "Shift+Q/W" in widget.navigation_help_label.toolTip()
+    assert [
+        widget.box_label_mode_combo.itemText(index)
+        for index in range(widget.box_label_mode_combo.count())
+    ] == ["Biological", "Digital", "Digital + biological"]
+    assert widget.box_label_mode_combo.currentData() == "biological"
+    assert widget.search_matches_label.text() == ""
+    assert not widget.check_matches_btn.isEnabled()
     assert widget.show_box_labels_checkbox.text() == (
         "Show selected box labels"
     )
@@ -538,10 +549,34 @@ def test_optional_box_labels_use_biological_name_with_id_fallback(
     assert list(box_labels.features["display_text"]) == ["AVA"]
     assert list(box_labels.text.values) == ["AVA"]
 
+    points_before = np.asarray(box_labels.data).copy()
+    checked_before = set(widget.checked_ids)
+    active_before = widget.active_id
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("digital")
+    )
+    assert list(box_labels.features["display_text"]) == ["0"]
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("digital_biological")
+    )
+    assert list(box_labels.features["display_text"]) == ["0 · AVA"]
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("biological")
+    )
+    assert list(box_labels.features["display_text"]) == ["AVA"]
+    np.testing.assert_allclose(box_labels.data, points_before)
+    assert widget.checked_ids == checked_before
+    assert widget.active_id == active_before
+
     widget.annotation_table.item(0, 2).setText("ignored note")
     assert list(box_labels.features["display_text"]) == ["AVA"]
 
     widget.annotation_table.item(0, 1).setText("   ")
+    assert list(box_labels.features["display_text"]) == ["0"]
+
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("digital_biological")
+    )
     assert list(box_labels.features["display_text"]) == ["0"]
 
     widget._selection_items[1].setCheckState(0, Qt.Checked)
@@ -561,6 +596,170 @@ def test_optional_box_labels_use_biological_name_with_id_fallback(
     assert box_labels.data.shape == (0, 4)
     assert widget.checked_ids == expected_checked
     assert widget.active_id == expected_active
+
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("digital")
+    )
+    assert box_labels.data.shape == (0, 4)
+    widget.show_box_labels_checkbox.setChecked(True)
+    assert list(box_labels.features["display_text"]) == ["1"]
+    widget.show_box_labels_checkbox.setChecked(False)
+
+
+def test_search_matching_uses_exact_digital_and_casefolded_biological():
+    names = {1: "AVA", 10: "AVB", 12: "  ava-left  "}
+
+    assert _match_neuron_ids([1, 10, 12], names, "1") == [1]
+    assert _match_neuron_ids([1, 10, 12], names, "001") == [1]
+    assert _match_neuron_ids([1, 10, 12], names, "AvA") == [1, 12]
+    assert _match_neuron_ids([1, 10, 12], names, "10, ava") == [1, 10, 12]
+    assert _match_neuron_ids([1, 10, 12], names, " , ") == []
+    assert _match_neuron_ids([1, 10, 12], names, "9" * 5_000) == []
+
+
+def test_search_marks_all_matches_and_enter_activates_one(
+    make_napari_viewer, qtbot, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi = np.full((1, 3, 6), np.nan, dtype=np.float32)
+    roi[0, 0] = [6, 6, 10, 4, 4, 5]
+    roi[0, 1] = [12, 12, 10, 4, 4, 5]
+    roi[0, 2] = [18, 18, 10, 4, 4, 5]
+    roi_path = tmp_path / "search.npy"
+    np.save(roi_path, roi)
+    widget.load_roi_path(roi_path)
+    viewer.dims.ndisplay = 3
+    widget._set_annotation_rows(
+        [(0, "AVA", "first"), (1, "AVB", ""), (2, "AVA-L", "")]
+    )
+
+    checked_before = set(widget.checked_ids)
+    active_before = widget.active_id
+    camera_before = tuple(viewer.camera.center)
+    widget.neuron_search_input.setText("ava")
+
+    assert widget._search_match_ids == [0, 2]
+    assert widget.search_matches_label.text() == "2 matches"
+    assert widget.checked_ids == checked_before
+    assert widget.active_id == active_before
+    assert tuple(viewer.camera.center) == camera_before
+    assert widget._selection_items[0].background(1).style() != Qt.NoBrush
+    assert widget._selection_items[2].background(1).style() != Qt.NoBrush
+    assert widget._selection_items[1].background(1).style() == Qt.NoBrush
+
+    qtbot.keyClick(widget.neuron_search_input, Qt.Key_Return)
+    assert widget.active_id == 0
+    assert widget.search_matches_label.text() == "1/2 matches"
+    qtbot.keyClick(widget.neuron_search_input, Qt.Key_Return)
+    assert widget.active_id == 2
+    assert widget.checked_ids == {0, 2}
+    assert widget.search_matches_label.text() == "2/2 matches"
+    active_layer = _managed_layer(viewer, ROLE_ACTIVE)
+    assert set(active_layer.features["neuron_id"]) == {2}
+
+    widget.neuron_search_input.setText("av")
+    active_before = widget.active_id
+    camera_before = tuple(viewer.camera.center)
+    qtbot.mouseClick(widget.check_matches_btn, Qt.LeftButton)
+    assert widget.checked_ids == {0, 1, 2}
+    assert widget.active_id == active_before
+    assert tuple(viewer.camera.center) == camera_before
+
+    widget.neuron_search_input.setText("new")
+    assert widget._search_match_ids == []
+    widget.annotation_table.item(1, 1).setText("NEW")
+    assert widget._search_match_ids == [1]
+    assert widget.search_matches_label.text() == "1 matches"
+
+    widget.check_none()
+    assert widget.neuron_search_input.text() == "new"
+    assert widget._search_match_ids == [1]
+    widget.neuron_search_input.clear()
+    assert widget._search_match_ids == []
+    assert widget.search_matches_label.text() == ""
+    assert widget._selection_items[1].background(1).style() == Qt.NoBrush
+
+    widget.activate_id(0, locate=False)
+    widget.neuron_search_input.setFocus()
+    qtbot.keyClicks(widget.neuron_search_input, "qW")
+    assert widget.neuron_search_input.text() == "qW"
+    assert widget.active_id == 0
+
+    widget.neuron_search_input.setText("ava")
+    widget.unload_roi()
+    assert widget.neuron_search_input.text() == ""
+    assert widget._search_match_ids == []
+
+
+def test_shift_q_w_navigate_only_checked_ids_and_unbind(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi = np.full((1, 4, 6), np.nan, dtype=np.float32)
+    for neuron_id in range(4):
+        roi[0, neuron_id] = [
+            4 + 4 * neuron_id,
+            4 + 4 * neuron_id,
+            10,
+            2,
+            2,
+            5,
+        ]
+    roi_path = tmp_path / "checked-navigation.npy"
+    np.save(roi_path, roi)
+    widget.load_roi_path(roi_path)
+    viewer.dims.ndisplay = 3
+
+    widget.checked_ids = {0, 2, 3}
+    widget.active_id = 0
+    widget._selection_changed(locate=False)
+    _press_viewer_key(viewer, "Shift-W")
+    assert widget.active_id == 2
+    assert widget.checked_ids == {0, 2, 3}
+    _press_viewer_key(viewer, "Shift-W")
+    assert widget.active_id == 3
+    _press_viewer_key(viewer, "Shift-W")
+    assert widget.active_id == 0
+    _press_viewer_key(viewer, "Shift-Q")
+    assert widget.active_id == 3
+
+    widget.active_id = 1
+    widget.navigate_checked(1)
+    assert widget.active_id == 2
+    widget.active_id = 1
+    widget.navigate_checked(-1)
+    assert widget.active_id == 0
+    assert widget.checked_ids == {0, 2, 3}
+
+    widget.active_id = None
+    widget.navigate_checked(1)
+    assert widget.active_id == 0
+    widget.active_id = None
+    widget.navigate_checked(-1)
+    assert widget.active_id == 3
+
+    widget.checked_ids.clear()
+    active_before = widget.active_id
+    camera_before = tuple(viewer.camera.center)
+    widget.navigate_checked(1)
+    assert widget.active_id == active_before
+    assert widget.checked_ids == set()
+    assert tuple(viewer.camera.center) == camera_before
+    assert "No checked neuron" in widget.status_label.text()
+
+    widget.checked_ids = {0}
+    widget.active_id = 0
+    widget.navigate(1)
+    assert widget.active_id == 1
+    assert widget.checked_ids == {0, 1}
+
+    widget.shutdown()
+    for key in ("Q", "W", "Shift-Q", "Shift-W"):
+        assert KeyBinding.from_str(key) not in viewer.keymap
 
 
 def test_row_click_checkbox_all_and_none_update_vector_layers(
@@ -641,6 +840,12 @@ def test_navigation_skips_missing_roi_at_current_time(
     assert widget.active_id == 1
     assert widget.checked_ids == {0, 1}
 
+    widget.active_id = 0
+    checked_before = set(widget.checked_ids)
+    widget.navigate_checked(1)
+    assert widget.active_id == 1
+    assert widget.checked_ids == checked_before
+
 
 def test_switching_3d_and_4d_images_recreates_managed_vectors(
     make_napari_viewer, monkeypatch, tmp_path
@@ -667,6 +872,12 @@ def test_switching_3d_and_4d_images_recreates_managed_vectors(
         lambda *args, **kwargs: QColor("#abcdef"),
     )
     widget.box_label_color_btn.click()
+    widget._set_annotation_rows([(0, "AVA", ""), (1, "", "")])
+    widget.box_label_mode_combo.setCurrentIndex(
+        widget.box_label_mode_combo.findData("digital_biological")
+    )
+    widget.show_box_labels_checkbox.setChecked(True)
+    viewer.dims.ndisplay = 3
 
     widget.image_combo.setCurrentText(layer_3d.name)
     managed = [
@@ -678,6 +889,9 @@ def test_switching_3d_and_4d_images_recreates_managed_vectors(
     assert len(managed) == 2
     assert all(layer.ndim == 3 for layer in managed)
     assert _managed_box_labels(viewer).ndim == 3
+    assert list(
+        _managed_box_labels(viewer).features["display_text"]
+    ) == ["0 · AVA"]
     np.testing.assert_allclose(
         _box_label_rgba(_managed_box_labels(viewer)),
         [0xAB / 255, 0xCD / 255, 0xEF / 255, 1],
@@ -693,6 +907,9 @@ def test_switching_3d_and_4d_images_recreates_managed_vectors(
     assert len(managed) == 2
     assert all(layer.ndim == 4 for layer in managed)
     assert _managed_box_labels(viewer).ndim == 4
+    assert list(
+        _managed_box_labels(viewer).features["display_text"]
+    ) == ["0 · AVA"]
     np.testing.assert_allclose(
         _box_label_rgba(_managed_box_labels(viewer)),
         [0xAB / 255, 0xCD / 255, 0xEF / 255, 1],

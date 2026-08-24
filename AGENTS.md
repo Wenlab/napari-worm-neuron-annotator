@@ -33,22 +33,36 @@ Keep these states separate. The supported interactions are:
   identity does not change the active neuron.
 - Q/W navigates to the previous/next valid neuron, checks it, and preserves
   existing checks.
+- Shift+Q/W navigates only current-time, current-Z-range checked neurons in
+  digital-ID order. It changes only `active_id` and the view, never
+  `checked_ids`.
 - All checks every global identity and preserves an existing active identity.
 - None clears both states.
 - Time changes preserve global checked and active identities. Missing boxes
   remain listed and checked but are not rendered at that time point.
 
 The Neuron Selection control is a non-alternating `QTreeWidget`. Keep its
-visible help text concise (`Q/W: last/next`). Do not reintroduce Labels
+visible help text concise (`Q/W: last/next`) and put Shift navigation in its
+tooltip. Do not reintroduce Labels
 selection, opacity or colormap controls, `Show Labels context`, `Reset
 Display`, random-colormap controls, text ID entry, Labels-only identity
 discovery, or Ctrl-click selection semantics.
 
+Search is session-only and covers every global ROI identity. Comma-separated
+numeric tokens match zero-based digital IDs exactly; other tokens match the
+stripped biological name by case-insensitive substring. Typing only marks all
+matching tree rows. Enter cycles one match at a time through the ordinary
+check-and-activate path, while Check matches unions every result into
+`checked_ids` without changing `active_id`. Missing and outside-Z matches stay
+gray. Do not filter rows or add a search-specific napari layer.
+
 `Show selected box labels` is optional and off by default. When enabled:
 
 - render exactly one centered text label per currently rendered checked box;
-- use the stripped `biological` value from annotation-table column two,
-  falling back to the zero-based `neuron_id` when it is empty;
+- offer session-only Biological, Digital, and Digital + biological modes,
+  defaulting to Biological;
+- strip the column-two `biological` value for display, use `ID · biological`
+  for the combined mode, and fall back to the zero-based ID when empty;
 - never use annotation-table column three as box text;
 - do not duplicate text for the active box;
 - keep missing or outside-Z-range checked identities global but omit their
@@ -211,15 +225,17 @@ At minimum, test:
 - layer insertion, removal, rename, reorder, and selection;
 - Image + ROI loading, selection, rendering, annotation, and Z display;
 - initial checked/active state, row clicks, checkbox changes, Q/W wrap,
-  All/None, and active cancellation;
+  Shift+Q/W checked-only wrap, All/None, and active cancellation;
+- exact digital and case-insensitive biological search, multi-token matching,
+  tree highlighting, Enter cycling, Check matches, and search focus;
 - 2D four-edge rectangles, 3D 12-edge boxes, overlapping identity features,
   time changes, and missing observations;
 - deterministic selected-box colors that remain stable across time and do not
   depend on other layers;
 - selected and active Vectors edge counts and managed-layer cleanup;
-- one Points text anchor per visible checked box, biological-name fallback,
-  exact 2D/3D/4D coordinates, missing observations, text color selection and
-  cancellation, read-only behavior, and cleanup;
+- one Points text anchor per visible checked box, all three text modes,
+  biological-name fallback, exact 2D/3D/4D coordinates, missing observations,
+  text color selection and cancellation, read-only behavior, and cleanup;
 - Z-cut parsing, half-open membership, 3D/4D view-preserving slices, shifted
   translation, and per-Z threshold pixel counts;
 - All/Layer k synchronization across Image, Vectors, Points, Q/W navigation,
@@ -234,9 +250,9 @@ can be clicked.
 
 Automated tests are regression checks, not the primary product acceptance.
 For GUI changes, exercise the real napari Image + ROI workflow and verify the
-selection list, Q/W, All/None, 2D/3D switching, time navigation, box text
-fallback/color, layer visibility, Z threshold profile, additive blending, and
-dock scrolling.
+selection list, search/Enter/Check matches, Q/W and Shift+Q/W, All/None,
+2D/3D switching, time navigation, every box-text mode and fallback/color,
+layer visibility, Z threshold profile, additive blending, and dock scrolling.
 
 ## Validation commands
 

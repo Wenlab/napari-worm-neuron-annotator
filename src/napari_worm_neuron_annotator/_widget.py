@@ -9,7 +9,7 @@ import napari
 import numpy as np
 from napari.layers import Image, Points, Vectors
 from qtpy.QtCore import Qt
-from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont
+from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont, QPalette
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -82,6 +82,9 @@ MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
 MANAGED_ROI_ROLES = (*MANAGED_VECTOR_ROLES, ROLE_BOX_LABELS)
 ROLE_Z_IMAGE = "z_layer_image"
 MANAGED_Z_ROLES = (ROLE_Z_IMAGE,)
+LABEL_MODE_BIOLOGICAL = "biological"
+LABEL_MODE_DIGITAL = "digital"
+LABEL_MODE_DIGITAL_BIOLOGICAL = "digital_biological"
 Z_SOURCE_GEOMETRY_EVENTS = (
     "scale",
     "translate",
@@ -91,6 +94,34 @@ Z_SOURCE_GEOMETRY_EVENTS = (
     "axis_labels",
     "units",
 )
+
+
+def _match_neuron_ids(
+    available_ids: list[int],
+    biological_names: dict[int, str],
+    query: str,
+) -> list[int]:
+    """Return global IDs matching comma-separated digital/name tokens."""
+    tokens = [token.strip() for token in query.split(",") if token.strip()]
+    if not tokens:
+        return []
+
+    digital_ids: set[int] = set()
+    biological_tokens: list[str] = []
+    for token in tokens:
+        if token.isdecimal():
+            with suppress(ValueError):
+                digital_ids.add(int(token))
+        else:
+            biological_tokens.append(token.casefold())
+    matches: list[int] = []
+    for neuron_id in available_ids:
+        biological = biological_names.get(neuron_id, "").strip().casefold()
+        if neuron_id in digital_ids or any(
+            token in biological for token in biological_tokens
+        ):
+            matches.append(neuron_id)
+    return matches
 
 
 class NeuronAnnotatorWidget(QWidget):
@@ -105,6 +136,8 @@ class NeuronAnnotatorWidget(QWidget):
         self.checked_ids: set[int] = set()
         self._available_ids: list[int] = []
         self._selection_items: dict[int, QTreeWidgetItem] = {}
+        self._search_match_ids: list[int] = []
+        self._search_cursor = -1
         self._box_label_color = "#ffffff"
         self._ui_sync = False
         self._closed = False
@@ -333,7 +366,36 @@ class NeuronAnnotatorWidget(QWidget):
         group_layout = QVBoxLayout()
 
         self.navigation_help_label = QLabel("Q/W: last/next")
+        self.navigation_help_label.setToolTip(
+            "Shift+Q/W: previous/next checked neuron"
+        )
         group_layout.addWidget(self.navigation_help_label)
+
+        self.neuron_search_input = QLineEdit()
+        self.neuron_search_input.setPlaceholderText(
+            "Search digital ID or biological name"
+        )
+        self.neuron_search_input.setClearButtonEnabled(True)
+        self.neuron_search_input.setToolTip(
+            "Use commas for multiple IDs or biological-name fragments."
+        )
+        self.neuron_search_input.textChanged.connect(
+            self._on_search_text_changed
+        )
+        self.neuron_search_input.returnPressed.connect(
+            self._activate_next_search_match
+        )
+        group_layout.addWidget(self.neuron_search_input)
+
+        search_results_layout = QHBoxLayout()
+        self.search_matches_label = QLabel()
+        self.check_matches_btn = QPushButton("Check matches")
+        self.check_matches_btn.setEnabled(False)
+        self.check_matches_btn.clicked.connect(self.check_search_matches)
+        search_results_layout.addWidget(self.search_matches_label)
+        search_results_layout.addStretch(1)
+        search_results_layout.addWidget(self.check_matches_btn)
+        group_layout.addLayout(search_results_layout)
 
         controls_layout = QHBoxLayout()
         self.check_all_btn = QPushButton("All")
@@ -352,6 +414,22 @@ class NeuronAnnotatorWidget(QWidget):
             self._refresh_roi_layers
         )
         group_layout.addWidget(self.show_box_labels_checkbox)
+
+        box_label_mode_layout = QHBoxLayout()
+        box_label_mode_layout.addWidget(QLabel("Label text:"))
+        self.box_label_mode_combo = QComboBox()
+        self.box_label_mode_combo.addItem(
+            "Biological", LABEL_MODE_BIOLOGICAL
+        )
+        self.box_label_mode_combo.addItem("Digital", LABEL_MODE_DIGITAL)
+        self.box_label_mode_combo.addItem(
+            "Digital + biological", LABEL_MODE_DIGITAL_BIOLOGICAL
+        )
+        self.box_label_mode_combo.currentIndexChanged.connect(
+            self._refresh_roi_layers
+        )
+        box_label_mode_layout.addWidget(self.box_label_mode_combo, 1)
+        group_layout.addLayout(box_label_mode_layout)
 
         box_label_color_layout = QHBoxLayout()
         box_label_color_layout.addWidget(QLabel("Text color:"))
@@ -683,6 +761,8 @@ class NeuronAnnotatorWidget(QWidget):
         bindings = (
             ("Q", self._previous_key),
             ("W", self._next_key),
+            ("Shift-Q", self._previous_checked_key),
+            ("Shift-W", self._next_checked_key),
             ("G", self._previous_z_key),
             ("H", self._next_z_key),
             ("J", self._previous_time_key),
@@ -1277,7 +1357,7 @@ class NeuronAnnotatorWidget(QWidget):
         *,
         valid_at_time: bool | None = None,
         in_active_layer: bool | None = None,
-        biological_name: str = "",
+        biological_name: str | None = None,
     ) -> None:
         item = self._selection_items.get(display_id)
         if item is None:
@@ -1286,8 +1366,9 @@ class NeuronAnnotatorWidget(QWidget):
             valid_at_time = display_id in set(self._valid_time_ids())
         if in_active_layer is None:
             in_active_layer = self._id_in_active_z_layer(display_id)
-        if not biological_name:
+        if biological_name is None:
             biological_name = self._annotation_names().get(display_id, "")
+        biological_name = biological_name.strip()
 
         text = f"Neuron {display_id}"
         if biological_name:
@@ -1308,6 +1389,70 @@ class NeuronAnnotatorWidget(QWidget):
         else:
             color = QColor("#777777")
         item.setForeground(1, QBrush(color))
+        if display_id in self._search_match_ids:
+            background = self.selection_tree.palette().color(
+                QPalette.Highlight
+            )
+            background.setAlpha(70)
+            brush = QBrush(background)
+        else:
+            brush = QBrush()
+        item.setBackground(0, brush)
+        item.setBackground(1, brush)
+
+    def _on_search_text_changed(self, text: str) -> None:
+        del text
+        self._recompute_search_matches()
+
+    def _recompute_search_matches(self) -> None:
+        self._search_match_ids = _match_neuron_ids(
+            self._available_ids,
+            self._annotation_names(),
+            self.neuron_search_input.text(),
+        )
+        self._search_cursor = -1
+        self._update_search_controls()
+        self._refresh_selection_item_styles()
+
+    def _update_search_controls(self) -> None:
+        match_count = len(self._search_match_ids)
+        if not self.neuron_search_input.text().strip():
+            text = ""
+        elif self._search_cursor >= 0 and match_count:
+            text = f"{self._search_cursor + 1}/{match_count} matches"
+        else:
+            text = f"{match_count} matches"
+        self.search_matches_label.setText(text)
+        self.check_matches_btn.setEnabled(bool(self._search_match_ids))
+
+    def _reset_search(self) -> None:
+        self.neuron_search_input.blockSignals(True)
+        try:
+            self.neuron_search_input.clear()
+        finally:
+            self.neuron_search_input.blockSignals(False)
+        self._search_match_ids = []
+        self._search_cursor = -1
+        self._update_search_controls()
+
+    def _activate_next_search_match(self) -> None:
+        if not self._search_match_ids:
+            if self.neuron_search_input.text().strip():
+                self.update_status("No neuron matches the search", "orange")
+            return
+        self._search_cursor = (
+            self._search_cursor + 1
+        ) % len(self._search_match_ids)
+        neuron_id = self._search_match_ids[self._search_cursor]
+        self._update_search_controls()
+        self.activate_id(neuron_id, locate=True)
+
+    def check_search_matches(self) -> None:
+        """Add every search result to checked IDs without changing active."""
+        if not self._search_match_ids:
+            return
+        self.checked_ids.update(self._search_match_ids)
+        self._selection_changed(locate=False)
 
     def _display_color(self, display_id: int) -> np.ndarray:
         return np.asarray(neuron_color(display_id), dtype=float)
@@ -1405,6 +1550,42 @@ class NeuronAnnotatorWidget(QWidget):
             next_id = valid_ids[(index + step) % len(valid_ids)]
         self.activate_id(next_id, locate=True)
 
+    def navigate_checked(self, step: int) -> None:
+        """Activate the adjacent checked ID that is currently navigable."""
+        candidates = [
+            neuron_id
+            for neuron_id in self._valid_navigation_ids()
+            if neuron_id in self.checked_ids
+        ]
+        if not candidates:
+            self.update_status(
+                "No checked neuron is navigable in the current time/Z view",
+                "orange",
+            )
+            return
+
+        if self.active_id is None:
+            next_id = candidates[0] if step >= 0 else candidates[-1]
+        elif self.active_id in candidates:
+            index = candidates.index(self.active_id)
+            next_id = candidates[(index + step) % len(candidates)]
+        elif step >= 0:
+            next_id = next(
+                (item_id for item_id in candidates if item_id > self.active_id),
+                candidates[0],
+            )
+        else:
+            next_id = next(
+                (
+                    item_id
+                    for item_id in reversed(candidates)
+                    if item_id < self.active_id
+                ),
+                candidates[-1],
+            )
+        self.active_id = next_id
+        self._selection_changed(locate=True)
+
     def _previous_key(self, viewer=None) -> None:
         del viewer
         self.navigate(-1)
@@ -1412,6 +1593,14 @@ class NeuronAnnotatorWidget(QWidget):
     def _next_key(self, viewer=None) -> None:
         del viewer
         self.navigate(1)
+
+    def _previous_checked_key(self, viewer=None) -> None:
+        del viewer
+        self.navigate_checked(-1)
+
+    def _next_checked_key(self, viewer=None) -> None:
+        del viewer
+        self.navigate_checked(1)
 
     def _step_z(self, step: int) -> None:
         if self.current_image is None or self.viewer.dims.ndisplay != 2:
@@ -1508,6 +1697,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._set_roi_config_enabled(False)
         self.active_id = None
         self.checked_ids.clear()
+        self._reset_search()
         self._refresh_available_ids(select_first=True)
         self._ensure_roi_layers()
         self._refresh_roi_layers()
@@ -1523,6 +1713,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.active_id = None
         self.checked_ids.clear()
         self._available_ids = []
+        self._reset_search()
         self.roi_info_label.setText("No ROI loaded")
         self._rebuild_selection_items()
         self._update_info()
@@ -1799,8 +1990,10 @@ class NeuronAnnotatorWidget(QWidget):
                             np.asarray(label_point, dtype=float)
                         )
                         label_neuron_ids.append(neuron_id)
-                        biological = biological_names.get(neuron_id, "").strip()
-                        display_texts.append(biological or str(neuron_id))
+                        biological = biological_names.get(neuron_id, "")
+                        display_texts.append(
+                            self._box_label_text(neuron_id, biological)
+                        )
                 if neuron_id == self.active_id:
                     active_vectors.append(geometry)
                     active_ids.extend([neuron_id] * len(geometry))
@@ -1863,6 +2056,15 @@ class NeuronAnnotatorWidget(QWidget):
         }
         layer.editable = False
         layer.visible = self.show_box_labels_checkbox.isChecked()
+
+    def _box_label_text(self, neuron_id: int, biological: str) -> str:
+        biological = biological.strip()
+        mode = self.box_label_mode_combo.currentData()
+        if mode == LABEL_MODE_DIGITAL:
+            return str(neuron_id)
+        if mode == LABEL_MODE_DIGITAL_BIOLOGICAL and biological:
+            return f"{neuron_id} · {biological}"
+        return biological or str(neuron_id)
 
     def _locate_active_box(self) -> None:
         if (
@@ -1962,7 +2164,7 @@ class NeuronAnnotatorWidget(QWidget):
         finally:
             self.annotation_table.blockSignals(False)
             self._ui_sync = False
-        self._refresh_selection_item_styles()
+        self._recompute_search_matches()
         self._refresh_roi_layers()
 
     def _sync_annotation_ids(self) -> int:
@@ -2020,7 +2222,7 @@ class NeuronAnnotatorWidget(QWidget):
         if self._ui_sync:
             return
         if item.column() in (0, 1):
-            self._refresh_selection_item_styles()
+            self._recompute_search_matches()
             self._refresh_roi_layers()
 
     def save_annotation_to_excel(self) -> None:
