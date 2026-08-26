@@ -4,7 +4,7 @@ from app_model.types import KeyBinding
 from napari.layers import Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
-from qtpy.QtWidgets import QComboBox, QLineEdit, QTreeWidget
+from qtpy.QtWidgets import QComboBox, QLineEdit, QMessageBox, QTreeWidget
 
 from napari_worm_neuron_annotator._colors import neuron_color
 from napari_worm_neuron_annotator._widget import (
@@ -1028,3 +1028,186 @@ def test_shutdown_leaves_labels_untouched_and_removes_managed_roi_layers(
         and item.metadata.get(ROLE_KEY) == ROLE_BOX_LABELS
         for item in viewer.layers
     )
+
+
+def test_proof_transition_cancel_preserves_loaded_roi(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    assert not widget._proof_size_draft_dirty
+    widget.proofread_store.set_observation_deleted(0, 0)
+    assert widget.proofread_store.dirty
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
+        lambda *args, **kwargs: QMessageBox.Cancel,
+    )
+
+    assert widget.unload_roi() is False
+    assert widget.roi_dataset is not None
+    assert widget.proofread_store.resolve(0, 0) is None
+    assert widget.proofread_store.dirty
+
+
+def test_proof_transition_discard_allows_unload(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    widget.proofread_store.set_observation_deleted(0, 0)
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
+        lambda *args, **kwargs: QMessageBox.Discard,
+    )
+
+    assert widget.unload_roi() is True
+    assert widget.roi_dataset is None
+    assert widget.proofread_store is None
+
+
+def test_proof_transition_cancel_prevents_image_switch(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    image_a = viewer.add_image(
+        np.zeros((6, 24, 24), dtype=np.uint16), name="image-a"
+    )
+    image_b = viewer.add_image(
+        np.zeros((6, 24, 24), dtype=np.uint16), name="image-b"
+    )
+    widget = LabelManager(viewer)
+    widget.image_combo.setCurrentText(image_a.name)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    widget.proofread_store.set_observation_deleted(0, 0)
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
+        lambda *args, **kwargs: QMessageBox.Cancel,
+    )
+
+    widget.image_combo.setCurrentText(image_b.name)
+
+    assert widget.current_image is image_a
+    assert widget.image_combo.currentData() is image_a
+    assert widget.proofread_store.dirty
+
+
+def test_clean_proof_session_rebinds_when_switching_image(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    image_a = viewer.add_image(
+        np.zeros((6, 24, 24), dtype=np.uint16), name="image-a"
+    )
+    image_b = viewer.add_image(
+        np.zeros((7, 24, 24), dtype=np.uint16), name="image-b"
+    )
+    widget = LabelManager(viewer)
+    widget.image_combo.setCurrentText(image_a.name)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    original_store = widget.proofread_store
+
+    assert not original_store.dirty
+    assert not widget._proof_session_has_content()
+    assert not widget._image_matches_proof_session(image_b)
+
+    widget.image_combo.setCurrentText(image_b.name)
+
+    assert widget.current_image is image_b
+    assert widget.proofread_store is not original_store
+    assert widget.proofread_store.dataset is widget.roi_dataset
+    assert widget.proofread_store.image_signature == (
+        widget._proof_image_signature(image_b)
+    )
+    assert widget._proof_view_allowed()
+    assert widget.proofreading_toggle.isEnabled()
+
+
+def test_external_image_removal_retains_dirty_detached_session(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(
+        np.zeros((6, 24, 24), dtype=np.uint16), name="image"
+    )
+    viewer.add_image(
+        np.zeros((6, 24, 24), dtype=np.uint16), name="fallback"
+    )
+    widget = LabelManager(viewer)
+    widget.image_combo.setCurrentText(image.name)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    widget.proofread_store.set_observation_deleted(0, 0)
+
+    viewer.layers.remove(image)
+
+    assert widget.current_image is None
+    assert widget._proof_detached
+    assert widget.proofread_store.dirty
+    assert widget.proofread_store.resolve(0, 0) is None
+
+
+def test_shutdown_cancel_preserves_widget_session(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    widget.proofread_store.set_observation_deleted(0, 0)
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
+        lambda *args, **kwargs: QMessageBox.Cancel,
+    )
+
+    assert widget.shutdown() is False
+    assert not widget._closed
+    assert widget.current_image is not None
+    assert widget.proofread_store.dirty
+    assert _managed_layer(viewer, ROLE_SELECTED) in viewer.layers
+
+    assert widget.shutdown(force=True) is True
+
+
+def test_proof_transition_save_failure_keeps_session(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = LabelManager(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    store = widget.proofread_store
+    store.set_observation_deleted(0, 0)
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QMessageBox.warning",
+        lambda *args, **kwargs: QMessageBox.Save,
+    )
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QFileDialog.getSaveFileName",
+        lambda *args, **kwargs: (str(tmp_path / "proof.json"), ""),
+    )
+
+    def fail_save(path):
+        raise PermissionError(path)
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    assert widget.unload_roi() is False
+    assert widget.proofread_store is store
+    assert store.dirty

@@ -8,10 +8,12 @@ from pathlib import Path
 import napari
 import numpy as np
 from napari.layers import Image, Points, Vectors
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QEvent, QObject, Qt
 from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont, QPalette
 from qtpy.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -63,6 +65,13 @@ from ._z_layers import (
 from ._z_profile import ZThresholdProfileWidget
 
 try:
+    # The model is optional while older installations are being upgraded.  The
+    # widget remains usable for browse-only ROI navigation when it is absent.
+    from ._proofread import ProofreadStore
+except ImportError:  # pragma: no cover - exercised by compatibility installs
+    ProofreadStore = None  # type: ignore[assignment,misc]
+
+try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Alignment
 
@@ -78,8 +87,18 @@ ROLE_SELECTED = "roi_boxes_selected"
 LEGACY_ROLE_ALL = "roi_boxes_all"
 ROLE_ACTIVE = "roi_box_active"
 ROLE_BOX_LABELS = "roi_box_labels"
+ROLE_PROOF_TARGET = "roi_proof_target"
+# The proofreading target is a display-only crosshair.  Keep its geometry
+# independent from the ROI box dimensions so users can tune visual length and
+# line weight without changing annotation data.
+PROOF_TARGET_HALF_LENGTH = 8.0
+PROOF_TARGET_EDGE_WIDTH = 1.0
 MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
-MANAGED_ROI_ROLES = (*MANAGED_VECTOR_ROLES, ROLE_BOX_LABELS)
+MANAGED_ROI_ROLES = (
+    *MANAGED_VECTOR_ROLES,
+    ROLE_BOX_LABELS,
+    ROLE_PROOF_TARGET,
+)
 ROLE_Z_IMAGE = "z_layer_image"
 MANAGED_Z_ROLES = (ROLE_Z_IMAGE,)
 LABEL_MODE_BIOLOGICAL = "biological"
@@ -124,6 +143,42 @@ def _match_neuron_ids(
     return matches
 
 
+class _ProofreadingKeyFilter(QObject):
+    """Temporarily consume proofreading function keys on the canvas.
+
+    napari's layer keymap owns several ordinary keys.  Installing this small
+    filter only while proofreading is enabled keeps those bindings intact and
+    lets Qt editors receive keys normally.
+    """
+
+    _KEY_ACTIONS = {
+        Qt.Key_F7: "_proof_delete_current",
+        Qt.Key_F8: "_proof_place_cursor",
+        Qt.Key_F9: "_proof_add_neuron",
+        Qt.Key_F12: "_proof_cancel_or_exit",
+    }
+
+    def __init__(self, widget: NeuronAnnotatorWidget) -> None:
+        super().__init__(widget)
+        self.widget = widget
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt API
+        del watched
+        if event.type() != QEvent.KeyPress:
+            return False
+        key = int(event.key())
+        action = self._KEY_ACTIONS.get(key)
+        if action is None or event.modifiers() != Qt.NoModifier:
+            return False
+        if self.widget._proof_key_focus_blocked():
+            return False
+        if not self.widget.proofreading_enabled:
+            return False
+        getattr(self.widget, action)()
+        event.accept()
+        return True
+
+
 class NeuronAnnotatorWidget(QWidget):
     """Navigate read-only neuron boxes on an Image."""
 
@@ -157,8 +212,25 @@ class NeuronAnnotatorWidget(QWidget):
         self._orientation_baseline_ndim: int | None = None
         self._orientation_applying = False
         self._orientation_ui_sync = False
+        self._proof_detached = False
+        # Proofreading state is deliberately independent from Browse
+        # selection state.  The store is created only after ROI load.
+        self.proofread_store = None
+        self.proofreading_enabled = False
+        self._proof_key_filter: _ProofreadingKeyFilter | None = None
+        self._proof_canvas_native = None
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target: tuple[int, int] | None = None
+        self._proof_target_zyx: tuple[float, float, float] | None = None
+        self._proof_target_volume_index: int | None = None
+        self._proof_target_context: tuple[int, int, int] | None = None
+        self._proof_mouse_callback_installed = False
 
         self._setup_ui()
+        # Initial spin-box values are defaults, not an unapplied user draft.
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self.proofreading_toggle.setEnabled(False)
         self._connect_viewer_events()
         self._bind_keys()
         self._refresh_image_layers()
@@ -189,6 +261,7 @@ class NeuronAnnotatorWidget(QWidget):
         layout.addWidget(self.orientation_group)
         layout.addWidget(self._build_z_layer_group())
         layout.addWidget(self._build_roi_group())
+        layout.addWidget(self._build_proofreading_group())
         layout.addWidget(self._build_selection_group())
         layout.addWidget(self._build_annotation_group())
         layout.addWidget(self._build_status_group())
@@ -360,6 +433,941 @@ class NeuronAnnotatorWidget(QWidget):
         group_layout.addWidget(self.roi_info_label)
         group.setLayout(group_layout)
         return group
+
+    def _build_proofreading_group(self) -> QGroupBox:
+        """Build the opt-in 2D proofreading controls.
+
+        The controls are present even before an ROI is loaded so the state is
+        discoverable, but remain disabled until a compatible 2D/All view and a
+        ProofreadStore are available.
+        """
+        group = QGroupBox("Proofreading")
+        layout = QVBoxLayout()
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Proofreading:"))
+        self.proofreading_toggle = QCheckBox("Off / On")
+        self.proofreading_toggle.setChecked(False)
+        self.proofreading_toggle.setToolTip(
+            "Select the source Image layer, then enable 2D proofreading."
+        )
+        self.proofreading_toggle.toggled.connect(self._set_proofreading_enabled)
+        mode_row.addWidget(self.proofreading_toggle)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        sizes = QGridLayout()
+        self.proof_width_spin = QDoubleSpinBox()
+        self.proof_height_spin = QDoubleSpinBox()
+        self.proof_depth_spin = QDoubleSpinBox()
+        for spin in (
+            self.proof_width_spin,
+            self.proof_height_spin,
+            self.proof_depth_spin,
+        ):
+            spin.setRange(0.001, 1_000_000)
+            spin.setDecimals(3)
+            spin.setSingleStep(1.0)
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(self._on_proof_size_draft_changed)
+        self.proof_width_spin.setValue(7)
+        self.proof_height_spin.setValue(7)
+        self.proof_depth_spin.setValue(3)
+        sizes.addWidget(QLabel("width:"), 0, 0)
+        sizes.addWidget(self.proof_width_spin, 0, 1)
+        sizes.addWidget(QLabel("height:"), 0, 2)
+        sizes.addWidget(self.proof_height_spin, 0, 3)
+        sizes.addWidget(QLabel("depth:"), 0, 4)
+        sizes.addWidget(self.proof_depth_spin, 0, 5)
+        sizes.setColumnStretch(1, 1)
+        sizes.setColumnStretch(3, 1)
+        sizes.setColumnStretch(5, 1)
+        layout.addLayout(sizes)
+
+        self.proof_current_box_label = QLabel("No active neuron")
+        self.proof_current_box_label.setWordWrap(True)
+        self.proof_current_box_label.setObjectName("proofCurrentBoxLabel")
+        layout.addWidget(self.proof_current_box_label)
+
+        self.proof_apply_size_btn = QPushButton("Apply size")
+        self.proof_apply_size_btn.clicked.connect(self._proof_apply_size)
+        layout.addWidget(self.proof_apply_size_btn)
+
+        io_row = QHBoxLayout()
+        self.proof_save_btn = QPushButton("Save proof edits")
+        self.proof_load_btn = QPushButton("Load proof edits")
+        self.proof_discard_btn = QPushButton("Discard edits")
+        self.proof_save_btn.clicked.connect(self.save_proof_edits)
+        self.proof_load_btn.clicked.connect(self.load_proof_edits)
+        self.proof_discard_btn.clicked.connect(self.discard_proof_edits)
+        io_row.addWidget(self.proof_save_btn)
+        io_row.addWidget(self.proof_load_btn)
+        io_row.addWidget(self.proof_discard_btn)
+        layout.addLayout(io_row)
+
+        export_row = QHBoxLayout()
+        self.proof_export_btn = QPushButton("Export corrected NPY")
+        self.proof_delete_all_btn = QPushButton("Delete active neuron (all volumes)")
+        self.proof_retire_btn = QPushButton("Retire added neuron")
+        self.proof_export_btn.clicked.connect(self.export_corrected_npy)
+        self.proof_delete_all_btn.clicked.connect(self._proof_delete_all)
+        self.proof_retire_btn.clicked.connect(self._proof_retire_added_neuron)
+        export_row.addWidget(self.proof_export_btn)
+        export_row.addWidget(self.proof_delete_all_btn)
+        layout.addLayout(export_row)
+        layout.addWidget(self.proof_retire_btn)
+
+        self.proof_help_label = QLabel(
+            "Click to lock target · F7 delete · F8 place · F9 add · F12 exit"
+        )
+        self.proof_help_label.setToolTip(
+            "Select the source Image layer. In 2D/All, click to lock the cyan crosshair, then use F8 or F9."
+        )
+        layout.addWidget(self.proof_help_label)
+        group.setLayout(layout)
+        self._set_proofreading_controls_enabled(False)
+        # Initial spin-box values are defaults, not an unapplied user draft.
+        self._proof_size_draft_dirty = False
+        return group
+
+    # ------------------------------------------------------------------
+    # Proofreading mode, cursor operations, and persistence adapters
+    # ------------------------------------------------------------------
+    def _proof_view_allowed(self) -> bool:
+        """Return whether the current viewer state supports proofreading."""
+        return bool(
+            self.roi_dataset is not None
+            and self.current_image is not None
+            and self.current_image in self.viewer.layers
+            and not self._proof_detached
+            and self.viewer.dims.ndisplay == 2
+            and self._view_axes_supported()
+            and self._active_z_range() is None
+            and self._current_volume_index() is not None
+            and self._image_matches_proof_session(self.current_image)
+            and ProofreadStore is not None
+        )
+
+    def _proof_interaction_allowed(self) -> bool:
+        """Return whether a proof edit may consume the current canvas state."""
+        return bool(
+            self._proof_view_allowed()
+            and self.viewer.layers.selection.active is self.current_image
+        )
+
+    def _set_proofreading_controls_enabled(self, enabled: bool) -> None:
+        for control in (
+            self.proof_apply_size_btn,
+            self.proof_delete_all_btn,
+            self.proof_retire_btn,
+            self.proof_width_spin,
+            self.proof_height_spin,
+            self.proof_depth_spin,
+        ):
+            control.setEnabled(bool(enabled))
+        session_available = self.proofread_store is not None
+        for control in (
+            self.proof_save_btn,
+            self.proof_load_btn,
+            self.proof_discard_btn,
+            self.proof_export_btn,
+        ):
+            control.setEnabled(session_available)
+
+    def _set_proofreading_enabled(self, enabled: bool) -> None:
+        requested = bool(enabled)
+        if requested and self.viewer.layers.selection.active is not self.current_image:
+            self.proofreading_toggle.blockSignals(True)
+            self.proofreading_toggle.setChecked(False)
+            self.proofreading_toggle.blockSignals(False)
+            self.proofreading_enabled = False
+            self._remove_proof_key_filter()
+            self._remove_proof_mouse_callback()
+            self._clear_proof_target()
+            self._set_proofreading_controls_enabled(False)
+            self.update_status("Select the source Image layer first", "orange")
+            return
+        if requested and not self._proof_view_allowed():
+            self.proofreading_toggle.blockSignals(True)
+            self.proofreading_toggle.setChecked(False)
+            self.proofreading_toggle.blockSignals(False)
+            self.proofreading_enabled = False
+            self._remove_proof_key_filter()
+            self._remove_proof_mouse_callback()
+            self._clear_proof_target()
+            self._set_proofreading_controls_enabled(False)
+            self.update_status(
+                "Proofreading requires a loaded ROI, 2D view, and Z view All",
+                "orange",
+            )
+            return
+        self.proofreading_enabled = requested
+        if requested:
+            if not self._install_proof_key_filter():
+                self.proofreading_enabled = False
+                self.proofreading_toggle.blockSignals(True)
+                self.proofreading_toggle.setChecked(False)
+                self.proofreading_toggle.blockSignals(False)
+                self._set_proofreading_controls_enabled(False)
+                return
+            self._install_proof_mouse_callback()
+            self._ensure_proof_target_layer()
+        else:
+            self._remove_proof_key_filter()
+            self._remove_proof_mouse_callback()
+            self._clear_proof_target()
+        self._set_proofreading_controls_enabled(
+            self.proofreading_enabled and self._proof_view_allowed()
+        )
+        self._update_proof_size_controls()
+        self._update_info()
+
+    def _install_proof_key_filter(self) -> bool:
+        if self._proof_key_filter is not None:
+            return True
+        canvas = self._get_proof_canvas_native()
+        if canvas is None:
+            self.update_status("Canvas hotkeys are unavailable", "orange")
+            return False
+        if not hasattr(canvas, "installEventFilter"):
+            self.update_status("Canvas hotkeys are unavailable", "orange")
+            return False
+        self._proof_canvas_native = canvas
+        self._proof_key_filter = _ProofreadingKeyFilter(self)
+        canvas.installEventFilter(self._proof_key_filter)
+        return True
+
+    def _get_proof_canvas_native(self):
+        """Return the canvas widget without using napari's deprecated accessor.
+
+        napari 0.8 exposes the Qt viewer through ``Window._qt_viewer``.  It is
+        technically private, but is the only available canvas-native bridge in
+        the supported release range (``napari>=0.8,<0.9``).  Keep this access
+        isolated so a future napari migration has one small compatibility
+        point.  Do not fall back to ``Window.qt_viewer``: merely reading that
+        public property emits the deprecation warning on napari 0.8.
+        """
+        try:
+            window = self.viewer.window
+            qt_viewer = getattr(window, "_qt_viewer", None)
+            canvas = getattr(qt_viewer, "canvas", None)
+            return getattr(canvas, "native", None)
+        except (AttributeError, RuntimeError, TypeError):
+            return None
+
+    def _remove_proof_key_filter(self) -> None:
+        filt = self._proof_key_filter
+        canvas = self._proof_canvas_native
+        if filt is not None and canvas is not None:
+            with suppress(RuntimeError, AttributeError):
+                canvas.removeEventFilter(filt)
+        if filt is not None:
+            filt.deleteLater()
+        self._proof_key_filter = None
+        self._proof_canvas_native = None
+
+    def _install_proof_mouse_callback(self) -> None:
+        """Install the viewer-level click callback exactly once."""
+        callback = self._on_proof_mouse_drag
+        if callback not in self.viewer.mouse_drag_callbacks:
+            self.viewer.mouse_drag_callbacks.append(callback)
+        self._proof_mouse_callback_installed = True
+
+    def _remove_proof_mouse_callback(self) -> None:
+        """Remove the proofreading click callback without touching layers."""
+        callback = self._on_proof_mouse_drag
+        while callback in self.viewer.mouse_drag_callbacks:
+            self.viewer.mouse_drag_callbacks.remove(callback)
+        self._proof_mouse_callback_installed = False
+
+    def _on_proof_mouse_drag(self, viewer, event):
+        """Lock one target from an unmodified left-button short click."""
+        del viewer
+        if (
+            not self.proofreading_enabled
+            or not self._proof_view_allowed()
+            or self.viewer.layers.selection.active is not self.current_image
+            or self.viewer.grid.enabled
+            or event.type != "mouse_press"
+            or event.button != 1
+            or event.modifiers
+        ):
+            return
+        try:
+            press_pos = np.asarray(event.pos, dtype=float)
+        except (TypeError, ValueError):
+            return
+        if press_pos.size != 2 or not np.all(np.isfinite(press_pos)):
+            return
+
+        valid_click = True
+        yield
+        while event.type == "mouse_move":
+            try:
+                move_pos = np.asarray(event.pos, dtype=float)
+            except (TypeError, ValueError):
+                move_pos = np.empty(0, dtype=float)
+            if (
+                event.modifiers
+                or move_pos.size != 2
+                or not np.all(np.isfinite(move_pos))
+                or np.linalg.norm(move_pos - press_pos) > 3.0
+            ):
+                valid_click = False
+            yield
+        if (
+            event.type != "mouse_release"
+            or event.button != 1
+            or not valid_click
+            or event.modifiers
+        ):
+            return
+        try:
+            release_pos = np.asarray(event.pos, dtype=float)
+        except (TypeError, ValueError):
+            return
+        if (
+            release_pos.size != 2
+            or not np.all(np.isfinite(release_pos))
+            or np.linalg.norm(release_pos - press_pos) > 3.0
+        ):
+            return
+        self._lock_proof_target(event.position)
+
+    def _proof_world_to_zyx(
+        self, world: tuple[float, ...] | np.ndarray
+    ) -> tuple[float, float, float] | None:
+        """Convert a canvas world coordinate to the current Image z/y/x."""
+        if self.current_image is None:
+            return None
+        try:
+            data = np.asarray(self.current_image.world_to_data(world), dtype=float)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+        if data.size < 3:
+            return None
+        zyx = np.asarray(data[-3:], dtype=float)
+        zyx[0] = float(self._viewer_z())
+        shape = np.asarray(self._shape_zyx(), dtype=float)
+        if not np.all(np.isfinite(zyx)) or np.any(zyx < 0) or np.any(zyx >= shape):
+            return None
+        return tuple(float(value) for value in zyx)
+
+    def _lock_proof_target(self, world) -> None:
+        """Lock and render a proofreading target for this volume and Z slice."""
+        if not self.proofreading_enabled or not self._proof_interaction_allowed():
+            return
+        center = self._proof_world_to_zyx(world)
+        volume_index = self._current_volume_index()
+        if center is None or volume_index is None:
+            return
+        viewer_t = self._viewer_time()
+        viewer_z = self._viewer_z()
+        if self._ensure_proof_target_layer() is None:
+            return
+        self._proof_target_zyx = center
+        self._proof_target_volume_index = volume_index
+        self._proof_target_context = (volume_index, viewer_t, viewer_z)
+        self._set_proof_target_layer_data(center)
+        self.update_status("Proofreading target locked", "green")
+
+    def _clear_proof_target(self) -> None:
+        """Clear the session-only target and its crosshair geometry."""
+        self._proof_target_zyx = None
+        self._proof_target_volume_index = None
+        self._proof_target_context = None
+        layer = self._managed_proof_target_layer()
+        if layer is not None:
+            layer.data = np.empty((0, 2, layer.ndim), dtype=float)
+            # Assigning empty Vectors data resets napari's editable flag.
+            layer.editable = False
+            layer.visible = False
+
+    def _set_proof_target_layer_data(
+        self, center_zyx: tuple[float, float, float]
+    ) -> None:
+        layer = self._managed_proof_target_layer()
+        if layer is None or self.current_image is None:
+            return
+        # Vectors use ``[start, delta]`` records.  Two orthogonal segments
+        # make a true crosshair while leaving visual length and edge width
+        # independently controllable (unlike a Points ``symbol='cross'``).
+        if self.current_image.ndim == 4:
+            center = np.asarray(
+                (float(self._viewer_time()), *center_zyx), dtype=float
+            )
+            y_axis, x_axis = 2, 3
+        else:
+            center = np.asarray(center_zyx, dtype=float)
+            y_axis, x_axis = 1, 2
+        half = float(PROOF_TARGET_HALF_LENGTH)
+        segments = np.zeros((2, 2, self.current_image.ndim), dtype=float)
+        horizontal_start = center.copy()
+        horizontal_start[x_axis] -= half
+        segments[0, 0] = horizontal_start
+        segments[0, 1, x_axis] = 2.0 * half
+        vertical_start = center.copy()
+        vertical_start[y_axis] -= half
+        segments[1, 0] = vertical_start
+        segments[1, 1, y_axis] = 2.0 * half
+        layer.data = segments
+        layer.editable = False
+        layer.visible = True
+
+    def _proof_locked_target(self) -> tuple[float, float, float] | None:
+        """Return the target only while it belongs to the current volume/Z."""
+        volume_index = self._current_volume_index()
+        context = self._proof_target_context
+        if (
+            self._proof_target_zyx is None
+            or volume_index is None
+            or context != (volume_index, self._viewer_time(), self._viewer_z())
+        ):
+            self._clear_proof_target()
+            return None
+        return self._proof_target_zyx
+
+    def _proof_key_focus_blocked(self) -> bool:
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return False
+        blocked_types = (
+            QLineEdit,
+            QTextEdit,
+            QTreeWidget,
+            QTableWidget,
+            QAbstractSpinBox,
+        )
+        if isinstance(focus, blocked_types):
+            return True
+        # Qt item editors are transient children of the table/tree.
+        parent = focus.parentWidget()
+        while parent is not None:
+            if isinstance(parent, blocked_types):
+                return True
+            parent = parent.parentWidget()
+        return False
+
+    def _current_volume_index(self) -> int | None:
+        """Map the current Image time to the raw NPY first-axis index."""
+        if self.roi_dataset is None or self.current_image is None:
+            return None
+        viewer_t = self._viewer_time()
+        index = (
+            self.volume_start_spin.value()
+            + viewer_t * self.volume_stride_spin.value()
+        )
+        raw_t = getattr(self.roi_dataset, "time_count", None)
+        if raw_t is None:
+            raw_t = getattr(self.roi_dataset, "raw_T", 0)
+        return int(index) if 0 <= int(index) < int(raw_t) else None
+
+    def _proof_resolve(self, volume_index: int, neuron_id: int):
+        store = self.proofread_store
+        if store is None:
+            return None
+        return store.resolve(volume_index, neuron_id)
+
+    def _proof_draft_size(self) -> tuple[float, float, float]:
+        """Return the visible width/height/depth draft in z/y/x order."""
+        return (
+            self.proof_depth_spin.value(),
+            self.proof_height_spin.value(),
+            self.proof_width_spin.value(),
+        )
+
+    def _proof_placement_size(
+        self, neuron_id: int, volume_index: int | None = None
+    ) -> tuple[float, float, float]:
+        store = self.proofread_store
+        if store is None:
+            return (3.0, 7.0, 7.0)
+        if volume_index is None:
+            volume_index = self._current_volume_index()
+        return tuple(
+            float(value)
+            for value in store.size_for_placement(neuron_id, volume_index)
+        )
+
+    def _update_proof_current_box_status(self) -> None:
+        """Show the active box center, Image time, and edit marker.
+
+        The proofreading store addresses observations by raw ``volume_index``;
+        the label intentionally reports the user-facing Image ``t`` so it
+        matches the napari view.  ``NeuronBox.center_zyx`` is reordered to
+        user-facing ``x, y, z`` here; the internal geometry remains z/y/x.
+        """
+        label = getattr(self, "proof_current_box_label", None)
+        if label is None:
+            return
+
+        active_id = self.active_id
+        volume_index = self._current_volume_index()
+        viewer_t = self._viewer_time()
+        if active_id is None:
+            label.setText("No active neuron")
+            return
+        if volume_index is None:
+            label.setText(f"Neuron {active_id}: no box, t={viewer_t}")
+            return
+
+        store = self.proofread_store
+        try:
+            if store is not None:
+                box = store.resolve(volume_index, active_id)
+                modified = (volume_index, active_id) in store.modified_observations
+            elif self.roi_dataset is not None:
+                box = self.roi_dataset.get_box(self._viewer_time(), active_id)
+                modified = False
+            else:
+                box = None
+                modified = False
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            # A transient Image/ROI transition can invalidate the target
+            # between the volume lookup and store resolution.  Keep the UI
+            # informative instead of allowing a Qt callback to fail.
+            box = None
+            modified = False
+
+        if box is None:
+            marker = " (modified)" if modified else ""
+            label.setText(f"Neuron {active_id}{marker}: no box, t={viewer_t}")
+            return
+
+        z, y, x = (float(value) for value in box.center_zyx)
+        marker = " (modified)" if modified else ""
+        text = (
+            f"Neuron {active_id}{marker}: "
+            f"center (x={x:.2f}, y={y:.2f}, z={z:.2f}), t={viewer_t}"
+        )
+        label.setText(text)
+
+    def _on_proof_size_draft_changed(self, value: float) -> None:
+        del value
+        volume_index = self._current_volume_index()
+        if self.active_id is None or volume_index is None:
+            return
+        self._proof_size_draft_dirty = True
+        self._proof_size_draft_target = (volume_index, self.active_id)
+        if hasattr(self, "info_text"):
+            self._update_info()
+
+    def _update_proof_size_controls(self) -> None:
+        self._update_proof_current_box_status()
+        # A target transition must explicitly Apply/Discard/Cancel this draft.
+        # Never let a routine refresh silently overwrite it.
+        if self._proof_size_draft_dirty:
+            return
+        volume_index = self._current_volume_index()
+        if (
+            self.active_id is None
+            or self.proofread_store is None
+            or volume_index is None
+        ):
+            size = (3.0, 7.0, 7.0)
+        else:
+            box = self._proof_resolve(volume_index, self.active_id)
+            size = (
+                box.size_zyx
+                if box is not None
+                else self._proof_placement_size(self.active_id, volume_index)
+            )
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self.proof_depth_spin.blockSignals(True)
+        self.proof_height_spin.blockSignals(True)
+        self.proof_width_spin.blockSignals(True)
+        try:
+            self.proof_depth_spin.setValue(max(0.001, float(size[0])))
+            self.proof_height_spin.setValue(max(0.001, float(size[1])))
+            self.proof_width_spin.setValue(max(0.001, float(size[2])))
+        finally:
+            self.proof_depth_spin.blockSignals(False)
+            self.proof_height_spin.blockSignals(False)
+            self.proof_width_spin.blockSignals(False)
+
+    def _proof_apply_size(self) -> None:
+        draft_target = self._proof_size_draft_target
+        target_id = (
+            draft_target[1]
+            if self._proof_size_draft_dirty and draft_target is not None
+            else self.active_id
+        )
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or target_id is None
+        ):
+            return
+        store = self.proofread_store
+        if store is None:
+            return
+        size = self._proof_draft_size()
+        if any(not np.isfinite(v) or v <= 0 for v in size):
+            self.update_status("Box dimensions must be positive", "orange")
+            return
+        try:
+            store.apply_size(target_id, size)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not apply size: {error}", "red")
+            return
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self._refresh_available_ids(select_first=False)
+        self._refresh_roi_layers()
+        self._update_proof_current_box_status()
+        self.update_status(f"Applied size to neuron {target_id}", "green")
+
+    def _confirm_proof_size_draft(self, action: str) -> bool:
+        """Resolve an unapplied size before changing its neuron/volume target."""
+        if not self._proof_size_draft_dirty:
+            return True
+        target = self._proof_size_draft_target
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("Unapplied box size")
+        dialog.setText(f"Apply the current size draft before {action}?")
+        apply_button = dialog.addButton("Apply", QMessageBox.AcceptRole)
+        discard_button = dialog.addButton(
+            "Discard draft", QMessageBox.DestructiveRole
+        )
+        cancel_button = dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(cancel_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is cancel_button or clicked is None:
+            return False
+        if clicked is apply_button:
+            if self.proofread_store is None or target is None:
+                self.update_status("The size draft has no valid target", "red")
+                return False
+            try:
+                self.proofread_store.apply_size(target[1], self._proof_draft_size())
+            except (TypeError, ValueError, RuntimeError) as error:
+                self.update_status(f"Could not apply size: {error}", "red")
+                return False
+        elif clicked is not discard_button:
+            return False
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        return True
+
+    def _proof_delete_current(self) -> None:
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or self.active_id is None
+        ):
+            return
+        volume_index = self._current_volume_index()
+        if volume_index is None:
+            return
+        box = self._proof_resolve(volume_index, self.active_id)
+        if box is None:
+            self.update_status("Current observation is already missing", "orange")
+            return
+        try:
+            self.proofread_store.set_observation_deleted(volume_index, self.active_id)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not delete observation: {error}", "red")
+            return
+        self._refresh_after_proof_edit()
+        self.update_status("Deleted current observation", "green")
+
+    def _proof_place_cursor(self) -> None:
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or self.active_id is None
+        ):
+            return
+        volume_index = self._current_volume_index()
+        center = self._proof_locked_target()
+        if volume_index is None or center is None:
+            self.update_status(
+                "Click the Image to lock a proofreading target first",
+                "orange",
+            )
+            return
+        if self._proof_resolve(volume_index, self.active_id) is not None:
+            self.update_status("Current observation exists; F8 did nothing", "orange")
+            return
+        size = self._proof_placement_size(self.active_id, volume_index)
+        try:
+            self.proofread_store.set_observation_present(
+                volume_index,
+                self.active_id,
+                center_zyx=center,
+                size_zyx=size,
+            )
+        except TypeError:
+            # Compatibility with a positional box-oriented implementation.
+            from ._roi import NeuronBox
+
+            box = NeuronBox(self.active_id, volume_index, center, size)
+            self.proofread_store.set_observation_present(volume_index, self.active_id, box)
+        except (AttributeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not place observation: {error}", "red")
+            return
+        self._clear_proof_target()
+        self._refresh_after_proof_edit()
+        self.update_status("Placed center at locked target", "green")
+
+    def _proof_add_neuron(self) -> None:
+        if not self.proofreading_enabled or not self._proof_interaction_allowed():
+            return
+        if not self._confirm_proof_size_draft("adding a neuron"):
+            return
+        volume_index = self._current_volume_index()
+        center = self._proof_locked_target()
+        if volume_index is None or center is None or self.proofread_store is None:
+            self.update_status(
+                "Click the Image to lock a proofreading target first",
+                "orange",
+            )
+            return
+        size = (3.0, 7.0, 7.0)
+        try:
+            neuron_id = self.proofread_store.add_neuron(
+                volume_index, center, size_zyx=size
+            )
+        except TypeError:
+            try:
+                neuron_id = self.proofread_store.add_neuron(volume_index, center)
+            except (AttributeError, ValueError, RuntimeError) as error:
+                self.update_status(f"Could not add neuron: {error}", "red")
+                return
+        except (AttributeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not add neuron: {error}", "red")
+            return
+        self._clear_proof_target()
+        self._available_ids = list(self.proofread_store.neuron_ids)
+        self.active_id = int(neuron_id)
+        self.checked_ids.add(self.active_id)
+        self._refresh_available_ids(select_first=False)
+        self._selection_changed(locate=False)
+        self._refresh_after_proof_edit()
+        self.update_status(f"Added neuron {self.active_id}", "green")
+
+    def _proof_cancel_or_exit(self) -> None:
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self.proofreading_toggle.blockSignals(True)
+        self.proofreading_toggle.setChecked(False)
+        self.proofreading_toggle.blockSignals(False)
+        self._set_proofreading_enabled(False)
+        self.update_status("Proofreading off", "green")
+
+    def _set_proofreading_off_preserve_draft(self) -> None:
+        """Disable proofreading without discarding an existing size draft."""
+        draft_dirty = self._proof_size_draft_dirty
+        draft_target = self._proof_size_draft_target
+        self.proofreading_toggle.blockSignals(True)
+        self.proofreading_toggle.setChecked(False)
+        self.proofreading_toggle.blockSignals(False)
+        self._set_proofreading_enabled(False)
+        self._proof_size_draft_dirty = draft_dirty
+        self._proof_size_draft_target = draft_target
+
+    def _proof_delete_all(self) -> None:
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or self.active_id is None
+            or self.proofread_store is None
+        ):
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete all observations",
+            f"Delete neuron {self.active_id} from all volumes?\nThe ID will be retained.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        volume_index = self._current_volume_index()
+        placement_size = self._proof_placement_size(
+            self.active_id, volume_index
+        )
+        try:
+            self.proofread_store.delete_all_observations(self.active_id)
+            self.proofread_store.placement_size[self.active_id] = placement_size
+        except (AttributeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not delete all observations: {error}", "red")
+            return
+        self._refresh_after_proof_edit()
+        self.update_status(f"Deleted neuron {self.active_id} in all volumes", "green")
+
+    def _proof_retire_added_neuron(self) -> None:
+        store = self.proofread_store
+        neuron_id = self.active_id
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or store is None
+            or neuron_id is None
+            or neuron_id < store.raw_N
+            or neuron_id in store.retired_ids
+        ):
+            return
+        if not self._confirm_proof_size_draft("retiring an added neuron"):
+            return
+        answer = QMessageBox.question(
+            self,
+            "Retire added neuron",
+            f"Retire added neuron {neuron_id}?\n"
+            "Its numeric ID will remain reserved and will not be reused.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            store.retire_added_neuron(neuron_id)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not retire neuron: {error}", "red")
+            return
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self.update_status(f"Retired added neuron {neuron_id}", "green")
+
+    def _refresh_after_proof_edit(self) -> None:
+        self._refresh_selection_item_styles()
+        self._refresh_roi_layers()
+        self._update_proof_size_controls()
+        self._update_info()
+
+    def save_proof_edits(self) -> None:
+        store = self.proofread_store
+        if store is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save proof edits", self._proof_default_path(),
+            "Proof sidecar (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            store.save(path)
+        except (OSError, PermissionError, ValueError, RuntimeError) as error:
+            self.update_status(f"Proof save failed: {error}", "red")
+            return
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self.update_status(f"Saved proof edits: {Path(path).name}", "green")
+
+    def _save_proof_edits_for_transition(self) -> bool:
+        """Save pending proof edits and report whether a transition may run."""
+        store = self.proofread_store
+        if store is None or not store.dirty:
+            return True
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save proof edits",
+            self._proof_default_path(),
+            "Proof sidecar (*.json);;All files (*)",
+        )
+        if not path:
+            return False
+        try:
+            store.save(path)
+        except (OSError, PermissionError, ValueError, RuntimeError) as error:
+            self.update_status(f"Proof save failed: {error}", "red")
+            return False
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self.update_status(f"Saved proof edits: {Path(path).name}", "green")
+        return True
+
+    def _confirm_proof_transition(self, action: str) -> bool:
+        """Resolve draft/dirty state before discarding the current session."""
+        store = self.proofread_store
+        if not self._confirm_proof_size_draft(action):
+            return False
+
+        if store is None or not store.dirty:
+            return True
+        result = QMessageBox.warning(
+            self,
+            "Unsaved proofreading edits",
+            f"Save proofreading edits before {action}?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if result == QMessageBox.Cancel:
+            return False
+        if result == QMessageBox.Save:
+            return self._save_proof_edits_for_transition()
+        if result == QMessageBox.Discard:
+            store.discard()
+            self._refresh_available_ids(select_first=False)
+            return True
+        return False
+
+    def load_proof_edits(self) -> None:
+        store_type = ProofreadStore
+        if store_type is None or self.roi_dataset is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load proof edits", self._proof_default_path(),
+            "Proof sidecar (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            loaded = store_type(
+                self.roi_dataset,
+                image_signature=self._proof_image_signature(
+                    self.current_image
+                ),
+            )
+            loaded.load(path)
+        except (OSError, PermissionError, ValueError, RuntimeError, TypeError) as error:
+            self.update_status(f"Proof load failed: {error}", "red")
+            return
+        if not self._confirm_proof_transition("loading another proof sidecar"):
+            return
+        self.proofread_store = loaded
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self.update_status(f"Loaded proof edits: {Path(path).name}", "green")
+
+    def discard_proof_edits(self) -> None:
+        store = self.proofread_store
+        if store is None:
+            return
+        try:
+            store.discard()
+        except (AttributeError, RuntimeError, ValueError) as error:
+            self.update_status(f"Could not discard proof edits: {error}", "red")
+            return
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self.update_status("Discarded unsaved proof edits", "green")
+
+    def export_corrected_npy(self) -> None:
+        store = self.proofread_store
+        if store is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export corrected NPY", "", "NumPy arrays (*.npy);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            store.export_corrected_npy(path)
+        except (OSError, PermissionError, ValueError, RuntimeError) as error:
+            self.update_status(f"NPY export failed: {error}", "red")
+            return
+        self.update_status(f"Exported corrected NPY: {Path(path).name}", "green")
+
+    def _proof_default_path(self) -> str:
+        if self.roi_dataset is not None and getattr(self.roi_dataset, "path", None):
+            return str(Path(self.roi_dataset.path).with_suffix(".proofread.json"))
+        return ""
 
     def _build_selection_group(self) -> QGroupBox:
         group = QGroupBox("Neuron Selection")
@@ -804,8 +1812,16 @@ class NeuronAnnotatorWidget(QWidget):
         if sources:
             for layer in sources:
                 self.image_combo.addItem(layer.name, layer)
-            target = current if current in sources else sources[0]
-            self.image_combo.setCurrentIndex(sources.index(target))
+            target = (
+                current
+                if current in sources
+                else None
+                if self._proof_detached
+                else sources[0]
+            )
+            self.image_combo.setCurrentIndex(
+                sources.index(target) if target in sources else -1
+            )
             self.image_combo.setEnabled(self._z_source_image is None)
             self.split_z_btn.setEnabled(True)
         else:
@@ -825,22 +1841,112 @@ class NeuronAnnotatorWidget(QWidget):
     def _on_image_changed(self, index: int) -> None:
         del index
         source = self.image_combo.currentData()
-        self._set_current_image(
-            source if isinstance(source, Image) else None
+        previous = self.current_image
+        target = source if isinstance(source, Image) else None
+        if (
+            target is not None
+            and self._proof_detached
+            and not self._image_matches_proof_session(target)
+        ):
+            self.update_status(
+                "Selected Image does not match the detached proof session",
+                "orange",
+            )
+            return
+        if not self._set_current_image(target):
+            self.image_combo.blockSignals(True)
+            try:
+                previous_index = self.image_combo.findData(previous)
+                if previous_index >= 0:
+                    self.image_combo.setCurrentIndex(previous_index)
+            finally:
+                self.image_combo.blockSignals(False)
+
+    def _image_matches_proof_session(self, source: Image) -> bool:
+        """Check the spatial contract before reattaching dirty proof state."""
+        if source.ndim not in (3, 4):
+            return False
+        expected = getattr(self.proofread_store, "image_signature", None)
+        if expected is None:
+            return True
+        return self._proof_image_signature(source) == expected
+
+    def _proof_session_has_content(self) -> bool:
+        """Return whether the current proof session carries user state."""
+        store = self.proofread_store
+        if store is None:
+            return self._proof_size_draft_dirty
+        return bool(
+            self._proof_size_draft_dirty
+            or store.dirty
+            or store.observation_patches
+            or store.delete_all_ids
+            or store.placement_size
+            or store.committed_added_ids
+            or store.provisional_added_ids
+            or store.retired_ids
         )
 
-    def _set_current_image(self, source: Image | None) -> None:
+    @staticmethod
+    def _proof_image_signature(source: Image) -> dict[str, object]:
+        return {
+            "shape": list(source.data.shape),
+            "scale": [float(value) for value in source.scale],
+            "translate": [float(value) for value in source.translate],
+            "axis_labels": [str(value) for value in source.axis_labels],
+            "units": [str(value) for value in source.units],
+        }
+
+    def _set_current_image(
+        self, source: Image | None, *, force: bool = False
+    ) -> bool:
         if source is self.current_image:
-            return
+            return True
+        rebind_clean_proof_store = bool(
+            source is not None
+            and self.roi_dataset is not None
+            and self.proofread_store is not None
+            and not self._proof_session_has_content()
+            and not self._image_matches_proof_session(source)
+        )
+        if (
+            source is not None
+            and self.roi_dataset is not None
+            and self._proof_session_has_content()
+            and not self._image_matches_proof_session(source)
+        ):
+            self.update_status(
+                "Image spatial metadata does not match the proof session",
+                "orange",
+            )
+            return False
+        if (
+            not force
+            and self.roi_dataset is not None
+            and not self._confirm_proof_transition("switching Image")
+        ):
+            return False
+        preserve_draft = force and self._proof_size_draft_dirty
+        if self.proofreading_enabled:
+            self._proof_cancel_or_exit()
+        if preserve_draft:
+            self._proof_size_draft_dirty = True
         self._disconnect_current_image_events()
         if self._z_ranges:
             self._clear_z_layers()
         self._remove_roi_layers()
         self.current_image = source
+        if source is not None:
+            self._proof_detached = False
+            if rebind_clean_proof_store and ProofreadStore is not None:
+                self.proofread_store = ProofreadStore(
+                    self.roi_dataset,
+                    image_signature=self._proof_image_signature(source),
+                )
         self.load_roi_btn.setEnabled(
             source is not None and self.roi_dataset is None
         )
-        if source is not None:
+        if source is not None and not force:
             # Clearing an active Z session refreshes this selector against the
             # previous source. Re-sync it after the new authority is installed.
             self._refresh_image_layers()
@@ -852,7 +1958,8 @@ class NeuronAnnotatorWidget(QWidget):
             self.z_profile_refresh_btn.setEnabled(False)
             self._refresh_selection_item_styles()
             self._update_orientation_controls_enabled()
-            return
+            self._update_proof_current_box_status()
+            return True
         self._validate_image_source(source)
         self._ensure_orientation_baseline()
         source.events.data.connect(self._on_current_image_changed)
@@ -871,7 +1978,9 @@ class NeuronAnnotatorWidget(QWidget):
             self._refresh_roi_layers()
         self._refresh_selection_item_styles()
         self._update_roi_info()
+        self._update_proof_current_box_status()
         self._update_orientation_controls_enabled()
+        return True
 
     def _disconnect_current_image_events(self) -> None:
         source = self.current_image
@@ -896,9 +2005,34 @@ class NeuronAnnotatorWidget(QWidget):
             self._set_current_image(None)
             self._refresh_image_layers()
             return
+        if self.proofread_store is not None:
+            signature_matches = self._image_matches_proof_session(source)
+            if not signature_matches:
+                # Layer events cannot be vetoed.  Keep the proof state and any
+                # size draft, but stop editing/rendering until the original
+                # spatial contract is restored or a matching Image is chosen.
+                self._proof_detached = True
+                self._set_proofreading_off_preserve_draft()
+                self.proofreading_toggle.setEnabled(False)
+                self._set_proofreading_controls_enabled(False)
+                self._remove_roi_layers()
+                self._update_info()
+                self.update_status(
+                    "Image geometry changed; proofreading is paused",
+                    "orange",
+                )
+                return
+            if self._proof_detached:
+                self._proof_detached = False
+                self.update_status(
+                    "Image geometry restored; proofreading may be enabled",
+                    "green",
+                )
         self._remove_roi_layers()
         self._ensure_roi_layers()
         self._refresh_roi_layers()
+        self.proofreading_toggle.setEnabled(self._proof_view_allowed())
+        self._update_info()
 
     # Compatibility with the old Z-specific callback name.
     def _on_z_image_changed(self, index: int) -> None:
@@ -1134,7 +2268,21 @@ class NeuronAnnotatorWidget(QWidget):
         if not self._z_ranges:
             return
         value = self.z_view_combo.currentData()
-        self._z_active_index = None if value is None else int(value)
+        previous = self._z_active_index
+        target = None if value is None else int(value)
+        if (
+            target != previous
+            and self._proof_size_draft_dirty
+            and not self._confirm_proof_size_draft("changing Z view")
+        ):
+            self.z_view_combo.blockSignals(True)
+            try:
+                restore = self.z_view_combo.findData(previous)
+                self.z_view_combo.setCurrentIndex(restore)
+            finally:
+                self.z_view_combo.blockSignals(False)
+            return
+        self._z_active_index = target
         self._apply_z_view()
 
     def _active_z_range(self) -> ZLayerRange | None:
@@ -1158,6 +2306,8 @@ class NeuronAnnotatorWidget(QWidget):
         if self._z_source_image is not None:
             self._z_source_image.visible = False
         if active_range is not None:
+            if self.proofreading_enabled:
+                self._proof_cancel_or_exit()
             self._clamp_z_to_active_layer(active_range)
 
         self._refresh_selection_item_styles()
@@ -1255,21 +2405,39 @@ class NeuronAnnotatorWidget(QWidget):
             isinstance(removed, Points | Vectors)
             and removed.metadata.get(ROLE_KEY) in MANAGED_ROI_ROLES
         ):
+            if role == ROLE_PROOF_TARGET:
+                self._clear_proof_target()
             return
         if removed is self._z_source_image:
             self._clear_z_layers()
         if removed is self.current_image:
-            self._set_current_image(None)
+            # napari has already removed the layer, so this transition cannot
+            # be vetoed.  Preserve dirty proof state in a detached session.
+            self._set_current_image(None, force=True)
+            if self._proof_session_has_content():
+                self._proof_detached = True
+                self.update_status(
+                    "Image removed; proofreading state is retained",
+                    "orange",
+                )
         self._refresh_image_layers()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.shutdown()
-        super().closeEvent(event)
+        if not self.shutdown():
+            event.ignore()
+            return
+        event.accept()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, force: bool = False) -> bool:
         """Restore managed display state and disconnect all external events."""
         if self._closed:
-            return
+            return True
+        if not force and not self._confirm_proof_transition("closing the widget"):
+            return False
+        self._remove_proof_key_filter()
+        self._remove_proof_mouse_callback()
+        self._clear_proof_target()
+        self.proofreading_enabled = False
         self._closed = True
         self._restore_orientation_baseline()
         self._disconnect_viewer_events()
@@ -1278,13 +2446,16 @@ class NeuronAnnotatorWidget(QWidget):
         self._disconnect_current_image_events()
         self.current_image = None
         self._remove_roi_layers()
+        return True
 
     # ------------------------------------------------------------------
     # ROI identities, checkable selection, and navigation
     # ------------------------------------------------------------------
     def _refresh_available_ids(self, *, select_first: bool) -> None:
         ids = (
-            self.roi_dataset.neuron_ids
+            list(self.proofread_store.neuron_ids)
+            if self.proofread_store is not None
+            else self.roi_dataset.neuron_ids
             if self.roi_dataset is not None
             else []
         )
@@ -1464,6 +2635,26 @@ class NeuronAnnotatorWidget(QWidget):
             return
         display_id = int(item.data(0, Qt.UserRole))
         checked = item.checkState(0) == Qt.Checked
+        changes_active = (checked and display_id != self.active_id) or (
+            not checked and display_id == self.active_id
+        )
+        if (
+            changes_active
+            and self._proof_size_draft_dirty
+            and not self._confirm_proof_size_draft("changing active neuron")
+        ):
+            self._ui_sync = True
+            try:
+                item.setCheckState(
+                    0,
+                    Qt.Checked
+                    if display_id in self.checked_ids
+                    else Qt.Unchecked,
+                )
+            finally:
+                self._ui_sync = False
+            self._refresh_selection_item_styles()
+            return
         if checked:
             self.checked_ids.add(display_id)
             self.active_id = display_id
@@ -1485,6 +2676,14 @@ class NeuronAnnotatorWidget(QWidget):
         """Check and activate one available identity."""
         if display_id not in self._available_ids:
             return
+        if (
+            display_id != self.active_id
+            and self._proof_size_draft_dirty
+            and not self._confirm_proof_size_draft("changing active neuron")
+        ):
+            self._refresh_selection_item_styles()
+            self._sync_annotation_to_active()
+            return
         self.checked_ids.add(display_id)
         self.active_id = display_id
         self._selection_changed(locate=locate)
@@ -1502,13 +2701,31 @@ class NeuronAnnotatorWidget(QWidget):
 
     def check_none(self) -> None:
         """Clear both the checked collection and active identity."""
+        if (
+            self.active_id is not None
+            and self._proof_size_draft_dirty
+            and not self._confirm_proof_size_draft("clearing selection")
+        ):
+            return
         self.checked_ids.clear()
         self.active_id = None
         self._selection_changed(locate=False)
 
     def _selection_changed(self, *, locate: bool) -> None:
+        draft_target = self._proof_size_draft_target
+        if (
+            self._proof_size_draft_dirty
+            and draft_target is not None
+            and self.active_id != draft_target[1]
+            and not self._confirm_proof_size_draft("changing active neuron")
+        ):
+            # Some Qt selection signals update active_id before reaching this
+            # common path. Restore the draft owner when the user cancels.
+            self.active_id = draft_target[1]
+            self.checked_ids.add(draft_target[1])
         self._refresh_selection_item_styles()
         self._refresh_roi_layers()
+        self._update_proof_size_controls()
         self._sync_annotation_to_active()
         if locate:
             self._locate_active_box()
@@ -1524,13 +2741,25 @@ class NeuronAnnotatorWidget(QWidget):
     def _valid_time_ids(self) -> list[int]:
         if self.roi_dataset is None:
             return list(self._available_ids)
+        volume_index = self._current_volume_index()
+        if self.proofread_store is not None:
+            return (
+                self.proofread_store.valid_ids_at_volume_index(volume_index)
+                if volume_index is not None
+                else []
+            )
         return self.roi_dataset.valid_ids(self._viewer_time())
 
     def _id_in_active_z_layer(self, display_id: int) -> bool:
         active_range = self._active_z_range()
         if active_range is None or self.roi_dataset is None:
             return True
-        box = self.roi_dataset.get_box(self._viewer_time(), display_id)
+        volume_index = self._current_volume_index()
+        box = (
+            self.proofread_store.resolve(volume_index, display_id)
+            if self.proofread_store is not None and volume_index is not None
+            else self.roi_dataset.get_box(self._viewer_time(), display_id)
+        )
         if box is None:
             return False
         owner = find_z_layer(box.center_zyx[0], self._z_ranges)
@@ -1583,8 +2812,7 @@ class NeuronAnnotatorWidget(QWidget):
                 ),
                 candidates[-1],
             )
-        self.active_id = next_id
-        self._selection_changed(locate=True)
+        self.activate_id(next_id, locate=True)
 
     def _previous_key(self, viewer=None) -> None:
         del viewer
@@ -1635,6 +2863,12 @@ class NeuronAnnotatorWidget(QWidget):
         time_axis = len(steps) - 4
         time_stop = int(self.current_image.data.shape[0]) - 1
         target = int(np.clip(steps[time_axis] + step, 0, time_stop))
+        if (
+            target != int(steps[time_axis])
+            and self._proof_size_draft_dirty
+            and not self._confirm_proof_size_draft("changing volume")
+        ):
+            return
         self.viewer.dims.set_current_step(time_axis, target)
 
     def _previous_time_key(self, viewer=None) -> None:
@@ -1691,7 +2925,28 @@ class NeuronAnnotatorWidget(QWidget):
         )
         source_path = Path(path)
 
+        if self.roi_dataset is not None and not self._confirm_proof_transition(
+            "loading another ROI"
+        ):
+            return
+        if self.proofreading_enabled:
+            self._proof_cancel_or_exit()
+        else:
+            self._remove_proof_mouse_callback()
+            self._clear_proof_target()
+
         self.roi_dataset = dataset
+        self.proofread_store = (
+            ProofreadStore(
+                dataset,
+                image_signature=self._proof_image_signature(
+                    self.current_image
+                ),
+            )
+            if ProofreadStore
+            else None
+        )
+        self._proof_detached = False
         self.roi_path_input.setText(str(source_path))
         self.unload_roi_btn.setEnabled(True)
         self._set_roi_config_enabled(False)
@@ -1702,9 +2957,20 @@ class NeuronAnnotatorWidget(QWidget):
         self._ensure_roi_layers()
         self._refresh_roi_layers()
         self._update_roi_info()
+        self._update_proof_current_box_status()
+        self.proofreading_toggle.setEnabled(self._proof_view_allowed())
+        self._set_proofreading_controls_enabled(False)
         self.update_status(f"Loaded ROI: {source_path.name}", "green")
 
-    def unload_roi(self) -> None:
+    def unload_roi(self, *, force: bool = False) -> bool:
+        if not force and not self._confirm_proof_transition("unloading ROI"):
+            return False
+        if self.proofreading_enabled:
+            self._proof_cancel_or_exit()
+        else:
+            self._remove_proof_mouse_callback()
+            self._clear_proof_target()
+        self.proofread_store = None
         self.roi_dataset = None
         self.roi_path_input.clear()
         self.unload_roi_btn.setEnabled(False)
@@ -1715,9 +2981,13 @@ class NeuronAnnotatorWidget(QWidget):
         self._available_ids = []
         self._reset_search()
         self.roi_info_label.setText("No ROI loaded")
+        self.proofreading_toggle.setEnabled(False)
+        self._set_proofreading_controls_enabled(False)
         self._rebuild_selection_items()
+        self._update_proof_current_box_status()
         self._update_info()
         self.update_status("ROI unloaded", "green")
+        return True
 
     def _set_roi_config_enabled(self, enabled: bool) -> None:
         self.z_divisor_spin.setEnabled(enabled)
@@ -1729,12 +2999,13 @@ class NeuronAnnotatorWidget(QWidget):
         if self.roi_dataset is None:
             return
         viewer_t = self._viewer_time()
-        source_t = self.roi_dataset.source_time(viewer_t)
-        valid = len(self.roi_dataset.valid_ids(viewer_t))
+        volume_index = self._current_volume_index()
+        valid = len(self._valid_time_ids())
+        volume_text = "out of range" if volume_index is None else str(volume_index)
         self.roi_info_label.setText(
             f"T={self.roi_dataset.time_count}, "
             f"N={self.roi_dataset.neuron_count}; "
-            f"viewer t={viewer_t} → source t={source_t}; "
+            f"Image t={viewer_t} → volume={volume_text}; "
             f"{valid} valid boxes"
         )
 
@@ -1778,6 +3049,43 @@ class NeuronAnnotatorWidget(QWidget):
         del event
         if self._closed:
             return
+        current_volume = self._current_volume_index()
+        current_target_context = (
+            current_volume,
+            self._viewer_time(),
+            self._viewer_z(),
+        )
+        if (
+            self._proof_target_context is not None
+            and self._proof_target_context != current_target_context
+        ):
+            self._clear_proof_target()
+        draft_target = self._proof_size_draft_target
+        target_changed = bool(
+            self._proof_size_draft_dirty
+            and draft_target is not None
+            and current_volume != draft_target[0]
+        )
+        view_changed = self.proofreading_enabled and not self._proof_view_allowed()
+        if target_changed or view_changed:
+            allowed = self._confirm_proof_size_draft(
+                "changing volume or display mode"
+            )
+            if view_changed or not allowed:
+                # An external napari dims change has already happened and
+                # cannot reliably be vetoed. Stop proofreading; on Cancel the
+                # draft remains attached to its original target.
+                if allowed:
+                    self.proofreading_toggle.blockSignals(True)
+                    self.proofreading_toggle.setChecked(False)
+                    self.proofreading_toggle.blockSignals(False)
+                    self._set_proofreading_enabled(False)
+                else:
+                    self._set_proofreading_off_preserve_draft()
+                if not allowed:
+                    self.update_status(
+                        "Proofreading paused; size draft retained", "orange"
+                    )
         if (
             self._orientation_baseline_ndim is not None
             and self._orientation_baseline_ndim != int(self.viewer.dims.ndim)
@@ -1802,7 +3110,16 @@ class NeuronAnnotatorWidget(QWidget):
             self._update_roi_info()
             self._refresh_selection_item_styles()
             self._refresh_roi_layers()
+            self._update_proof_size_controls()
+        else:
+            # Keep the empty-state label accurate while an Image/ROI
+            # transition temporarily leaves no resolvable observation.
+            self._update_proof_current_box_status()
         self._update_orientation_controls_enabled()
+        self.proofreading_toggle.setEnabled(self._proof_view_allowed())
+        self._set_proofreading_controls_enabled(
+            self.proofreading_enabled and self._proof_view_allowed()
+        )
 
     def _ensure_roi_layers(self) -> None:
         if (
@@ -1811,6 +3128,12 @@ class NeuronAnnotatorWidget(QWidget):
             or self.current_image.ndim not in (3, 4)
         ):
             return
+        # ``Viewer.add_*`` selects the newly-created layer.  Preserve the
+        # user's active layer while constructing runtime ROI overlays; without
+        # this, loading an ROI leaves the transparent label overlay active and
+        # Proofreading immediately rejects the toggle because the source Image
+        # is no longer active.
+        previous_active = self.viewer.layers.selection.active
         ndim = self.current_image.ndim
         empty_vectors = np.empty((0, 2, ndim), dtype=float)
         empty_points = np.empty((0, ndim), dtype=float)
@@ -1882,7 +3205,14 @@ class NeuronAnnotatorWidget(QWidget):
                 metadata={ROLE_KEY: ROLE_BOX_LABELS},
             )
             box_label_layer.editable = False
-
+        if previous_active is not None and previous_active in self.viewer.layers:
+            self.viewer.layers.selection.active = previous_active
+        elif previous_active is None:
+            self.viewer.layers.selection.active = None
+        elif self.current_image in self.viewer.layers:
+            # The previous active layer may have been the legacy managed layer
+            # removed above.  The source Image is the safe fallback.
+            self.viewer.layers.selection.active = self.current_image
     def _managed_vector_layer(self, role: str) -> Vectors | None:
         for layer in self.viewer.layers:
             if (
@@ -1901,7 +3231,63 @@ class NeuronAnnotatorWidget(QWidget):
                 return layer
         return None
 
+    def _ensure_proof_target_layer(self) -> Vectors | None:
+        """Create the session-only, read-only proofreading crosshair layer."""
+        if self.current_image is None or self.current_image.ndim not in (3, 4):
+            return None
+        active = self.viewer.layers.selection.active
+        # Releases before the vector crosshair used a Points marker under the
+        # same role.  Remove that legacy layer rather than returning it, so a
+        # reopened widget always gets independently tunable line geometry.
+        legacy_points = [
+            layer
+            for layer in self.viewer.layers
+            if isinstance(layer, Points)
+            and layer.metadata.get(ROLE_KEY) == ROLE_PROOF_TARGET
+        ]
+        for legacy in legacy_points:
+            if legacy in self.viewer.layers:
+                self.viewer.layers.remove(legacy)
+
+        layer = self._managed_proof_target_layer()
+        if layer is not None:
+            layer.editable = False
+            if active in self.viewer.layers:
+                self.viewer.layers.selection.active = active
+            return layer
+        layer = self.viewer.add_vectors(
+            np.empty((0, 2, self.current_image.ndim), dtype=float),
+            ndim=self.current_image.ndim,
+            name="Proofreading target",
+            vector_style="line",
+            edge_color="cyan",
+            edge_width=float(PROOF_TARGET_EDGE_WIDTH),
+            opacity=1.0,
+            blending="translucent",
+            scale=tuple(self.current_image.scale),
+            translate=tuple(self.current_image.translate),
+            axis_labels=tuple(self.current_image.axis_labels),
+            units=tuple(self.current_image.units),
+            visible=False,
+            metadata={ROLE_KEY: ROLE_PROOF_TARGET},
+        )
+        layer.editable = False
+        self.viewer.layers.selection.active = (
+            active if active in self.viewer.layers else None
+        )
+        return layer
+
+    def _managed_proof_target_layer(self) -> Vectors | None:
+        for layer in self.viewer.layers:
+            if (
+                isinstance(layer, Vectors)
+                and layer.metadata.get(ROLE_KEY) == ROLE_PROOF_TARGET
+            ):
+                return layer
+        return None
+
     def _remove_roi_layers(self) -> None:
+        self._clear_proof_target()
         managed = [
             layer
             for layer in self.viewer.layers
@@ -1938,6 +3324,7 @@ class NeuronAnnotatorWidget(QWidget):
             return
 
         viewer_t = self._viewer_time()
+        volume_index = self._current_volume_index()
         z_index = self._viewer_z()
         shape_zyx = self._shape_zyx()
         selected_vectors: list[np.ndarray] = []
@@ -1953,13 +3340,22 @@ class NeuronAnnotatorWidget(QWidget):
             and self.show_box_labels_checkbox.isChecked()
         )
 
-        for neuron_id in self.roi_dataset.valid_ids(viewer_t):
+        valid_ids = (
+            self.proofread_store.valid_ids_at_volume_index(volume_index)
+            if self.proofread_store is not None and volume_index is not None
+            else self.roi_dataset.valid_ids(viewer_t)
+        )
+        for neuron_id in valid_ids:
             if (
                 neuron_id not in self.checked_ids
                 and neuron_id != self.active_id
             ):
                 continue
-            box = self.roi_dataset.get_box(viewer_t, neuron_id)
+            box = (
+                self.proofread_store.resolve(volume_index, neuron_id)
+                if self.proofread_store is not None and volume_index is not None
+                else self.roi_dataset.get_box(viewer_t, neuron_id)
+            )
             if box is None:
                 continue
             active_range = self._active_z_range()
@@ -2073,7 +3469,12 @@ class NeuronAnnotatorWidget(QWidget):
             or self.active_id is None
         ):
             return
-        box = self.roi_dataset.get_box(self._viewer_time(), self.active_id)
+        volume_index = self._current_volume_index()
+        box = (
+            self.proofread_store.resolve(volume_index, self.active_id)
+            if self.proofread_store is not None and volume_index is not None
+            else self.roi_dataset.get_box(self._viewer_time(), self.active_id)
+        )
         if box is None:
             self.update_status(
                 f"Neuron {self.active_id} is missing at this volume", "orange"
@@ -2363,6 +3764,10 @@ class NeuronAnnotatorWidget(QWidget):
     # Status helpers
     # ------------------------------------------------------------------
     def _update_info(self) -> None:
+        # Keep the compact proofreading status synchronized with all state
+        # transitions that refresh the general information panel (including
+        # source/Image detach and unload paths).
+        self._update_proof_current_box_status()
         mode = "ROI" if self.roi_dataset is not None else "Idle"
         checked = sorted(self.checked_ids)
         text = (
@@ -2370,6 +3775,19 @@ class NeuronAnnotatorWidget(QWidget):
             f"Active: {self.active_id if self.active_id is not None else 'none'}\n"
             f"Checked: {checked[:12]}"
         )
+        store = self.proofread_store
+        if store is not None:
+            proof_mode = "On" if self.proofreading_enabled else "Off"
+            if self._proof_detached:
+                proof_mode += " (paused)"
+            text += (
+                f"\nProof: {proof_mode}; "
+                f"dirty={'yes' if store.dirty else 'no'}; "
+                f"modified={len(store.modified_observations)} observations/"
+                f"{len(store.modified_ids)} neurons"
+            )
+            if self._proof_size_draft_dirty:
+                text += "; size draft"
         active_range = self._active_z_range()
         if self._z_ranges:
             z_view = (
@@ -2393,9 +3811,12 @@ __all__ = (
     "EXCEL_AVAILABLE",
     "LabelManager",
     "NeuronAnnotatorWidget",
+    "PROOF_TARGET_EDGE_WIDTH",
+    "PROOF_TARGET_HALF_LENGTH",
     "ROLE_ACTIVE",
     "ROLE_BOX_LABELS",
     "ROLE_KEY",
+    "ROLE_PROOF_TARGET",
     "ROLE_SELECTED",
     "ROLE_Z_IMAGE",
 )

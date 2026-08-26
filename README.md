@@ -30,6 +30,8 @@ synchronize them.
 - Session-only whole-viewer rotation and screen-axis flip controls.
 - View-preserving Z-layer display synchronized across Image and ROI overlays.
 - Zero-based ROI annotation with optional Excel import/export.
+- Opt-in 2D proofreading of box centers, dimensions, missing observations,
+  and added neurons using a non-destructive JSON sidecar.
 
 ## Installation
 
@@ -253,6 +255,39 @@ visually, but one box does not erase the identity of another.
 Vectors and the transparent Points text layer are derived display data. They
 are removed when the ROI is unloaded or the widget closes and are not saved
 as a separate annotation format.
+
+The proofreading target is a separate, session-only Vectors layer. It is drawn
+as two thin orthogonal line segments (rather than a Points marker), with a
+default half-length of 8 data units and an edge width of 1 pixel. These display
+constants are independent of the neuron box dimensions.
+
+## 2D proofreading
+
+Proofreading is off by default and is available only in napari's 2D display
+with Z view set to **All**. Select the source Image layer, turn proofreading
+on, then make an unmodified short left-click on the Image to lock a fixed
+crosshair target. Moving the pointer does not move this target. Then use:
+
+- F7 to delete the active neuron's observation at the current volume;
+- F8 to place a missing active observation at the locked target;
+- F9 to add a provisional neuron at the locked target using the default
+  width/height/depth of `7/7/3`;
+- F12 to discard an unapplied size draft and leave proofreading mode.
+
+Successful F8/F9 placement clears the target. Changing time or Z, or leaving
+proofreading mode, also clears it. F8 never moves a box that is already
+present. Width, height, and depth accept positive floating-point values;
+**Apply size** changes every currently valid
+observation of the active neuron while preserving its centers. Delete-all is
+explicitly confirmed and removes the active ID's observations from every raw
+volume without deleting or renumbering its identity. Added IDs can be retired;
+retired numeric IDs remain reserved and are not reused.
+
+**Save proof edits** writes canonical sparse edits to a JSON sidecar. The
+original ROI NPY remains read-only. **Export corrected NPY** creates a separate
+array with stable neuron indices; deleted geometry uses NaN in the first six
+fields. If an Image's shape or spatial metadata changes, proofreading pauses
+until a compatible Image is restored.
 
 ## Annotation
 
