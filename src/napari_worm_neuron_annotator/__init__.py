@@ -8,6 +8,13 @@ except ImportError:
     except PackageNotFoundError:
         __version__ = "0+unknown"
 
+from ._proofread import ObservationPatch, ProofreadStore, SidecarError
 from ._widget import LabelManager, NeuronAnnotatorWidget
 
-__all__ = ("NeuronAnnotatorWidget", "LabelManager")
+__all__ = (
+    "NeuronAnnotatorWidget",
+    "LabelManager",
+    "ObservationPatch",
+    "ProofreadStore",
+    "SidecarError",
+)

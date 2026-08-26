@@ -23,6 +23,16 @@ class NeuronBox:
     size_zyx: tuple[float, float, float]
 
     @property
+    def volume_index(self) -> int:
+        """Return the NPY time/volume index for this observation.
+
+        ``source_t`` is retained as a compatibility field for the existing
+        browse code.  Proofreading code uses the less ambiguous
+        ``volume_index`` name, which is an alias for the same value.
+        """
+        return int(self.source_t)
+
+    @property
     def bounds_zyx(
         self,
     ) -> tuple[
@@ -97,8 +107,40 @@ class NeuronBoxDataset:
         return int(self._data.shape[0])
 
     @property
+    def raw_T(self) -> int:
+        """Number of observations along the raw NPY time axis."""
+        return self.time_count
+
+    @property
     def neuron_count(self) -> int:
         return int(self._data.shape[1])
+
+    @property
+    def raw_N(self) -> int:
+        """Number of raw neuron identities."""
+        return self.neuron_count
+
+    @property
+    def raw_shape(self) -> tuple[int, ...]:
+        """Shape of the source ROI array (without exposing a writable view)."""
+        return tuple(int(value) for value in self._data.shape)
+
+    @property
+    def raw_dtype(self) -> np.dtype:
+        """NumPy dtype of the source ROI array."""
+        return self._data.dtype
+
+    @property
+    def raw_data(self) -> np.ndarray:
+        """Read-only view of the source ROI array.
+
+        Proofreading always writes to a separate sidecar/export array.  A
+        read-only view makes accidental mutation through this convenience
+        property fail loudly while leaving the caller's array flags intact.
+        """
+        view = self._data.view()
+        view.flags.writeable = False
+        return view
 
     @property
     def neuron_ids(self) -> list[int]:
@@ -107,16 +149,31 @@ class NeuronBoxDataset:
     def source_time(self, viewer_t: int) -> int:
         return self.volume_start + int(viewer_t) * self.volume_stride
 
-    def get_box(self, viewer_t: int, neuron_id: int) -> NeuronBox | None:
-        """Return a valid box, or ``None`` for absent/invalid observations."""
-        source_t = self.source_time(viewer_t)
-        if not 0 <= source_t < self.time_count:
+    def volume_index_for_viewer_time(self, viewer_t: int) -> int:
+        """Map an Image/viewer time to a raw NPY volume index."""
+        return self.source_time(viewer_t)
+
+    def get_box_at_volume_index(
+        self, volume_index: int, neuron_id: int
+    ) -> NeuronBox | None:
+        """Return a valid box addressed directly by raw NPY index."""
+        if isinstance(volume_index, bool) or not isinstance(
+            volume_index, int | np.integer
+        ):
+            raise TypeError("volume_index must be an integer")
+        volume_index = int(volume_index)
+        if not 0 <= volume_index < self.raw_T:
             return None
-        if not 0 <= neuron_id < self.neuron_count:
+        if isinstance(neuron_id, bool) or not isinstance(
+            neuron_id, int | np.integer
+        ):
+            raise TypeError("neuron_id must be an integer")
+        neuron_id = int(neuron_id)
+        if not 0 <= neuron_id < self.raw_N:
             return None
 
         values = np.asarray(
-            self._data[source_t, neuron_id, :6], dtype=float
+            self._data[volume_index, neuron_id, :6], dtype=float
         )
         if not np.all(np.isfinite(values)):
             return None
@@ -127,15 +184,33 @@ class NeuronBoxDataset:
             return None
 
         return NeuronBox(
-            neuron_id=int(neuron_id),
-            source_t=source_t,
-            center_zyx=(
-                z_scaled / self.z_divisor,
-                y,
-                x,
-            ),
+            neuron_id=neuron_id,
+            source_t=volume_index,
+            center_zyx=(z_scaled / self.z_divisor, y, x),
             size_zyx=(depth, height, width),
         )
+
+    def get_box(self, viewer_t: int, neuron_id: int) -> NeuronBox | None:
+        """Return a valid box, or ``None`` for absent/invalid observations."""
+        source_t = self.source_time(viewer_t)
+        if not 0 <= source_t < self.raw_T:
+            return None
+        return self.get_box_at_volume_index(source_t, neuron_id)
+
+    def valid_ids_at_volume_index(self, volume_index: int) -> list[int]:
+        """Return raw IDs with valid boxes at ``volume_index``."""
+        if isinstance(volume_index, bool) or not isinstance(
+            volume_index, int | np.integer
+        ):
+            raise TypeError("volume_index must be an integer")
+        if not 0 <= int(volume_index) < self.raw_T:
+            return []
+        return [
+            neuron_id
+            for neuron_id in self.neuron_ids
+            if self.get_box_at_volume_index(volume_index, neuron_id)
+            is not None
+        ]
 
     def valid_ids(self, viewer_t: int) -> list[int]:
         return [

@@ -35,6 +35,44 @@ def test_dataset_validates_and_maps_source_coordinates(tmp_path):
     assert dataset.valid_ids(1) == [1]
 
 
+def test_dataset_exposes_read_only_raw_shape_and_volume_index_queries():
+    data = np.full((3, 2, 6), np.nan, dtype=np.float32)
+    data[2, 1, :6] = [20, 10, 25, 8, 6, 10]
+    dataset = NeuronBoxDataset(data, z_divisor=5)
+
+    assert dataset.raw_shape == (3, 2, 6)
+    assert dataset.raw_T == 3
+    assert dataset.raw_N == 2
+    assert dataset.raw_dtype == data.dtype
+    assert dataset.volume_index_for_viewer_time(2) == 2
+    assert dataset.get_box_at_volume_index(2, 1) is not None
+    assert dataset.valid_ids_at_volume_index(2) == [1]
+    assert dataset.valid_ids_at_volume_index(0) == []
+
+    raw = dataset.raw_data
+    assert not raw.flags.writeable
+    with pytest.raises(ValueError):
+        raw[2, 1, 0] = 99
+    np.testing.assert_array_equal(data, dataset.raw_data)
+
+
+@pytest.mark.parametrize("bad_index", [True, 1.0, "1"])
+def test_volume_index_query_rejects_non_integer_indices(bad_index):
+    dataset = NeuronBoxDataset(np.zeros((2, 1, 6), dtype=float))
+    with pytest.raises(TypeError, match="volume_index"):
+        dataset.get_box_at_volume_index(bad_index, 0)
+    with pytest.raises(TypeError, match="volume_index"):
+        dataset.valid_ids_at_volume_index(bad_index)
+
+
+def test_volume_index_query_out_of_range_is_missing():
+    dataset = NeuronBoxDataset(np.zeros((2, 1, 6), dtype=float))
+    assert dataset.get_box_at_volume_index(-1, 0) is None
+    assert dataset.get_box_at_volume_index(2, 0) is None
+    assert dataset.valid_ids_at_volume_index(-1) == []
+    assert dataset.valid_ids_at_volume_index(2) == []
+
+
 @pytest.mark.parametrize(
     "shape",
     [(2, 3), (2, 3, 5), (2, 3, 4, 5)],
