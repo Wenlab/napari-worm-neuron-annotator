@@ -89,6 +89,46 @@ def test_image_is_spatial_authority_and_roi_works_without_labels(
     np.testing.assert_allclose(selected.translate, image.translate)
 
 
+def test_time_change_recenters_view_on_active_box(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(
+        np.zeros((3, 8, 32, 32), dtype=np.uint16),
+        name="image",
+        scale=(2, 3, 4, 5),
+        translate=(7, 11, 13, 17),
+    )
+    widget = NeuronAnnotatorWidget(viewer)
+    roi = np.full((3, 1, 6), np.nan, dtype=np.float32)
+    roi[0, 0] = [4, 5, 5, 2, 2, 5]
+    roi[1, 0] = [18, 20, 25, 2, 2, 5]
+    roi_path = tmp_path / "moving-active.npy"
+    np.save(roi_path, roi)
+    widget.load_roi_path(roi_path)
+
+    viewer.dims.current_step = (0, 2, 0, 0)
+    viewer.camera.center = (101, 102, 103)
+    viewer.dims.set_current_step(0, 1)
+
+    box = widget.roi_dataset.get_box(1, 0)
+    assert box is not None
+    assert viewer.dims.current_step == (1, 5, 0, 0)
+    expected_world = image.data_to_world((1, *box.center_zyx))
+    np.testing.assert_allclose(viewer.camera.center, expected_world[-3:])
+
+    viewer.camera.center = (201, 202, 203)
+    viewer.dims.set_current_step(1, 3)
+    assert viewer.dims.current_step == (1, 3, 0, 0)
+    np.testing.assert_allclose(viewer.camera.center, (201, 202, 203))
+
+    viewer.dims.set_current_step(0, 2)
+    assert widget.active_id == 0
+    assert viewer.dims.current_step == (2, 3, 0, 0)
+    np.testing.assert_allclose(viewer.camera.center, (201, 202, 203))
+    assert "missing at this volume" in widget.status_label.text()
+
+
 def test_widget_ignores_labels_layers_when_no_image_exists(make_napari_viewer):
     viewer = make_napari_viewer()
     viewer.add_labels(np.zeros((3, 2, 2), dtype=np.int32), name="labels")

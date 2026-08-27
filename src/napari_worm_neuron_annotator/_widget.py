@@ -197,6 +197,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._ui_sync = False
         self._closed = False
         self._keys_bound: list[str] = []
+        self._last_viewer_time: int | None = None
         self._z_ranges: tuple[ZLayerRange, ...] = ()
         self._z_source_image: Image | None = None
         self._z_image_layers: list[Image] = []
@@ -1936,6 +1937,11 @@ class NeuronAnnotatorWidget(QWidget):
             self._clear_z_layers()
         self._remove_roi_layers()
         self.current_image = source
+        self._last_viewer_time = (
+            self._viewer_time()
+            if source is not None and source.ndim == 4
+            else None
+        )
         if source is not None:
             self._proof_detached = False
             if rebind_clean_proof_store and ProofreadStore is not None:
@@ -3049,10 +3055,22 @@ class NeuronAnnotatorWidget(QWidget):
         del event
         if self._closed:
             return
+        viewer_time = self._viewer_time()
+        time_changed = bool(
+            self.current_image is not None
+            and self.current_image.ndim == 4
+            and self._last_viewer_time is not None
+            and viewer_time != self._last_viewer_time
+        )
+        self._last_viewer_time = (
+            viewer_time
+            if self.current_image is not None and self.current_image.ndim == 4
+            else None
+        )
         current_volume = self._current_volume_index()
         current_target_context = (
             current_volume,
-            self._viewer_time(),
+            viewer_time,
             self._viewer_z(),
         )
         if (
@@ -3111,6 +3129,8 @@ class NeuronAnnotatorWidget(QWidget):
             self._refresh_selection_item_styles()
             self._refresh_roi_layers()
             self._update_proof_size_controls()
+            if time_changed:
+                self._locate_active_box()
         else:
             # Keep the empty-state label accurate while an Image/ROI
             # transition temporarily leaves no resolvable observation.
