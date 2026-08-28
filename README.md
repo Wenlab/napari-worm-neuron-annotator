@@ -276,18 +276,34 @@ crosshair target. Moving the pointer does not move this target. Then use:
 
 Successful F8/F9 placement clears the target. Changing time or Z, or leaving
 proofreading mode, also clears it. F8 never moves a box that is already
-present. Width, height, and depth accept positive floating-point values;
-**Apply size** changes every currently valid
-observation of the active neuron while preserving its centers. Delete-all is
-explicitly confirmed and removes the active ID's observations from every raw
-volume without deleting or renumbering its identity. Added IDs can be retired;
+present. Width, height, and depth accept positive floating-point values.
+**Apply current t** changes only the locked observation at the current Image
+time, preserving its center and leaving other volumes untouched.
+**Apply to all existing…** is an explicit opt-in operation that changes the
+size of every existing observation for that neuron; missing observations are
+not created and all centers remain unchanged. Delete-all is explicitly
+confirmed and removes the active ID's observations from every raw volume
+without deleting or renumbering its identity. Added IDs can be retired;
 retired numeric IDs remain reserved and are not reused.
 
-**Save proof edits** writes canonical sparse edits to a JSON sidecar. The
-original ROI NPY remains read-only. **Export corrected NPY** creates a separate
-array with stable neuron indices; deleted geometry uses NaN in the first six
-fields. If an Image's shape or spatial metadata changes, proofreading pauses
-until a compatible Image is restored.
+The current-neuron line reports the final state relative to the raw ROI using
+`(moved)`, `(resized)`, `(moved + resized)`, `(placed)`, `(deleted)`, or
+`(added)` markers. These markers remain visible after saving; the separate
+`Unsaved proof edits` indicator only describes changes since the most recent
+save/load snapshot. A size edit that has not yet been applied is shown as an
+`Unapplied size draft` and is never written to a sidecar without an explicit
+Apply/Discard decision.
+
+**Save proof edits** writes canonical sparse edits to a schema-v2 JSON sidecar
+(`changed_fields` records whether each patch changes presence, center, and/or
+size). Existing schema-v1 sidecars are accepted and kept clean in memory; the
+next explicit save upgrades the same file in place. The current sidecar path
+is retained for subsequent saves, while **Save As…** switches that path.
+Cancel or validation/permission failures leave the working state and path
+unchanged. The original ROI NPY remains read-only. **Export corrected NPY**
+creates a separate array with stable neuron indices; deleted geometry uses NaN
+in the first six fields. If an Image's shape or spatial metadata changes,
+proofreading pauses until a compatible Image is restored.
 
 ## Annotation
 

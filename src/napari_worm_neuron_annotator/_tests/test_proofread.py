@@ -134,6 +134,107 @@ def test_apply_size_updates_only_currently_valid_observations():
     assert set(store.observation_patches) == {(0, 0), (1, 0)}
 
 
+def test_apply_size_at_volume_index_preserves_center_and_other_volumes():
+    store = ProofreadStore(_dataset())
+    center_0 = store.resolve(0, 0).center_zyx
+    box_1 = store.resolve(1, 0)
+
+    store.apply_size_at_volume_index(0, 0, (5, 6, 7))
+
+    assert store.resolve(0, 0).center_zyx == center_0
+    assert store.resolve(0, 0).size_zyx == (5, 6, 7)
+    assert store.resolve(1, 0) == box_1
+    assert 0 not in store.placement_size
+    assert set(store.observation_patches) == {(0, 0)}
+
+    store.apply_size_at_volume_index(0, 0, (3, 9, 7))
+    assert store.observation_patches == {}
+    assert not store.dirty
+
+
+def test_apply_size_at_volume_index_rejects_missing_without_creating_box():
+    store = ProofreadStore(_dataset())
+    state_before = store.saved_snapshot
+
+    with pytest.raises(ValueError, match=r"observation \(2, 0\) is missing"):
+        store.apply_size_at_volume_index(2, 0, (5, 6, 7))
+
+    assert store.resolve(2, 0) is None
+    assert store.saved_snapshot == state_before
+    assert not store.dirty
+
+
+def test_apply_size_to_all_existing_keeps_legacy_scope_and_missing_state():
+    store = ProofreadStore(_dataset())
+    centers = {
+        volume: store.resolve(volume, 0).center_zyx for volume in (0, 1)
+    }
+
+    store.apply_size_to_all_existing(0, (5, 6, 7))
+
+    assert store.placement_size[0] == (5, 6, 7)
+    assert {
+        volume: store.resolve(volume, 0).center_zyx for volume in (0, 1)
+    } == centers
+    assert store.resolve(2, 0) is None
+    assert set(store.observation_patches) == {(0, 0), (1, 0)}
+
+
+def test_observation_change_classification_and_canonical_restore():
+    store = ProofreadStore(_dataset())
+
+    store.set_observation_present(
+        0, 0, center_zyx=(3, 20, 12), size_zyx=(3, 9, 7)
+    )
+    store.apply_size_at_volume_index(1, 0, (5, 10, 8))
+    store.set_observation_present(
+        2, 0, center_zyx=(1, 2, 3), size_zyx=(3, 7, 7)
+    )
+    store.set_observation_deleted(2, 1)
+    added = store.add_neuron(0, (4, 5, 6))
+
+    assert store.changed_fields_for_observation(0, 0) == ("center_zyx",)
+    assert store.classify_observation(0, 0) == "moved"
+    assert store.changed_fields_for_observation(1, 0) == ("size_zyx",)
+    assert store.classify_observation(1, 0) == "resized"
+    assert store.changed_fields_for_observation(2, 0) == ("presence",)
+    assert store.classify_observation(2, 0) == "placed"
+    assert store.classify_observation(2, 1) == "deleted"
+    assert store.classify_observation(0, added) == "added"
+    assert store.moved_observations == {(0, 0)}
+    assert store.resized_observations == {(1, 0)}
+    assert store.presence_observations == {(2, 0), (2, 1), (0, added)}
+
+    raw = store.dataset.get_box_at_volume_index(0, 0)
+    store.set_observation_present(0, 0, raw)
+    assert store.classify_observation(0, 0) is None
+    assert (0, 0) not in store.modified_observations
+
+
+def test_combined_and_delete_all_restore_change_fields_are_exact():
+    store = ProofreadStore(_dataset())
+    store.set_observation_present(
+        0, 0, center_zyx=(8, 9, 10), size_zyx=(4, 5, 6)
+    )
+    assert store.changed_fields_for_observation(0, 0) == (
+        "center_zyx",
+        "size_zyx",
+    )
+    assert store.classify_observation(0, 0) == "moved + resized"
+
+    store.delete_all_observations(0)
+    store.set_observation_present(
+        0, 0, center_zyx=(8, 9, 10), size_zyx=(4, 5, 6)
+    )
+    assert store.changed_fields_for_observation(0, 0) == (
+        "presence",
+        "center_zyx",
+        "size_zyx",
+    )
+    assert store.classify_observation(0, 0) == "moved + resized"
+    assert store.classify_observation(1, 0) == "deleted"
+
+
 def test_add_discard_and_save_commit_identity(tmp_path):
     store = ProofreadStore(_dataset(tmp_path))
     first = store.add_neuron(0, (1, 2, 3))
@@ -212,6 +313,91 @@ def test_dirty_save_and_discard_snapshot(tmp_path):
     assert not store.dirty
     assert store.resolve(0, 0) is None
     assert store.resolve(1, 0).center_zyx == (3, 21, 11)
+
+
+def test_v2_sidecar_writes_changed_fields_and_round_trips(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    store.set_observation_present(
+        0, 0, center_zyx=(1, 2, 3), size_zyx=(3, 9, 7)
+    )
+    path = store.save(tmp_path / "proof.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 2
+    patch = payload["observation_patches"][0]
+    assert patch["changed_fields"] == ["center_zyx"]
+    loaded = ProofreadStore.from_sidecar(path, store.dataset)
+    assert loaded.resolve(0, 0).center_zyx == (1, 2, 3)
+    assert not loaded.dirty
+
+
+def test_v1_sidecar_loads_clean_and_next_save_upgrades_in_place(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    store.set_observation_present(
+        0, 0, center_zyx=(1, 2, 3), size_zyx=(3, 9, 7)
+    )
+    source = store.save(tmp_path / "proof.json")
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    for record in payload["observation_patches"]:
+        record.pop("changed_fields", None)
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = ProofreadStore.from_sidecar(source, store.dataset)
+    assert not loaded.dirty
+    assert loaded.resolve(0, 0).center_zyx == (1, 2, 3)
+
+    loaded.save()
+    upgraded = json.loads(source.read_text(encoding="utf-8"))
+    assert upgraded["schema_version"] == 2
+    assert upgraded["observation_patches"][0]["changed_fields"] == [
+        "center_zyx"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda patch: patch.pop("changed_fields"), "changed_fields"),
+        (
+            lambda patch: patch.update(changed_fields=["center_zyx", "center_zyx"]),
+            "duplicates",
+        ),
+        (
+            lambda patch: patch.update(changed_fields=["size_zyx", "center_zyx"]),
+            "canonical order",
+        ),
+        (
+            lambda patch: patch.update(changed_fields=["unknown"]),
+            "unknown changed_fields",
+        ),
+        (
+            lambda patch: patch.update(changed_fields=["size_zyx"]),
+            "do not match",
+        ),
+    ],
+)
+def test_v2_changed_fields_validation_is_transactional(
+    tmp_path, mutate, message
+):
+    source_store = ProofreadStore(_dataset(tmp_path))
+    source_store.set_observation_present(
+        0, 0, center_zyx=(1, 2, 3), size_zyx=(3, 7, 7)
+    )
+    source = source_store.save(tmp_path / "valid.json")
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    mutate(payload["observation_patches"][0])
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text(json.dumps(payload), encoding="utf-8")
+
+    target = ProofreadStore(source_store.dataset)
+    target.set_observation_deleted(0, 0)
+    before = target.resolve(0, 0)
+    dirty_before = target.dirty
+    with pytest.raises(SidecarError, match=message):
+        target.load(invalid)
+    assert target.resolve(0, 0) == before
+    assert target.dirty is dirty_before
 
 
 def test_load_failure_is_transactional(tmp_path):
@@ -364,7 +550,7 @@ def test_sidecar_rejects_coercible_non_json_vector_values(
         ProofreadStore.from_sidecar(invalid, store.dataset)
 
 
-@pytest.mark.parametrize("schema_version", [None, 0, 2, 1.0, "1", True])
+@pytest.mark.parametrize("schema_version", [None, 0, 1.0, "1", True])
 def test_sidecar_rejects_old_unknown_or_non_integer_schema(
     tmp_path, schema_version
 ):

@@ -263,7 +263,8 @@ def test_proofreading_defaults_off_and_handlers_are_inert(
     assert not widget.proofreading_enabled
     assert widget._proof_key_filter is None
     assert not widget.proof_width_spin.isEnabled()
-    assert widget.proof_save_btn.isEnabled()
+    # Save is only actionable when there are applied edits or a draft.
+    assert not widget.proof_save_btn.isEnabled()
 
     widget._proof_delete_current()
 
@@ -304,14 +305,14 @@ def test_current_box_status_reports_identity_time_and_modified_observation(
     widget.proof_width_spin.setValue(9.0)
     widget._proof_apply_size()
     assert widget.proof_current_box_label.text() == (
-        "Neuron 0 (modified): center (x=10.00, y=10.00, z=3.00), t=0"
+        "Neuron 0 (resized): center (x=10.00, y=10.00, z=3.00), t=0"
     )
 
     # A deleted observation has no center to show, but it is still a modified
     # observation and should retain that marker in the compact status line.
     widget._proof_delete_current()
     assert widget.proof_current_box_label.text() == (
-        "Neuron 0 (modified): no box, t=0"
+        "Neuron 0 (deleted): no box, t=0"
     )
 
     # Image t=1 maps to raw volume 3 in this fixture, where neuron 0 is

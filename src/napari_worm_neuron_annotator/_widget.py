@@ -9,7 +9,14 @@ import napari
 import numpy as np
 from napari.layers import Image, Points, Vectors
 from qtpy.QtCore import QEvent, QObject, Qt
-from qtpy.QtGui import QBrush, QCloseEvent, QColor, QFont, QPalette
+from qtpy.QtGui import (
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPalette,
+)
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -222,6 +229,10 @@ class NeuronAnnotatorWidget(QWidget):
         self._proof_canvas_native = None
         self._proof_size_draft_dirty = False
         self._proof_size_draft_target: tuple[int, int] | None = None
+        # Session-only sidecar binding.  This is intentionally not persisted
+        # in the store; it tracks the file used by Save/Load during this UI
+        # session.
+        self._proof_sidecar_path: Path | None = None
         self._proof_target_zyx: tuple[float, float, float] | None = None
         self._proof_target_volume_index: int | None = None
         self._proof_target_context: tuple[int, int, int] | None = None
@@ -231,6 +242,8 @@ class NeuronAnnotatorWidget(QWidget):
         # Initial spin-box values are defaults, not an unapplied user draft.
         self._proof_size_draft_dirty = False
         self._proof_size_draft_target = None
+        self._proof_sidecar_path = None
+        self._update_proof_path_display()
         self.proofreading_toggle.setEnabled(False)
         self._connect_viewer_events()
         self._bind_keys()
@@ -485,38 +498,65 @@ class NeuronAnnotatorWidget(QWidget):
         sizes.setColumnStretch(5, 1)
         layout.addLayout(sizes)
 
+        apply_row = QHBoxLayout()
+        self.proof_apply_size_btn = QPushButton("Apply current t")
+        self.proof_apply_size_btn.clicked.connect(self._proof_apply_size)
+        apply_row.addWidget(self.proof_apply_size_btn)
+        self.proof_apply_all_size_btn = QPushButton("Apply to all existing…")
+        self.proof_apply_all_size_btn.clicked.connect(self._proof_apply_size_all)
+        # Keep a descriptive compatibility alias for tests/integrations that
+        # refer to the action by scope rather than size semantics.
+        self.proof_apply_size_all_btn = self.proof_apply_all_size_btn
+        apply_row.addWidget(self.proof_apply_all_size_btn)
+        layout.addLayout(apply_row)
+
         self.proof_current_box_label = QLabel("No active neuron")
         self.proof_current_box_label.setWordWrap(True)
         self.proof_current_box_label.setObjectName("proofCurrentBoxLabel")
         layout.addWidget(self.proof_current_box_label)
 
-        self.proof_apply_size_btn = QPushButton("Apply size")
-        self.proof_apply_size_btn.clicked.connect(self._proof_apply_size)
-        layout.addWidget(self.proof_apply_size_btn)
-
-        io_row = QHBoxLayout()
-        self.proof_save_btn = QPushButton("Save proof edits")
-        self.proof_load_btn = QPushButton("Load proof edits")
-        self.proof_discard_btn = QPushButton("Discard edits")
+        io_group = QGroupBox("Proof edits")
+        io_layout = QVBoxLayout()
+        self.proof_sidecar_path_input = QLineEdit()
+        self.proof_sidecar_path_input.setReadOnly(True)
+        self.proof_sidecar_path_input.setPlaceholderText("No sidecar selected")
+        self.proof_sidecar_path_input.setToolTip("No sidecar selected")
+        io_layout.addWidget(self.proof_sidecar_path_input)
+        io_row = QGridLayout()
+        self.proof_save_btn = QPushButton("Save edits")
+        self.proof_save_as_btn = QPushButton("Save As…")
+        self.proof_load_btn = QPushButton("Load…")
+        self.proof_discard_btn = QPushButton("Discard unsaved")
         self.proof_save_btn.clicked.connect(self.save_proof_edits)
+        self.proof_save_as_btn.clicked.connect(self.save_proof_edits_as)
         self.proof_load_btn.clicked.connect(self.load_proof_edits)
         self.proof_discard_btn.clicked.connect(self.discard_proof_edits)
-        io_row.addWidget(self.proof_save_btn)
-        io_row.addWidget(self.proof_load_btn)
-        io_row.addWidget(self.proof_discard_btn)
-        layout.addLayout(io_row)
+        io_row.addWidget(self.proof_save_btn, 0, 0)
+        io_row.addWidget(self.proof_save_as_btn, 0, 1)
+        io_row.addWidget(self.proof_load_btn, 1, 0)
+        io_row.addWidget(self.proof_discard_btn, 1, 1)
+        io_layout.addLayout(io_row)
+        io_group.setLayout(io_layout)
+        layout.addWidget(io_group)
 
-        export_row = QHBoxLayout()
+        output_group = QGroupBox("Output")
+        output_layout = QVBoxLayout()
         self.proof_export_btn = QPushButton("Export corrected NPY")
-        self.proof_delete_all_btn = QPushButton("Delete active neuron (all volumes)")
-        self.proof_retire_btn = QPushButton("Retire added neuron")
         self.proof_export_btn.clicked.connect(self.export_corrected_npy)
+        output_layout.addWidget(self.proof_export_btn)
+        output_group.setLayout(output_layout)
+        layout.addWidget(output_group)
+
+        actions_group = QGroupBox("Neuron actions")
+        actions_layout = QVBoxLayout()
+        self.proof_delete_all_btn = QPushButton("Remove all observations…")
+        self.proof_retire_btn = QPushButton("Retire added neuron…")
         self.proof_delete_all_btn.clicked.connect(self._proof_delete_all)
         self.proof_retire_btn.clicked.connect(self._proof_retire_added_neuron)
-        export_row.addWidget(self.proof_export_btn)
-        export_row.addWidget(self.proof_delete_all_btn)
-        layout.addLayout(export_row)
-        layout.addWidget(self.proof_retire_btn)
+        actions_layout.addWidget(self.proof_delete_all_btn)
+        actions_layout.addWidget(self.proof_retire_btn)
+        actions_group.setLayout(actions_layout)
+        layout.addWidget(actions_group)
 
         self.proof_help_label = QLabel(
             "Click to lock target · F7 delete · F8 place · F9 add · F12 exit"
@@ -559,6 +599,7 @@ class NeuronAnnotatorWidget(QWidget):
     def _set_proofreading_controls_enabled(self, enabled: bool) -> None:
         for control in (
             self.proof_apply_size_btn,
+            self.proof_apply_all_size_btn,
             self.proof_delete_all_btn,
             self.proof_retire_btn,
             self.proof_width_spin,
@@ -569,11 +610,63 @@ class NeuronAnnotatorWidget(QWidget):
         session_available = self.proofread_store is not None
         for control in (
             self.proof_save_btn,
+            self.proof_save_as_btn,
             self.proof_load_btn,
             self.proof_discard_btn,
             self.proof_export_btn,
         ):
             control.setEnabled(session_available)
+        self._update_proof_action_state()
+
+    def _update_proof_action_state(self) -> None:
+        """Refresh proofreading button emphasis from store/draft state."""
+        store = self.proofread_store
+        store_dirty = bool(store is not None and store.dirty)
+        draft_dirty = bool(self._proof_size_draft_dirty)
+        if hasattr(self, "proof_save_btn"):
+            self.proof_save_btn.setText("Save edits *" if store_dirty else "Save edits")
+            font = self.proof_save_btn.font()
+            font.setBold(store_dirty)
+            self.proof_save_btn.setFont(font)
+            self.proof_save_btn.setEnabled(store is not None and (store_dirty or draft_dirty))
+        if hasattr(self, "proof_save_as_btn"):
+            self.proof_save_as_btn.setEnabled(store is not None)
+        if hasattr(self, "proof_discard_btn"):
+            self.proof_discard_btn.setEnabled(store is not None and (store_dirty or draft_dirty))
+        if hasattr(self, "proof_apply_size_btn"):
+            can_apply = False
+            can_apply_all = False
+            target = self._proof_size_draft_target
+            if (
+                self.proofreading_enabled
+                and store is not None
+                and self._proof_size_draft_dirty
+                and target is not None
+            ):
+                try:
+                    box = store.resolve(*target)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    box = None
+                size = self._proof_draft_size()
+                can_apply = box is not None and tuple(float(v) for v in box.size_zyx) != size
+                # All-existing is independent of whether the draft owner's
+                # current observation exists; it may legitimately update
+                # boxes at other volumes while leaving this one missing.
+                for volume in range(store.raw_T):
+                    with suppress(
+                        AttributeError, TypeError, ValueError, RuntimeError
+                    ):
+                        if store.resolve(volume, target[1]) is not None:
+                            can_apply_all = True
+                            break
+            self.proof_apply_size_btn.setText(
+                "Apply current t *" if draft_dirty else "Apply current t"
+            )
+            apply_font = self.proof_apply_size_btn.font()
+            apply_font.setBold(draft_dirty)
+            self.proof_apply_size_btn.setFont(apply_font)
+            self.proof_apply_size_btn.setEnabled(can_apply)
+            self.proof_apply_all_size_btn.setEnabled(can_apply_all)
 
     def _set_proofreading_enabled(self, enabled: bool) -> None:
         requested = bool(enabled)
@@ -916,27 +1009,41 @@ class NeuronAnnotatorWidget(QWidget):
         try:
             if store is not None:
                 box = store.resolve(volume_index, active_id)
-                modified = (volume_index, active_id) in store.modified_observations
             elif self.roi_dataset is not None:
                 box = self.roi_dataset.get_box(self._viewer_time(), active_id)
-                modified = False
             else:
                 box = None
-                modified = False
         except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
             # A transient Image/ROI transition can invalidate the target
             # between the volume lookup and store resolution.  Keep the UI
             # informative instead of allowing a Qt callback to fail.
             box = None
-            modified = False
 
         if box is None:
-            marker = " (modified)" if modified else ""
-            label.setText(f"Neuron {active_id}{marker}: no box, t={viewer_t}")
+            marker = ""
+            if store is not None and volume_index is not None:
+                with suppress(Exception):
+                    status = store.classify_observation(volume_index, active_id)
+                    if status:
+                        marker = f" ({status})"
+            draft_hint = ""
+            if (
+                self._proof_size_draft_dirty
+                and self._proof_size_draft_target == (volume_index, active_id)
+            ):
+                draft_hint = " · Unapplied size draft — F8 will use it"
+            label.setText(
+                f"Neuron {active_id}{marker}: no box, t={viewer_t}{draft_hint}"
+            )
             return
 
         z, y, x = (float(value) for value in box.center_zyx)
-        marker = " (modified)" if modified else ""
+        marker = ""
+        if store is not None and volume_index is not None:
+            with suppress(Exception):
+                status = store.classify_observation(volume_index, active_id)
+                if status:
+                    marker = f" ({status})"
         text = (
             f"Neuron {active_id}{marker}: "
             f"center (x={x:.2f}, y={y:.2f}, z={z:.2f}), t={viewer_t}"
@@ -948,10 +1055,31 @@ class NeuronAnnotatorWidget(QWidget):
         volume_index = self._current_volume_index()
         if self.active_id is None or volume_index is None:
             return
-        self._proof_size_draft_dirty = True
-        self._proof_size_draft_target = (volume_index, self.active_id)
+        size = self._proof_draft_size()
+        baseline: tuple[float, float, float] | None = None
+        store = self.proofread_store
+        if store is not None:
+            with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+                box = store.resolve(volume_index, self.active_id)
+                baseline = (
+                    tuple(float(v) for v in box.size_zyx)
+                    if box is not None
+                    else tuple(
+                        float(v)
+                        for v in store.size_for_placement(
+                            self.active_id, volume_index
+                        )
+                    )
+                )
+        if baseline is not None and size == baseline:
+            self._proof_size_draft_dirty = False
+            self._proof_size_draft_target = None
+        else:
+            self._proof_size_draft_dirty = True
+            self._proof_size_draft_target = (volume_index, self.active_id)
         if hasattr(self, "info_text"):
             self._update_info()
+        self._update_proof_action_state()
 
     def _update_proof_size_controls(self) -> None:
         self._update_proof_current_box_status()
@@ -998,6 +1126,7 @@ class NeuronAnnotatorWidget(QWidget):
             not self.proofreading_enabled
             or not self._proof_interaction_allowed()
             or target_id is None
+            or draft_target is None
         ):
             return
         store = self.proofread_store
@@ -1008,16 +1137,67 @@ class NeuronAnnotatorWidget(QWidget):
             self.update_status("Box dimensions must be positive", "orange")
             return
         try:
-            store.apply_size(target_id, size)
+            store.apply_size_at_volume_index(draft_target[0], target_id, size)
         except (AttributeError, TypeError, ValueError, RuntimeError) as error:
             self.update_status(f"Could not apply size: {error}", "red")
             return
         self._proof_size_draft_dirty = False
         self._proof_size_draft_target = None
-        self._refresh_available_ids(select_first=False)
-        self._refresh_roi_layers()
-        self._update_proof_current_box_status()
+        self._refresh_after_proof_edit()
         self.update_status(f"Applied size to neuron {target_id}", "green")
+
+    def _proof_apply_size_all(self) -> None:
+        """Apply the visible draft size to every existing observation."""
+        target = self._proof_size_draft_target
+        store = self.proofread_store
+        if (
+            not self.proofreading_enabled
+            or not self._proof_interaction_allowed()
+            or store is None
+            or target is None
+        ):
+            return
+        neuron_id = int(target[1])
+        size = self._proof_draft_size()
+        existing: list[int] = []
+        changed: list[int] = []
+        for volume in range(store.raw_T):
+            with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+                box = store.resolve(volume, neuron_id)
+                if box is not None:
+                    existing.append(volume)
+                    if tuple(float(v) for v in box.size_zyx) != size:
+                        changed.append(volume)
+        answer = QMessageBox.question(
+            self,
+            "Apply size to all existing observations",
+            f"Neuron {neuron_id}: {len(existing)} existing observations; "
+            f"{len(changed)} will change. Centers and missing observations remain unchanged.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if not changed:
+            # Keep a canonical no-op: do not create a placement template or
+            # mark the store dirty when every existing box already has this
+            # size.
+            self._proof_size_draft_dirty = False
+            self._proof_size_draft_target = None
+            self._update_proof_action_state()
+            self.update_status("All existing observations already use this size", "green")
+            return
+        try:
+            store.apply_size_to_all_existing(neuron_id, size)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+            self.update_status(f"Could not apply size: {error}", "red")
+            return
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self._refresh_after_proof_edit()
+        self.update_status(f"Applied size to {len(changed)} observations", "green")
+
+    _proof_apply_size_to_all_existing = _proof_apply_size_all
 
     def _confirm_proof_size_draft(self, action: str) -> bool:
         """Resolve an unapplied size before changing its neuron/volume target."""
@@ -1027,8 +1207,20 @@ class NeuronAnnotatorWidget(QWidget):
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Warning)
         dialog.setWindowTitle("Unapplied box size")
-        dialog.setText(f"Apply the current size draft before {action}?")
-        apply_button = dialog.addButton("Apply", QMessageBox.AcceptRole)
+        has_box = False
+        if self.proofread_store is not None and target is not None:
+            with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+                has_box = self.proofread_store.resolve(*target) is not None
+        if has_box:
+            dialog.setText(f"Resolve the current size draft before {action}.")
+            apply_button = dialog.addButton(
+                "Apply current t", QMessageBox.AcceptRole
+            )
+        else:
+            dialog.setText(
+                f"The draft target has no box. Discard the size draft before {action}?"
+            )
+            apply_button = None
         discard_button = dialog.addButton(
             "Discard draft", QMessageBox.DestructiveRole
         )
@@ -1038,12 +1230,20 @@ class NeuronAnnotatorWidget(QWidget):
         clicked = dialog.clickedButton()
         if clicked is cancel_button or clicked is None:
             return False
-        if clicked is apply_button:
+        if apply_button is not None and clicked is apply_button:
             if self.proofread_store is None or target is None:
                 self.update_status("The size draft has no valid target", "red")
                 return False
             try:
-                self.proofread_store.apply_size(target[1], self._proof_draft_size())
+                if self.proofread_store.resolve(*target) is None:
+                    self.update_status(
+                        "Current observation is missing; discard the draft or place it with F8",
+                        "orange",
+                    )
+                    return False
+                self.proofread_store.apply_size_at_volume_index(
+                    target[0], target[1], self._proof_draft_size()
+                )
             except (TypeError, ValueError, RuntimeError) as error:
                 self.update_status(f"Could not apply size: {error}", "red")
                 return False
@@ -1051,6 +1251,7 @@ class NeuronAnnotatorWidget(QWidget):
             return False
         self._proof_size_draft_dirty = False
         self._proof_size_draft_target = None
+        self._update_proof_action_state()
         return True
 
     def _proof_delete_current(self) -> None:
@@ -1059,6 +1260,8 @@ class NeuronAnnotatorWidget(QWidget):
             or not self._proof_interaction_allowed()
             or self.active_id is None
         ):
+            return
+        if not self._confirm_proof_size_draft("deleting the current observation"):
             return
         volume_index = self._current_volume_index()
         if volume_index is None:
@@ -1090,10 +1293,27 @@ class NeuronAnnotatorWidget(QWidget):
                 "orange",
             )
             return
+        # A size draft belongs to one exact (volume, neuron) owner.  Do not
+        # consume it, or accidentally place another target, after an external
+        # active-neuron/time transition.
+        if (
+            self._proof_size_draft_dirty
+            and self._proof_size_draft_target != (volume_index, self.active_id)
+        ):
+            self.update_status("Size draft belongs to another observation", "orange")
+            return
         if self._proof_resolve(volume_index, self.active_id) is not None:
             self.update_status("Current observation exists; F8 did nothing", "orange")
             return
-        size = self._proof_placement_size(self.active_id, volume_index)
+        draft_matches = bool(
+            self._proof_size_draft_dirty
+            and self._proof_size_draft_target == (volume_index, self.active_id)
+        )
+        size = (
+            self._proof_draft_size()
+            if draft_matches
+            else self._proof_placement_size(self.active_id, volume_index)
+        )
         try:
             self.proofread_store.set_observation_present(
                 volume_index,
@@ -1110,6 +1330,9 @@ class NeuronAnnotatorWidget(QWidget):
         except (AttributeError, ValueError, RuntimeError) as error:
             self.update_status(f"Could not place observation: {error}", "red")
             return
+        if draft_matches:
+            self._proof_size_draft_dirty = False
+            self._proof_size_draft_target = None
         self._clear_proof_target()
         self._refresh_after_proof_edit()
         self.update_status("Placed center at locked target", "green")
@@ -1151,6 +1374,9 @@ class NeuronAnnotatorWidget(QWidget):
         self.update_status(f"Added neuron {self.active_id}", "green")
 
     def _proof_cancel_or_exit(self) -> None:
+        # F12 is the explicit discard-and-exit shortcut.  Other transitions
+        # resolve drafts through ``_confirm_proof_size_draft`` before calling
+        # this helper; they may preserve the owner around that resolution.
         self._proof_size_draft_dirty = False
         self._proof_size_draft_target = None
         self.proofreading_toggle.blockSignals(True)
@@ -1177,6 +1403,8 @@ class NeuronAnnotatorWidget(QWidget):
             or self.active_id is None
             or self.proofread_store is None
         ):
+            return
+        if not self._confirm_proof_size_draft("removing all observations"):
             return
         answer = QMessageBox.question(
             self,
@@ -1240,10 +1468,26 @@ class NeuronAnnotatorWidget(QWidget):
         self._refresh_roi_layers()
         self._update_proof_size_controls()
         self._update_info()
+        self._update_proof_action_state()
 
     def save_proof_edits(self) -> None:
         store = self.proofread_store
         if store is None:
+            return
+        # Resolve a draft before persistence; a geometry-free draft is never
+        # serialized.  If no sidecar is bound, this is equivalent to Save As.
+        if self._proof_size_draft_dirty and not self._confirm_proof_size_draft("saving proof edits"):
+            return
+        path = str(self._proof_sidecar_path) if self._proof_sidecar_path else ""
+        if not path:
+            return self.save_proof_edits_as()
+        self._save_proof_to_path(path)
+
+    def save_proof_edits_as(self) -> None:
+        store = self.proofread_store
+        if store is None:
+            return
+        if self._proof_size_draft_dirty and not self._confirm_proof_size_draft("saving proof edits"):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save proof edits", self._proof_default_path(),
@@ -1251,37 +1495,40 @@ class NeuronAnnotatorWidget(QWidget):
         )
         if not path:
             return
+        self._save_proof_to_path(path)
+
+    def _save_proof_to_path(self, path: str) -> bool:
+        store = self.proofread_store
+        if store is None:
+            return False
         try:
             store.save(path)
         except (OSError, PermissionError, ValueError, RuntimeError) as error:
             self.update_status(f"Proof save failed: {error}", "red")
-            return
+            return False
+        self._proof_sidecar_path = Path(path)
+        self._update_proof_path_display()
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
         self.update_status(f"Saved proof edits: {Path(path).name}", "green")
+        return True
 
     def _save_proof_edits_for_transition(self) -> bool:
         """Save pending proof edits and report whether a transition may run."""
         store = self.proofread_store
         if store is None or not store.dirty:
             return True
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save proof edits",
-            self._proof_default_path(),
-            "Proof sidecar (*.json);;All files (*)",
-        )
+        path = str(self._proof_sidecar_path) if self._proof_sidecar_path else ""
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save proof edits",
+                self._proof_default_path(),
+                "Proof sidecar (*.json);;All files (*)",
+            )
         if not path:
             return False
-        try:
-            store.save(path)
-        except (OSError, PermissionError, ValueError, RuntimeError) as error:
-            self.update_status(f"Proof save failed: {error}", "red")
-            return False
-        self._refresh_available_ids(select_first=False)
-        self._refresh_after_proof_edit()
-        self.update_status(f"Saved proof edits: {Path(path).name}", "green")
-        return True
+        return self._save_proof_to_path(path)
 
     def _confirm_proof_transition(self, action: str) -> bool:
         """Resolve draft/dirty state before discarding the current session."""
@@ -1318,6 +1565,8 @@ class NeuronAnnotatorWidget(QWidget):
         )
         if not path:
             return
+        requested_path = Path(path)
+        bound_path_before_transition = self._proof_sidecar_path
         try:
             loaded = store_type(
                 self.roi_dataset,
@@ -1326,12 +1575,58 @@ class NeuronAnnotatorWidget(QWidget):
                 ),
             )
             loaded.load(path)
-        except (OSError, PermissionError, ValueError, RuntimeError, TypeError) as error:
+        except (
+            AttributeError,
+            OSError,
+            PermissionError,
+            ValueError,
+            RuntimeError,
+            TypeError,
+        ) as error:
             self.update_status(f"Proof load failed: {error}", "red")
             return
         if not self._confirm_proof_transition("loading another proof sidecar"):
             return
+        # A Save chosen during the dirty transition may have overwritten the
+        # same file that was staged above.  Re-read it so Load never swaps in
+        # stale pre-transition state.
+        same_bound_path = False
+        bound_path_after_transition = self._proof_sidecar_path
+        for bound_path in (
+            bound_path_before_transition,
+            bound_path_after_transition,
+        ):
+            if bound_path is None:
+                continue
+            with suppress(OSError, ValueError):
+                same_bound_path = (
+                    requested_path.resolve()
+                    == bound_path.resolve()
+                )
+            if same_bound_path:
+                break
+        if same_bound_path:
+            try:
+                loaded = store_type(
+                    self.roi_dataset,
+                    image_signature=self._proof_image_signature(
+                        self.current_image
+                    ),
+                )
+                loaded.load(path)
+            except (
+                AttributeError,
+                OSError,
+                PermissionError,
+                ValueError,
+                RuntimeError,
+                TypeError,
+            ) as error:
+                self.update_status(f"Proof load failed: {error}", "red")
+                return
         self.proofread_store = loaded
+        self._proof_sidecar_path = Path(path)
+        self._update_proof_path_display()
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
         self.update_status(f"Loaded proof edits: {Path(path).name}", "green")
@@ -1345,6 +1640,8 @@ class NeuronAnnotatorWidget(QWidget):
         except (AttributeError, RuntimeError, ValueError) as error:
             self.update_status(f"Could not discard proof edits: {error}", "red")
             return
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
         self.update_status("Discarded unsaved proof edits", "green")
@@ -1352,6 +1649,10 @@ class NeuronAnnotatorWidget(QWidget):
     def export_corrected_npy(self) -> None:
         store = self.proofread_store
         if store is None:
+            return
+        if self._proof_size_draft_dirty and not self._confirm_proof_size_draft(
+            "exporting corrected NPY"
+        ):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export corrected NPY", "", "NumPy arrays (*.npy);;All files (*)"
@@ -1366,9 +1667,28 @@ class NeuronAnnotatorWidget(QWidget):
         self.update_status(f"Exported corrected NPY: {Path(path).name}", "green")
 
     def _proof_default_path(self) -> str:
+        if self._proof_sidecar_path is not None:
+            return str(self._proof_sidecar_path)
         if self.roi_dataset is not None and getattr(self.roi_dataset, "path", None):
             return str(Path(self.roi_dataset.path).with_suffix(".proofread.json"))
         return ""
+
+    def _update_proof_path_display(self) -> None:
+        field = getattr(self, "proof_sidecar_path_input", None)
+        if field is None:
+            return
+        full_path = (
+            "" if self._proof_sidecar_path is None else str(self._proof_sidecar_path)
+        )
+        # Keep the complete path available in the tooltip while avoiding a
+        # wide, horizontally scrolling editor in the narrow dock.
+        display_path = QFontMetrics(field.font()).elidedText(
+            full_path,
+            Qt.TextElideMode.ElideMiddle,
+            360,
+        )
+        field.setText(display_path)
+        field.setToolTip(full_path or "No sidecar selected")
 
     def _build_selection_group(self) -> QGroupBox:
         group = QGroupBox("Neuron Selection")
@@ -1949,6 +2269,8 @@ class NeuronAnnotatorWidget(QWidget):
                     self.roi_dataset,
                     image_signature=self._proof_image_signature(source),
                 )
+                self._proof_sidecar_path = None
+                self._update_proof_path_display()
         self.load_roi_btn.setEnabled(
             source is not None and self.roi_dataset is None
         )
@@ -2452,6 +2774,8 @@ class NeuronAnnotatorWidget(QWidget):
         self._disconnect_current_image_events()
         self.current_image = None
         self._remove_roi_layers()
+        self._proof_sidecar_path = None
+        self._update_proof_path_display()
         return True
 
     # ------------------------------------------------------------------
@@ -2552,6 +2876,9 @@ class NeuronAnnotatorWidget(QWidget):
             text += f" · {biological_name}"
         if self.roi_dataset is not None and not valid_at_time:
             text += " (missing)"
+        status = self._proof_observation_status(display_id)
+        if status:
+            text += f" ({status})"
         item.setText(1, text)
         item.setCheckState(
             0,
@@ -2576,6 +2903,31 @@ class NeuronAnnotatorWidget(QWidget):
             brush = QBrush()
         item.setBackground(0, brush)
         item.setBackground(1, brush)
+
+    def _proof_neuron_status(self, neuron_id: int) -> str | None:
+        store = self.proofread_store
+        if store is None:
+            return None
+        with suppress(Exception):
+            statuses = set(store.classify_neuron(neuron_id))
+            if "moved + resized" in statuses:
+                return "moved + resized"
+            if "moved" in statuses and "resized" in statuses:
+                return "moved + resized"
+            for name in ("moved", "resized", "placed", "deleted", "added"):
+                if name in statuses:
+                    return name
+        return None
+
+    def _proof_observation_status(self, neuron_id: int) -> str | None:
+        """Return the status for this ID only at the current observation."""
+        store = self.proofread_store
+        volume_index = self._current_volume_index()
+        if store is None or volume_index is None:
+            return None
+        with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+            return store.classify_observation(volume_index, neuron_id)
+        return None
 
     def _on_search_text_changed(self, text: str) -> None:
         del text
@@ -2942,6 +3294,8 @@ class NeuronAnnotatorWidget(QWidget):
             self._clear_proof_target()
 
         self.roi_dataset = dataset
+        self._proof_sidecar_path = None
+        self._update_proof_path_display()
         self.proofread_store = (
             ProofreadStore(
                 dataset,
@@ -2977,6 +3331,8 @@ class NeuronAnnotatorWidget(QWidget):
             self._remove_proof_mouse_callback()
             self._clear_proof_target()
         self.proofread_store = None
+        self._proof_sidecar_path = None
+        self._update_proof_path_display()
         self.roi_dataset = None
         self.roi_path_input.clear()
         self.unload_roi_btn.setEnabled(False)
@@ -3800,14 +4156,18 @@ class NeuronAnnotatorWidget(QWidget):
             proof_mode = "On" if self.proofreading_enabled else "Off"
             if self._proof_detached:
                 proof_mode += " (paused)"
+            moved = len(getattr(store, "center_changed_observations", ()))
+            resized = len(getattr(store, "size_changed_observations", ()))
+            presence = len(getattr(store, "presence_changed_observations", ()))
             text += (
                 f"\nProof: {proof_mode}; "
                 f"dirty={'yes' if store.dirty else 'no'}; "
-                f"modified={len(store.modified_observations)} observations/"
-                f"{len(store.modified_ids)} neurons"
+                f"moved={moved}; resized={resized}; presence={presence}"
             )
             if self._proof_size_draft_dirty:
-                text += "; size draft"
+                text += "; Unapplied size draft — F8 will use it"
+            if store.dirty:
+                text += "; Unsaved proof edits"
         active_range = self._active_z_range()
         if self._z_ranges:
             z_view = (

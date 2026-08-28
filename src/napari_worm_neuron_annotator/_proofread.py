@@ -23,7 +23,11 @@ import numpy as np
 
 from ._roi import NeuronBox, NeuronBoxDataset
 
-SCHEMA_VERSION = 1
+# Sidecars written by this module use schema v2.  The reader deliberately
+# keeps accepting v1 files; v1 records did not carry the derived
+# ``changed_fields`` list and are upgraded in memory on load.
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 PRESENT = "present"
 DELETED = "deleted"
 RAW = "raw"
@@ -140,7 +144,11 @@ def _box_to_json(box: NeuronBox) -> dict[str, Any]:
 
 
 def _patch_to_json(
-    volume_index: int, neuron_id: int, patch: ObservationPatch
+    volume_index: int,
+    neuron_id: int,
+    patch: ObservationPatch,
+    *,
+    changed_fields: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "volume_index": int(volume_index),
@@ -154,7 +162,29 @@ def _patch_to_json(
         record["restore_size_zyx"] = [
             float(v) for v in patch.restore_size_zyx
         ]
+    if changed_fields is not None:
+        record["changed_fields"] = list(changed_fields)
     return record
+
+
+_CHANGED_FIELD_ORDER = ("presence", "center_zyx", "size_zyx")
+_CHANGED_FIELDS = frozenset(_CHANGED_FIELD_ORDER)
+
+
+def _ordered_changed_fields(value: Any) -> tuple[str, ...]:
+    """Validate and canonicalize a v2 ``changed_fields`` list."""
+    if not isinstance(value, list) or not value:
+        raise SidecarError("changed_fields must be a non-empty list")
+    if any(not isinstance(item, str) for item in value):
+        raise SidecarError("changed_fields entries must be strings")
+    if len(set(value)) != len(value):
+        raise SidecarError("changed_fields must not contain duplicates")
+    if any(item not in _CHANGED_FIELDS for item in value):
+        raise SidecarError("unknown changed_fields entry")
+    expected_order = [item for item in _CHANGED_FIELD_ORDER if item in value]
+    if value != expected_order:
+        raise SidecarError("changed_fields are not in canonical order")
+    return tuple(value)
 
 
 def _reject_json_constants(value: str) -> Any:
@@ -234,6 +264,7 @@ class ProofreadStore:
         self.provisional_added_ids: set[int] = set()
         self.retired_ids: set[int] = set()
         self._next_neuron_id = self.dataset.raw_N
+        self._bound_sidecar_path: Path | None = None
         self._saved_snapshot = self._canonical_state()
 
     # ------------------------------------------------------------------
@@ -528,6 +559,58 @@ class ProofreadStore:
             )
         return size
 
+    def apply_size_at_volume_index(
+        self,
+        volume_index: int,
+        neuron_id: int,
+        size_zyx: Any,
+    ) -> tuple[float, float, float]:
+        """Apply a size to one existing observation.
+
+        The observation must currently resolve to a box.  Its center is
+        copied verbatim and no placement template or other volume is changed.
+        ``set_observation_present`` performs the normal canonicalization, so
+        restoring both raw center and size removes a redundant patch.
+        """
+        volume_index = self._check_volume(volume_index)
+        neuron_id = self._check_id(neuron_id)
+        size = _validate_size(size_zyx)
+        box = self.resolve(volume_index, neuron_id)
+        if box is None:
+            raise ValueError(
+                f"observation ({volume_index}, {neuron_id}) is missing"
+            )
+        self.set_observation_present(
+            volume_index,
+            neuron_id,
+            center_zyx=box.center_zyx,
+            size_zyx=size,
+        )
+        return size
+
+    def apply_size_to_all_existing(
+        self, neuron_id: int, size_zyx: Any
+    ) -> tuple[float, float, float]:
+        """Apply a size to existing observations, preserving legacy scope.
+
+        The explicit all-existing operation keeps the historical placement
+        template update, but avoids introducing metadata when every existing
+        observation already has the requested size (a canonical no-op).
+        """
+        neuron_id = self._check_id(neuron_id)
+        size = _validate_size(size_zyx)
+        boxes = [
+            self.resolve(volume_index, neuron_id)
+            for volume_index in range(self.raw_T)
+        ]
+        if (
+            all(box is None or box.size_zyx == size for box in boxes)
+            and neuron_id in self.placement_size
+            and self.placement_size[neuron_id] == size
+        ):
+            return size
+        return self.apply_size(neuron_id, size)
+
     # ------------------------------------------------------------------
     # Derived status and snapshots
     # ------------------------------------------------------------------
@@ -554,6 +637,160 @@ class ProofreadStore:
     @property
     def modified_ids(self) -> set[int]:
         return {neuron_id for _, neuron_id in self.modified_observations}
+
+    def _changed_fields_for_patch(
+        self,
+        volume_index: int,
+        neuron_id: int,
+        patch: ObservationPatch,
+        *,
+        delete_all_ids: set[int] | None = None,
+    ) -> tuple[str, ...]:
+        """Derive v2's field list from raw geometry and a complete patch.
+
+        The list is metadata only; resolution and NPY export continue to use
+        the complete patch box.  Exact tuple equality is intentional here and
+        matches the canonical redundant-patch normalization rules.
+        """
+        raw_box = self._raw_box(volume_index, neuron_id)
+        markers = (
+            self.delete_all_ids
+            if delete_all_ids is None
+            else delete_all_ids
+        )
+        if patch.state == DELETED:
+            return ("presence",)
+        assert patch.box is not None
+        if raw_box is None:
+            return ("presence",)
+        fields: list[str] = []
+        if neuron_id in markers:
+            fields.append("presence")
+        if patch.box.center_zyx != raw_box.center_zyx:
+            fields.append("center_zyx")
+        if patch.box.size_zyx != raw_box.size_zyx:
+            fields.append("size_zyx")
+        # An exact raw restore is not a real change.  Canonical mutators remove
+        # such patches; returning an empty tuple here lets v2 validation reject
+        # hand-written redundant records instead of mislabelling them as
+        # ``placed``.
+        return tuple(fields)
+
+    def changed_fields_for_observation(
+        self, volume_index: int, neuron_id: int
+    ) -> tuple[str, ...]:
+        """Return the canonical v2 field list for one observation."""
+        volume_index = self._check_volume(volume_index)
+        neuron_id = self._check_id(neuron_id)
+        patch = self.observation_patches.get((volume_index, neuron_id))
+        if patch is not None:
+            return self._changed_fields_for_patch(volume_index, neuron_id, patch)
+        if (
+            neuron_id in self.delete_all_ids
+            and self._raw_box(volume_index, neuron_id) is not None
+        ):
+            return ("presence",)
+        return ()
+
+    # ``observation_change_fields`` is a convenient mapping for UI and
+    # downstream consumers; the method above remains useful for point lookup.
+    @property
+    def observation_change_fields(
+        self,
+    ) -> dict[tuple[int, int], tuple[str, ...]]:
+        result: dict[tuple[int, int], tuple[str, ...]] = {}
+        for key, patch in self.observation_patches.items():
+            result[key] = self._changed_fields_for_patch(*key, patch)
+        for neuron_id in self.delete_all_ids:
+            for volume_index in range(self.raw_T):
+                key = (volume_index, neuron_id)
+                if key in result or self._raw_box(volume_index, neuron_id) is None:
+                    continue
+                result[key] = ("presence",)
+        return result
+
+    @property
+    def center_changed_observations(self) -> set[tuple[int, int]]:
+        return {
+            key
+            for key, fields in self.observation_change_fields.items()
+            if "center_zyx" in fields
+        }
+
+    @property
+    def size_changed_observations(self) -> set[tuple[int, int]]:
+        return {
+            key
+            for key, fields in self.observation_change_fields.items()
+            if "size_zyx" in fields
+        }
+
+    @property
+    def presence_changed_observations(self) -> set[tuple[int, int]]:
+        return {
+            key
+            for key, fields in self.observation_change_fields.items()
+            if "presence" in fields
+        }
+
+    # Public/UI-friendly synonyms used by the proofreading panel.
+    moved_observations = property(lambda self: self.center_changed_observations)
+    resized_observations = property(lambda self: self.size_changed_observations)
+    presence_observations = property(
+        lambda self: self.presence_changed_observations
+    )
+    center_observations = property(
+        lambda self: self.center_changed_observations
+    )
+    size_observations = property(lambda self: self.size_changed_observations)
+
+    def classify_observation(self, volume_index: int, neuron_id: int) -> str | None:
+        """Return the UI status label for one modified observation."""
+        volume_index = self._check_volume(volume_index)
+        neuron_id = self._check_id(neuron_id)
+        fields = set(self.changed_fields_for_observation(volume_index, neuron_id))
+        if not fields:
+            return None
+        patch = self.observation_patches.get((volume_index, neuron_id))
+        has_center = "center_zyx" in fields
+        has_size = "size_zyx" in fields
+        # Presence plus geometry (e.g. a Delete-all local restoration) keeps
+        # the meaningful geometry classification; presence alone maps to the
+        # placed/deleted/added labels below.
+        if "presence" in fields and not (has_center or has_size):
+            # A delete-all marker without an explicit per-volume patch is a
+            # presence-only deletion represented by the global operation.
+            if patch is None and neuron_id in self.delete_all_ids:
+                return "deleted"
+            if patch is None:
+                return "placed"
+            if patch.state == DELETED:
+                return "deleted"
+            if neuron_id >= self.raw_N:
+                return "added"
+            return "placed"
+        if has_center and has_size:
+            return "moved + resized"
+        if has_center:
+            return "moved"
+        if has_size:
+            return "resized"
+        return None
+
+    observation_classification = classify_observation
+
+    def classify_neuron(self, neuron_id: int) -> set[str]:
+        """Return distinct UI status labels across an identity's observations."""
+        neuron_id = self._check_id(neuron_id, allow_retired=True)
+        return {
+            status
+            for (volume_index, candidate), _fields in (
+                self.observation_change_fields.items()
+            )
+            if candidate == neuron_id
+            for status in [self.classify_observation(volume_index, candidate)]
+            if status is not None
+        }
 
     def _canonical_state(self) -> dict[str, Any]:
         patches = [
@@ -680,6 +917,38 @@ class ProofreadStore:
         ) + 1 if (
             state["committed_added_ids"] or state["retired_ids"]
         ) else max(self.raw_N, int(state["next_neuron_id"]))
+        # v2 records carry an ordered field classification derived from the
+        # raw geometry and the complete patch.  Keep the box itself as the
+        # sole geometry authority; ``changed_fields`` is descriptive only.
+        v2_patches: list[dict[str, Any]] = []
+        for record in state["observation_patches"]:
+            volume_index = int(record["volume_index"])
+            neuron_id = int(record["neuron_id"])
+            if record["state"] == PRESENT:
+                box_data = record["box"]
+                patch = ObservationPatch.present(
+                    _box_from_parts(
+                        neuron_id,
+                        volume_index,
+                        box_data["center_zyx"],
+                        box_data["size_zyx"],
+                    )
+                )
+            else:
+                patch = ObservationPatch.deleted(record.get("restore_size_zyx"))
+            fields = self._changed_fields_for_patch(volume_index, neuron_id, patch)
+            if not fields:
+                # Drop a redundant PRESENT patch if an external caller placed
+                # a box exactly equal to raw geometry.
+                continue
+            v2_patches.append(
+                _patch_to_json(
+                    volume_index,
+                    neuron_id,
+                    patch,
+                    changed_fields=fields,
+                )
+            )
         return {
             "schema_version": SCHEMA_VERSION,
             "raw": {
@@ -689,7 +958,7 @@ class ProofreadStore:
                 "sha256": self._raw_fingerprint(),
             },
             "image_signature": copy.deepcopy(self.image_signature),
-            "observation_patches": state["observation_patches"],
+            "observation_patches": v2_patches,
             "delete_all_ids": state["delete_all_ids"],
             "placement_size": state["placement_size"],
             "added_neurons": {
@@ -739,12 +1008,15 @@ class ProofreadStore:
                 os.unlink(temporary)
             raise
         self._commit_saved_payload(payload)
+        self._bound_sidecar_path = target
         return target
 
     save_as = save
 
     def _sidecar_path(self, path: str | Path | None) -> Path:
         if path is None:
+            if self._bound_sidecar_path is not None:
+                return self._bound_sidecar_path
             if self.dataset.path is None:
                 raise ValueError(
                     "a sidecar path is required for an in-memory dataset"
@@ -802,6 +1074,7 @@ class ProofreadStore:
         # No mutation has happened before this point.
         self._restore_state(state)
         self._saved_snapshot = self._canonical_state()
+        self._bound_sidecar_path = source
 
     load_sidecar = load
 
@@ -809,8 +1082,9 @@ class ProofreadStore:
         if not isinstance(payload, dict):
             raise SidecarError("sidecar root must be an object")
         schema_version = payload.get("schema_version")
-        if not _is_int(schema_version) or schema_version != SCHEMA_VERSION:
+        if not _is_int(schema_version) or schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             raise SidecarError("unsupported schema_version")
+        is_v2 = int(schema_version) == 2
         _require_fields(
             payload,
             "sidecar root",
@@ -944,13 +1218,24 @@ class ProofreadStore:
                 _require_fields(
                     record,
                     "present patch",
-                    required={"volume_index", "neuron_id", "state", "box"},
+                    required={
+                        "volume_index",
+                        "neuron_id",
+                        "state",
+                        "box",
+                        *( {"changed_fields"} if is_v2 else set() ),
+                    },
                 )
             elif state == DELETED:
                 _require_fields(
                     record,
                     "deleted patch",
-                    required={"volume_index", "neuron_id", "state"},
+                    required={
+                        "volume_index",
+                        "neuron_id",
+                        "state",
+                        *( {"changed_fields"} if is_v2 else set() ),
+                    },
                     optional={"restore_size_zyx"},
                 )
             else:
@@ -985,7 +1270,36 @@ class ProofreadStore:
                 box = _box_from_parts(
                     neuron_id, volume_index, center, size
                 )
-                patches[key] = ObservationPatch.present(box)
+                patch = ObservationPatch.present(box)
+                if is_v2:
+                    fields = _ordered_changed_fields(record.get("changed_fields"))
+                    expected = self._changed_fields_for_patch(
+                        volume_index,
+                        neuron_id,
+                        patch,
+                        delete_all_ids=delete_all_ids,
+                    )
+                    if fields != expected:
+                        raise SidecarError(
+                            "changed_fields do not match raw and patch geometry"
+                        )
+                    if not expected:
+                        raise SidecarError(
+                            "changed_fields do not match raw and patch geometry"
+                        )
+                else:
+                    # v1 had no field metadata.  During migration, silently
+                    # normalize an exact raw restore just as the mutator does
+                    # so the in-memory snapshot contains no redundant patch.
+                    expected = self._changed_fields_for_patch(
+                        volume_index,
+                        neuron_id,
+                        patch,
+                        delete_all_ids=delete_all_ids,
+                    )
+                    if not expected:
+                        continue
+                patches[key] = patch
             elif state == DELETED:
                 if neuron_id in delete_all_ids:
                     raise SidecarError(
@@ -998,7 +1312,20 @@ class ProofreadStore:
                     if "restore_size_zyx" in record
                     else None
                 )
-                patches[key] = ObservationPatch.deleted(restore_size)
+                patch = ObservationPatch.deleted(restore_size)
+                if is_v2:
+                    fields = _ordered_changed_fields(record.get("changed_fields"))
+                    expected = self._changed_fields_for_patch(
+                        volume_index,
+                        neuron_id,
+                        patch,
+                        delete_all_ids=delete_all_ids,
+                    )
+                    if fields != expected:
+                        raise SidecarError(
+                            "changed_fields do not match raw and patch geometry"
+                        )
+                patches[key] = patch
 
         # Retired IDs may remain reserved but cannot be active in markers.
         if delete_all_ids & retired:
@@ -1162,6 +1489,8 @@ __all__ = [
     "DELETED",
     "PRESENT",
     "RAW",
+    "SCHEMA_VERSION",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "ObservationPatch",
     "ProofreadStore",
     "SidecarError",
