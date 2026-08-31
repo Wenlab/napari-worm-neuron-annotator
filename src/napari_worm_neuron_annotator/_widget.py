@@ -2002,7 +2002,11 @@ class NeuronAnnotatorWidget(QWidget):
         order: tuple[int, ...],
         camera: Orientation2D,
     ) -> None:
-        center = tuple(self.viewer.camera.center)
+        current_order = tuple(self.viewer.dims.order)
+        center_by_axis = dict(
+            zip(current_order[-3:], self.viewer.camera.center, strict=True)
+        )
+        center = tuple(center_by_axis[axis] for axis in order[-3:])
         zoom = float(self.viewer.camera.zoom)
         angles = tuple(self.viewer.camera.angles)
         current_step = tuple(self.viewer.dims.current_step)
@@ -3879,7 +3883,14 @@ class NeuronAnnotatorWidget(QWidget):
             else (z, y, x)
         )
         world = self.current_image.data_to_world(point)
-        self.viewer.camera.center = tuple(world[-3:])
+        world_by_viewer_axis = np.asarray(
+            self.viewer.dims.point, dtype=float
+        ).copy()
+        world_by_viewer_axis[-self.current_image.ndim :] = world
+        camera_axes = tuple(self.viewer.dims.order[-3:])
+        self.viewer.camera.center = tuple(
+            world_by_viewer_axis[list(camera_axes)]
+        )
 
     # ------------------------------------------------------------------
     # Annotation and Excel

@@ -165,6 +165,11 @@ def test_orientation_controls_apply_absolute_viewer_transform_and_reset(
 
     assert tuple(viewer.dims.order) == (0, 2, 1)
     assert _camera_orientation2d(viewer) == ("up", "right")
+    assert tuple(viewer.camera.center) == (
+        baseline_center[0],
+        baseline_center[2],
+        baseline_center[1],
+    )
     assert widget.orientation_reset_btn.isEnabled()
 
     widget.flip_horizontal_checkbox.setChecked(True)
@@ -172,7 +177,11 @@ def test_orientation_controls_apply_absolute_viewer_transform_and_reset(
 
     assert tuple(viewer.dims.order) == (0, 2, 1)
     assert _camera_orientation2d(viewer) == ("down", "left")
-    assert tuple(viewer.camera.center) == baseline_center
+    assert tuple(viewer.camera.center) == (
+        baseline_center[0],
+        baseline_center[2],
+        baseline_center[1],
+    )
     assert viewer.camera.zoom == pytest.approx(baseline_zoom)
     assert image.data is image_data
 
@@ -191,6 +200,68 @@ def test_orientation_controls_apply_absolute_viewer_transform_and_reset(
     assert not widget.flip_horizontal_checkbox.isChecked()
     assert not widget.flip_vertical_checkbox.isChecked()
     assert not widget.orientation_reset_btn.isEnabled()
+    assert tuple(viewer.camera.center) == baseline_center
+
+
+@pytest.mark.parametrize("rotation", (90, 270))
+@pytest.mark.parametrize("image_ndim", (3, 4))
+def test_rotation_keeps_and_recenters_active_box(
+    make_napari_viewer, tmp_path, rotation, image_ndim
+):
+    viewer = make_napari_viewer()
+    spatial_shape = (8, 80, 120)
+    spatial_scale = (2.0, 3.0, 5.0)
+    spatial_translate = (7.0, 11.0, 13.0)
+    if image_ndim == 4:
+        image = viewer.add_image(
+            np.zeros((2, *spatial_shape), dtype=np.uint16),
+            scale=(4.0, *spatial_scale),
+            translate=(17.0, *spatial_translate),
+        )
+    else:
+        image = viewer.add_image(
+            np.zeros(spatial_shape, dtype=np.uint16),
+            scale=spatial_scale,
+            translate=spatial_translate,
+        )
+    widget = NeuronAnnotatorWidget(viewer)
+    roi_path = tmp_path / f"rotation-{rotation}-{image_ndim}d.npy"
+    roi = np.array(
+        [[[70.0, 20.0, 15.0, 6.0, 8.0, 5.0]]], dtype=np.float32
+    )
+    np.save(roi_path, roi)
+    widget.load_roi_path(roi_path)
+
+    box = widget.roi_dataset.get_box(0, 0)
+    assert box is not None
+    point = (0, *box.center_zyx) if image_ndim == 4 else box.center_zyx
+    world = np.asarray(image.data_to_world(point), dtype=float)
+
+    def assert_active_is_centered():
+        displayed_axes = tuple(viewer.dims.displayed)
+        np.testing.assert_allclose(
+            np.asarray(viewer.camera.center)[-viewer.dims.ndisplay :],
+            world[list(displayed_axes)],
+        )
+
+    widget.activate_id(0)
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(rotation)
+    )
+    assert tuple(viewer.dims.order[-2:]) == (
+        image_ndim - 1,
+        image_ndim - 2,
+    )
+    assert_active_is_centered()
+
+    viewer.camera.center = (-100.0, -200.0, -300.0)
+    widget.activate_id(0)
+    assert_active_is_centered()
+
+    viewer.dims.ndisplay = 3
+    viewer.camera.center = (-100.0, -200.0, -300.0)
+    widget.activate_id(0)
+    assert_active_is_centered()
 
 
 def test_external_orientation_change_becomes_new_baseline(
@@ -481,8 +552,12 @@ def test_native_yx_transpose_preserves_roi_vectors_points_and_centering(
     widget.activate_id(0)
     box = widget.roi_dataset.get_box(0, 0)
     assert box is not None
-    world = image.data_to_world((0, *box.center_zyx))
-    np.testing.assert_allclose(viewer.camera.center, world[-3:])
+    world = np.asarray(image.data_to_world((0, *box.center_zyx)))
+    displayed_axes = tuple(viewer.dims.displayed)
+    np.testing.assert_allclose(
+        np.asarray(viewer.camera.center)[-viewer.dims.ndisplay :],
+        world[list(displayed_axes)],
+    )
 
     viewer.dims.ndisplay = 3
     assert selected.data.shape == (12, 2, 4)

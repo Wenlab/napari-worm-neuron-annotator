@@ -764,6 +764,50 @@ def test_click_locks_world_to_data_target_and_stable_4d_crosshair(
     _assert_crosshair_geometry(marker, (0, 3, 17, 18))
 
 
+@pytest.mark.parametrize("rotation", (90, 270))
+def test_rotation_preserves_proof_target_and_placed_data_coordinates(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets, rotation
+):
+    scale = (2.0, 3.0, 4.0, 5.0)
+    translate = (11.0, 13.0, 17.0, 19.0)
+    viewer, widget = _make_widget(
+        make_napari_viewer,
+        qtbot,
+        tmp_path,
+        proof_widgets,
+        image_kwargs={"scale": scale, "translate": translate},
+    )
+    image = widget.current_image
+    assert image is not None
+    _enable_proofreading(widget)
+
+    first_world = image.data_to_world((0, 3, 17, 18))
+    _click_world(viewer, *first_world)
+    assert widget._proof_target_zyx == pytest.approx((3, 17, 18))
+
+    widget.orientation_rotation_combo.setCurrentIndex(
+        widget.orientation_rotation_combo.findData(rotation)
+    )
+    QApplication.processEvents()
+
+    assert widget.proofreading_enabled
+    assert widget._proof_target_zyx == pytest.approx((3, 17, 18))
+    marker = _proof_target_layer(viewer)
+    assert marker is not None
+    _assert_crosshair_geometry(marker, (0, 3, 17, 18))
+
+    second_world = image.data_to_world((0, 3, 21, 22))
+    _click_world(viewer, *second_world)
+    assert widget._proof_target_zyx == pytest.approx((3, 21, 22))
+    _assert_crosshair_geometry(marker, (0, 3, 21, 22))
+
+    _press_proof_key(qtbot, widget, Qt.Key_F7)
+    _press_proof_key(qtbot, widget, Qt.Key_F8)
+    restored = widget.proofread_store.resolve(1, 0)
+    assert restored.center_zyx == pytest.approx((3, 21, 22))
+    assert restored.size_zyx == pytest.approx((3, 7, 7))
+
+
 def test_click_replaces_target_but_invalid_clicks_and_drag_do_not(
     make_napari_viewer, qtbot, tmp_path, proof_widgets
 ):
