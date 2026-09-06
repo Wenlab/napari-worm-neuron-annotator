@@ -432,6 +432,7 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     assert not widget.selection_tree.alternatingRowColors()
     assert widget.navigation_help_label.text() == "Q/W: last/next"
     assert "Shift+Q/W" in widget.navigation_help_label.toolTip()
+    assert "F10" in widget.navigation_help_label.toolTip()
     assert [
         widget.box_label_mode_combo.itemText(index)
         for index in range(widget.box_label_mode_combo.count())
@@ -443,12 +444,75 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
         "Show selected box labels"
     )
     assert not widget.show_box_labels_checkbox.isChecked()
+    assert widget.show_roi_overlays_checkbox.isChecked()
+    assert widget.show_roi_overlays_checkbox.text() == (
+        "Show neuron overlays (F10)"
+    )
     assert widget.box_label_color_btn.text() == "#FFFFFF"
     assert widget._available_ids == []
     assert widget.active_id is None
     assert widget.checked_ids == set()
     assert not hasattr(widget, "reset_btn")
     assert not hasattr(widget, "labels_visible_checkbox")
+
+
+def test_f10_toggles_only_managed_neuron_overlays_and_persists_across_refresh(
+    make_napari_viewer, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(
+        np.zeros((2, 6, 24, 24), dtype=np.uint16), name="image"
+    )
+    labels = viewer.add_labels(
+        np.zeros((2, 6, 24, 24), dtype=np.uint8), name="user labels"
+    )
+    user_points = viewer.add_points([[0, 2, 3, 4]], name="user points")
+    widget = NeuronAnnotatorWidget(viewer)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data())
+    widget.load_roi_path(roi_path)
+    viewer.dims.current_step = (0, 2, 0, 0)
+    widget.show_box_labels_checkbox.setChecked(True)
+
+    selected = _managed_layer(viewer, ROLE_SELECTED)
+    active = _managed_layer(viewer, ROLE_ACTIVE)
+    box_labels = _managed_box_labels(viewer)
+    checked_before = set(widget.checked_ids)
+    active_before = widget.active_id
+
+    _press_viewer_key(viewer, "F10")
+
+    assert not widget.show_roi_overlays_checkbox.isChecked()
+    assert not selected.visible
+    assert not active.visible
+    assert not box_labels.visible
+    assert image.visible
+    assert labels.visible
+    assert user_points.visible
+    assert widget.checked_ids == checked_before
+    assert widget.active_id == active_before
+
+    viewer.dims.set_current_step(0, 1)
+    widget.activate_id(1, locate=False)
+    widget.show_box_labels_checkbox.setChecked(False)
+    widget.show_box_labels_checkbox.setChecked(True)
+
+    assert not selected.visible
+    assert not active.visible
+    assert not box_labels.visible
+
+    _press_viewer_key(viewer, "F10")
+
+    assert widget.show_roi_overlays_checkbox.isChecked()
+    assert selected.visible
+    assert active.visible
+    assert box_labels.visible
+    assert image.visible
+    assert labels.visible
+    assert user_points.visible
+
+    widget.shutdown()
+    assert KeyBinding.from_str("F10") not in viewer.keymap
 
 
 def test_roi_load_preserves_covered_ids_and_renders_2d_and_3d(

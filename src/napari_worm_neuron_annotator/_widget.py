@@ -204,6 +204,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._search_match_ids: list[int] = []
         self._search_cursor = -1
         self._box_label_color = "#ffffff"
+        self._roi_overlays_visible = True
         self._ui_sync = False
         self._closed = False
         self._keys_bound: list[str] = []
@@ -721,6 +722,8 @@ class NeuronAnnotatorWidget(QWidget):
                 "orange",
             )
             return
+        if requested and not self._roi_overlays_visible:
+            self.show_roi_overlays_checkbox.setChecked(True)
         self.proofreading_enabled = requested
         if requested:
             if not self._install_proof_key_filter():
@@ -738,6 +741,9 @@ class NeuronAnnotatorWidget(QWidget):
             self._clear_proof_target()
         self._set_proofreading_controls_enabled(
             self.proofreading_enabled and self._proof_view_allowed()
+        )
+        self.show_roi_overlays_checkbox.setEnabled(
+            not self.proofreading_enabled
         )
         self._update_proof_size_controls()
         self._update_info()
@@ -1854,7 +1860,8 @@ class NeuronAnnotatorWidget(QWidget):
 
         self.navigation_help_label = QLabel("Q/W: last/next")
         self.navigation_help_label.setToolTip(
-            "Shift+Q/W: previous/next checked neuron"
+            "Shift+Q/W: previous/next checked neuron · "
+            "F10: hide/show neuron overlays"
         )
         group_layout.addWidget(self.navigation_help_label)
 
@@ -1893,6 +1900,19 @@ class NeuronAnnotatorWidget(QWidget):
         controls_layout.addWidget(self.check_none_btn)
         controls_layout.addStretch(1)
         group_layout.addLayout(controls_layout)
+
+        self.show_roi_overlays_checkbox = QCheckBox(
+            "Show neuron overlays (F10)"
+        )
+        self.show_roi_overlays_checkbox.setChecked(True)
+        self.show_roi_overlays_checkbox.setToolTip(
+            "Hide or show plugin-generated neuron boxes and box labels. "
+            "Image and user layers are unchanged."
+        )
+        self.show_roi_overlays_checkbox.toggled.connect(
+            self._on_roi_overlays_toggled
+        )
+        group_layout.addWidget(self.show_roi_overlays_checkbox)
 
         self.show_box_labels_checkbox = QCheckBox(
             "Show selected box labels"
@@ -2260,6 +2280,7 @@ class NeuronAnnotatorWidget(QWidget):
             ("K", self._next_time_key),
             ("Shift-J", self._previous_time_fast_key),
             ("Shift-K", self._next_time_fast_key),
+            ("F10", self._toggle_roi_overlays_key),
         )
         for key, callback in bindings:
             try:
@@ -2276,6 +2297,47 @@ class NeuronAnnotatorWidget(QWidget):
             with suppress(KeyError, ValueError):
                 self.viewer.bind_key(key, None, overwrite=True)
         self._keys_bound.clear()
+
+    def _toggle_roi_overlays_key(self, viewer=None) -> None:
+        """Toggle plugin-owned neuron overlays without changing ROI state."""
+        del viewer
+        self.show_roi_overlays_checkbox.setChecked(
+            not self.show_roi_overlays_checkbox.isChecked()
+        )
+
+    def _on_roi_overlays_toggled(self, visible: bool) -> None:
+        if not visible and self.proofreading_enabled:
+            self.show_roi_overlays_checkbox.blockSignals(True)
+            self.show_roi_overlays_checkbox.setChecked(True)
+            self.show_roi_overlays_checkbox.blockSignals(False)
+            self.update_status(
+                "Turn proofreading off before hiding neuron overlays",
+                "orange",
+            )
+            return
+        self._roi_overlays_visible = bool(visible)
+        self._sync_roi_overlay_visibility()
+        if self._roi_overlays_visible:
+            self._refresh_roi_layers()
+        state = "shown" if self._roi_overlays_visible else "hidden"
+        self.update_status(f"Neuron overlays {state}", "green")
+
+    def _sync_roi_overlay_visibility(self) -> None:
+        """Apply the display toggle only to plugin-owned neuron overlays."""
+        for role in (ROLE_SELECTED, ROLE_ACTIVE):
+            layer = self._managed_vector_layer(role)
+            if layer is not None:
+                layer.visible = self._roi_overlays_visible
+                if self._roi_overlays_visible:
+                    # Hidden Vectors layers may retain stale slice indices in
+                    # napari. Reslice the old geometry before replacing it.
+                    layer.refresh()
+        label_layer = self._managed_box_label_layer()
+        if label_layer is not None:
+            label_layer.visible = bool(
+                self._roi_overlays_visible
+                and self.show_box_labels_checkbox.isChecked()
+            )
 
     def _refresh_image_layers(self, event=None) -> None:
         del event
@@ -3735,7 +3797,10 @@ class NeuronAnnotatorWidget(QWidget):
                     "size": 12,
                     "anchor": "center",
                 },
-                visible=self.show_box_labels_checkbox.isChecked(),
+                visible=(
+                    self._roi_overlays_visible
+                    and self.show_box_labels_checkbox.isChecked()
+                ),
                 scale=tuple(self.current_image.scale),
                 translate=tuple(self.current_image.translate),
                 axis_labels=axis_labels,
@@ -3743,6 +3808,7 @@ class NeuronAnnotatorWidget(QWidget):
                 metadata={ROLE_KEY: ROLE_BOX_LABELS},
             )
             box_label_layer.editable = False
+        self._sync_roi_overlay_visibility()
         if previous_active is not None and previous_active in self.viewer.layers:
             self.viewer.layers.selection.active = previous_active
         elif previous_active is None:
@@ -3848,6 +3914,9 @@ class NeuronAnnotatorWidget(QWidget):
         active_layer = self._managed_vector_layer(ROLE_ACTIVE)
         box_label_layer = self._managed_box_label_layer()
         if selected_layer is None or active_layer is None:
+            return
+        if not self._roi_overlays_visible:
+            self._sync_roi_overlay_visibility()
             return
 
         if not self._view_axes_supported():
@@ -3989,7 +4058,10 @@ class NeuronAnnotatorWidget(QWidget):
             "display_text": np.asarray(display_texts, dtype=str),
         }
         layer.editable = False
-        layer.visible = self.show_box_labels_checkbox.isChecked()
+        layer.visible = bool(
+            self._roi_overlays_visible
+            and self.show_box_labels_checkbox.isChecked()
+        )
 
     def _box_label_text(self, neuron_id: int, biological: str) -> str:
         biological = biological.strip()

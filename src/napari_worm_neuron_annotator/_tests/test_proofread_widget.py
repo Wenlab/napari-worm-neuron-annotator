@@ -772,6 +772,25 @@ def test_f12_discards_only_unapplied_size_draft_and_exits(
     assert store.dirty
 
 
+def test_overlay_toggle_is_disabled_during_proofreading(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    _enable_proofreading(widget)
+
+    assert not widget.show_roi_overlays_checkbox.isEnabled()
+    widget._toggle_roi_overlays_key()
+
+    assert widget.show_roi_overlays_checkbox.isChecked()
+    assert widget._roi_overlays_visible
+    assert widget.proofreading_enabled
+
+    _press_proof_key(qtbot, widget, Qt.Key_F12)
+    assert widget.show_roi_overlays_checkbox.isEnabled()
+
+
 def test_delete_all_confirmation_normalizes_patches_and_f8_restores_one_volume(
     make_napari_viewer, qtbot, tmp_path, monkeypatch, proof_widgets
 ):

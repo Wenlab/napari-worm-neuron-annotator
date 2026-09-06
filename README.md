@@ -245,6 +245,12 @@ back to the zero-based `neuron_id` when empty; the combined form is written as
 used for box labels. The option is off by default. Use **Text color** to choose
 a session-only label color that contrasts with the current Image colormap.
 
+Use **Show neuron overlays** or F10 to temporarily hide/show the plugin's
+selected box, active box, and optional box-label layers while keeping Image,
+Z-derived Image, Labels, and user-created layers unchanged. This display-only
+toggle preserves checked and active neuron state and is disabled during
+proofreading.
+
 In 2D mode, the plugin draws four rectangle edges only when the current z
 slice intersects the box's half-open z range.
 

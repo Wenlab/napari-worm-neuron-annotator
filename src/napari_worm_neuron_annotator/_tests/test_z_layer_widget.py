@@ -145,6 +145,32 @@ def test_split_image_creates_only_image_layers(
     assert not source.visible
 
 
+def test_f10_leaves_z_derived_images_unchanged(
+    make_napari_viewer, qtbot, tmp_path
+):
+    viewer = make_napari_viewer()
+    source, labels, _, _ = _add_matching_layers(viewer, (6, 8, 8))
+    widget = NeuronAnnotatorWidget(viewer)
+    roi_path = tmp_path / "centers.npy"
+    np.save(roi_path, _roi_data_by_z_center())
+    widget.load_roi_path(roi_path)
+    viewer.dims.ndisplay = 3
+    widget.show_box_labels_checkbox.setChecked(True)
+    _split(widget, qtbot, "3")
+    _select_z_layer(widget, 2)
+    z_images = tuple(_managed_layers(viewer, ROLE_Z_IMAGE))
+    visibility_before = tuple(layer.visible for layer in z_images)
+
+    _press_viewer_key(viewer, "F10")
+
+    assert tuple(layer.visible for layer in z_images) == visibility_before
+    assert not source.visible
+    assert labels.visible
+    assert not _managed_vector(viewer, ROLE_SELECTED).visible
+    assert not _managed_vector(viewer, ROLE_ACTIVE).visible
+    assert not _managed_box_labels(viewer).visible
+
+
 def test_orientation_preserves_z_session_and_source_data(
     make_napari_viewer, qtbot, tmp_path
 ):
