@@ -23,6 +23,9 @@ from napari_worm_neuron_annotator._proofread import (
     ObservationPatch,
 )
 from napari_worm_neuron_annotator._widget import (
+    DISCARD_ACTIVE_ALL,
+    DISCARD_ALL,
+    DISCARD_CURRENT,
     PROOF_TARGET_EDGE_WIDTH,
     PROOF_TARGET_HALF_LENGTH,
     ROLE_ACTIVE,
@@ -63,6 +66,7 @@ def _make_widget(
     *,
     image_ndim: int = 4,
     image_kwargs: dict[str, object] | None = None,
+    roi_data: np.ndarray | None = None,
 ) -> tuple[object, NeuronAnnotatorWidget]:
     viewer = make_napari_viewer()
     image_shape = (3, 8, 32, 32) if image_ndim == 4 else (8, 32, 32)
@@ -87,7 +91,7 @@ def _make_widget(
     widget.volume_start_spin.setValue(1)
     widget.volume_stride_spin.setValue(2)
     path = tmp_path / f"proof-{image_ndim}d.npy"
-    np.save(path, _roi_data())
+    np.save(path, _roi_data() if roi_data is None else roi_data)
     widget.load_roi_path(path)
     QApplication.processEvents()
     return viewer, widget
@@ -265,11 +269,142 @@ def test_proofreading_defaults_off_and_handlers_are_inert(
     assert not widget.proof_width_spin.isEnabled()
     # Save is only actionable when there are applied edits or a draft.
     assert not widget.proof_save_btn.isEnabled()
+    assert [
+        widget.proof_discard_scope_combo.itemText(index)
+        for index in range(widget.proof_discard_scope_combo.count())
+    ] == [
+        "Current t · active neuron",
+        "All t · active neuron",
+        "All unsaved edits",
+    ]
+    assert widget.proof_discard_scope_combo.currentData() == DISCARD_CURRENT
 
     widget._proof_delete_current()
 
     assert store.resolve(1, 0) is not None
     assert store.observation_patches == {}
+
+
+def test_discard_current_scope_restores_only_active_neuron_at_mapped_volume(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    store.set_observation_deleted(1, 0)
+    store.set_observation_deleted(5, 0)
+    store.set_observation_deleted(3, 1)
+    widget._refresh_after_proof_edit()
+
+    widget.discard_proof_edits()
+
+    assert store.resolve(1, 0) is not None
+    assert store.resolve(5, 0) is None
+    assert store.resolve(3, 1) is None
+    assert store.dirty
+    assert widget.active_id == 0
+    assert widget.proof_discard_scope_combo.currentData() == DISCARD_CURRENT
+
+
+def test_discard_all_t_scope_restores_only_active_neuron(
+    make_napari_viewer, qtbot, tmp_path, monkeypatch, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    store.set_observation_deleted(1, 0)
+    store.set_observation_deleted(5, 0)
+    store.set_observation_deleted(3, 1)
+    widget._refresh_after_proof_edit()
+    widget.proof_discard_scope_combo.setCurrentIndex(
+        widget.proof_discard_scope_combo.findData(DISCARD_ACTIVE_ALL)
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+    )
+
+    widget.discard_proof_edits()
+
+    assert store.resolve(1, 0) is not None
+    assert store.resolve(5, 0) is not None
+    assert store.resolve(3, 1) is None
+    assert store.dirty
+    assert widget.proof_discard_scope_combo.currentData() == DISCARD_ACTIVE_ALL
+
+
+def test_discard_all_scope_restores_snapshot_and_drops_matching_draft(
+    make_napari_viewer, qtbot, tmp_path, monkeypatch, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    _enable_proofreading(widget)
+    store.set_observation_deleted(1, 0)
+    store.set_observation_deleted(3, 1)
+    widget.proof_width_spin.setValue(9.0)
+    assert widget._proof_size_draft_dirty
+    widget.proof_discard_scope_combo.setCurrentIndex(
+        widget.proof_discard_scope_combo.findData(DISCARD_ALL)
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+    )
+
+    widget.discard_proof_edits()
+
+    assert store.resolve(1, 0) is not None
+    assert store.resolve(3, 1) is not None
+    assert not store.dirty
+    assert not widget._proof_size_draft_dirty
+    assert widget._proof_size_draft_target is None
+
+
+def test_discard_current_drops_only_matching_size_draft(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    _enable_proofreading(widget)
+    widget.proof_width_spin.setValue(9.0)
+    assert widget._proof_size_draft_target == (1, 0)
+
+    widget.discard_proof_edits()
+
+    assert not widget._proof_size_draft_dirty
+    assert widget._proof_size_draft_target is None
+    assert not widget.proofread_store.dirty
+    assert widget.proof_width_spin.value() == pytest.approx(7.0)
+
+
+def test_discard_all_t_removes_unsaved_provisional_active_neuron(
+    make_napari_viewer, qtbot, tmp_path, monkeypatch, proof_widgets
+):
+    viewer, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    _enable_proofreading(widget)
+    _click_world(viewer, 0, 3, 22, 23)
+    widget._proof_add_neuron()
+    added_id = widget.active_id
+    assert added_id in store.provisional_added_ids
+    widget.proof_discard_scope_combo.setCurrentIndex(
+        widget.proof_discard_scope_combo.findData(DISCARD_ACTIVE_ALL)
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+    )
+
+    widget.discard_proof_edits()
+
+    assert added_id not in store.all_neuron_ids
+    assert added_id not in widget._available_ids
+    assert widget.active_id is None
+    assert not store.dirty
 
 
 def test_loaded_roi_preserves_source_image_active_for_proofreading(
@@ -320,6 +455,136 @@ def test_current_box_status_reports_identity_time_and_modified_observation(
     viewer.dims.set_current_step(0, 1)
     QApplication.processEvents()
     assert widget.proof_current_box_label.text() == "Neuron 0: no box, t=1"
+
+
+def test_restoring_depth_preserves_hidden_precision_and_clears_resized(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    data = _roi_data()
+    data[1, 0, 3:5] = (8.666667, 8.833333)
+    viewer, widget = _make_widget(
+        make_napari_viewer,
+        qtbot,
+        tmp_path,
+        proof_widgets,
+        roi_data=data,
+    )
+    store = widget.proofread_store
+    raw_size = store.dataset.get_box_at_volume_index(1, 0).size_zyx
+    assert raw_size[1:] != widget._proof_draft_size()[1:]
+    _enable_proofreading(widget)
+
+    original_depth = widget.proof_depth_spin.value()
+    widget.proof_depth_spin.setValue(original_depth + 1)
+    widget._proof_apply_size()
+
+    assert store.resolve(1, 0).size_zyx[1:] == raw_size[1:]
+    assert store.classify_observation(1, 0) == "resized"
+
+    widget.proof_depth_spin.setValue(original_depth)
+    widget._proof_apply_size()
+
+    assert store.resolve(1, 0).size_zyx == raw_size
+    assert store.classify_observation(1, 0) is None
+    assert (1, 0) not in store.observation_patches
+    assert "(resized)" not in widget.proof_current_box_label.text()
+    assert "(resized)" not in widget.selection_tree.topLevelItem(0).text(1)
+
+
+def test_restoring_depth_for_all_clears_resized_with_hidden_precision(
+    make_napari_viewer,
+    qtbot,
+    tmp_path,
+    monkeypatch,
+    proof_widgets,
+):
+    data = _roi_data()
+    data[[1, 5], 0, 3:5] = (8.666667, 8.833333)
+    _, widget = _make_widget(
+        make_napari_viewer,
+        qtbot,
+        tmp_path,
+        proof_widgets,
+        roi_data=data,
+    )
+    store = widget.proofread_store
+    raw_sizes = {
+        volume: store.dataset.get_box_at_volume_index(volume, 0).size_zyx
+        for volume in (1, 5)
+    }
+    _enable_proofreading(widget)
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+    )
+
+    original_depth = widget.proof_depth_spin.value()
+    widget.proof_depth_spin.setValue(original_depth + 1)
+    widget._proof_apply_size_all()
+    assert store.resized_observations == {(1, 0), (5, 0)}
+
+    widget.proof_depth_spin.setValue(original_depth)
+    widget._proof_apply_size_all()
+
+    assert {volume: store.resolve(volume, 0).size_zyx for volume in (1, 5)} == (
+        raw_sizes
+    )
+    assert store.resized_observations == set()
+    assert "(resized)" not in widget.proof_current_box_label.text()
+    assert "(resized)" not in widget.selection_tree.topLevelItem(0).text(1)
+
+
+def test_restoring_depth_cleans_legacy_rounded_size_patch(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    data = _roi_data()
+    data[1, 0, 3:5] = (8.666667, 8.833333)
+    _, widget = _make_widget(
+        make_napari_viewer,
+        qtbot,
+        tmp_path,
+        proof_widgets,
+        roi_data=data,
+    )
+    store = widget.proofread_store
+    raw_size = store.dataset.get_box_at_volume_index(1, 0).size_zyx
+    # Reproduce the complete rounded tuple written by the old UI when the
+    # user changed only depth.
+    store.apply_size_at_volume_index(1, 0, (4.0, 8.833, 8.667))
+    widget._refresh_after_proof_edit()
+    _enable_proofreading(widget)
+    assert store.classify_observation(1, 0) == "resized"
+
+    widget.proof_depth_spin.setValue(raw_size[0])
+    widget._proof_apply_size()
+
+    assert store.resolve(1, 0).size_zyx == raw_size
+    assert store.classify_observation(1, 0) is None
+    assert (1, 0) not in store.observation_patches
+
+
+def test_depth_edit_preserves_legitimate_hidden_precision_patch(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    data = _roi_data()
+    data[1, 0, 3:5] = (8.0, 8.0)
+    _, widget = _make_widget(
+        make_napari_viewer,
+        qtbot,
+        tmp_path,
+        proof_widgets,
+        roi_data=data,
+    )
+    store = widget.proofread_store
+    store.apply_size_at_volume_index(1, 0, (3.0, 8.123456, 8.0))
+    widget._refresh_after_proof_edit()
+    _enable_proofreading(widget)
+
+    widget.proof_depth_spin.setValue(4.0)
+    widget._proof_apply_size()
+
+    assert store.resolve(1, 0).size_zyx == pytest.approx(
+        (4.0, 8.123456, 8.0)
+    )
 
 
 def test_current_box_status_refreshes_for_active_neuron_and_image_time(
@@ -478,6 +743,33 @@ def test_f9_adds_default_sized_neuron_to_tree_annotation_and_vectors_then_f12_ex
     assert not widget.proofreading_toggle.isChecked()
     assert widget._proof_key_filter is None
     assert store.resolve(1, added_id) is not None
+
+
+def test_f12_discards_only_unapplied_size_draft_and_exits(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    original = store.resolve(1, 0)
+    _enable_proofreading(widget)
+    widget.proof_width_spin.setValue(original.size_zyx[2] + 2)
+    assert widget._proof_size_draft_dirty
+
+    # This applied edit remains pending for sidecar save; F12 only abandons
+    # the separate, unapplied size-control draft.
+    store.set_observation_deleted(3, 1)
+    assert store.dirty
+
+    _press_proof_key(qtbot, widget, Qt.Key_F12)
+
+    assert not widget.proofreading_enabled
+    assert not widget._proof_size_draft_dirty
+    assert widget._proof_size_draft_target is None
+    assert store.resolve(1, 0).size_zyx == original.size_zyx
+    assert store.resolve(3, 1) is None
+    assert store.dirty
 
 
 def test_delete_all_confirmation_normalizes_patches_and_f8_restores_one_volume(

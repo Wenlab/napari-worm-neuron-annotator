@@ -294,6 +294,13 @@ save/load snapshot. A size edit that has not yet been applied is shown as an
 `Unapplied size draft` and is never written to a sidecar without an explicit
 Apply/Discard decision.
 
+**Discard scope** controls what **Discard unsaved** restores to the most recent
+successful Save/Load state. It defaults to `Current t · active neuron`; the
+other choices restore `All t · active neuron` or `All unsaved edits`. Current-t
+discard uses the configured Image-time to raw-volume mapping. Discarding one
+neuron does not affect unsaved edits belonging to other neurons. The two
+broader scopes require confirmation.
+
 **Save proof edits** writes canonical sparse edits to a schema-v2 JSON sidecar
 (`changed_fields` records whether each patch changes presence, center, and/or
 size). Existing schema-v1 sidecars are accepted and kept clean in memory; the

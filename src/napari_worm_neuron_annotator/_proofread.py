@@ -856,6 +856,121 @@ class ProofreadStore:
         """Restore the most recently saved/loaded canonical snapshot."""
         self._restore_state(copy.deepcopy(self._saved_snapshot))
 
+    def _saved_store(self) -> ProofreadStore:
+        """Return a lightweight resolver for the saved/loaded snapshot."""
+        saved = ProofreadStore(
+            self.dataset,
+            image_signature=copy.deepcopy(self.image_signature),
+        )
+        saved._restore_state(copy.deepcopy(self._saved_snapshot))
+        saved._saved_snapshot = copy.deepcopy(self._saved_snapshot)
+        return saved
+
+    def _expand_delete_all(
+        self,
+        neuron_id: int,
+        *,
+        saved: ProofreadStore | None = None,
+    ) -> None:
+        """Replace one delete-all marker with equivalent per-volume patches."""
+        if neuron_id not in self.delete_all_ids:
+            return
+        resolved = [
+            self.resolve(volume_index, neuron_id)
+            for volume_index in range(self.raw_T)
+        ]
+        for key in [
+            key for key in self.observation_patches if key[1] == neuron_id
+        ]:
+            del self.observation_patches[key]
+        self.delete_all_ids.remove(neuron_id)
+        for volume_index, box in enumerate(resolved):
+            if box is not None:
+                self.set_observation_present(volume_index, neuron_id, box)
+            elif self._raw_box(volume_index, neuron_id) is not None:
+                self.set_observation_deleted(volume_index, neuron_id)
+            elif saved is not None and neuron_id in set(saved.neuron_ids):
+                saved_box = saved.resolve(volume_index, neuron_id)
+                if saved_box is not None:
+                    # Added-neuron observations have no raw box. Keep their
+                    # deletion explicit so status and sidecar output retain
+                    # the unsaved presence change at every other volume.
+                    self.observation_patches[(volume_index, neuron_id)] = (
+                        ObservationPatch.deleted(saved_box.size_zyx)
+                    )
+
+    def discard_observation(self, volume_index: int, neuron_id: int) -> bool:
+        """Restore one observation to the most recent saved/loaded snapshot.
+
+        A working delete-all marker is expanded when the saved snapshot does
+        not contain that marker. This preserves deletions at every other
+        volume while allowing the requested observation to be restored.
+        """
+        volume_index = self._check_volume(volume_index)
+        neuron_id = self._check_id(neuron_id)
+        before = self._canonical_state()
+        saved = self._saved_store()
+        saved_known = neuron_id in set(saved.neuron_ids)
+        saved_delete_all = saved_known and neuron_id in saved.delete_all_ids
+
+        if neuron_id in self.delete_all_ids and not saved_delete_all:
+            self._expand_delete_all(neuron_id, saved=saved)
+
+        key = (volume_index, neuron_id)
+        current_delete_all = neuron_id in self.delete_all_ids
+        if saved_known and current_delete_all == saved_delete_all:
+            patch = saved.observation_patches.get(key)
+            if patch is None:
+                self.observation_patches.pop(key, None)
+            else:
+                self.observation_patches[key] = copy.deepcopy(patch)
+        else:
+            self.observation_patches.pop(key, None)
+            saved_box = (
+                saved.resolve(volume_index, neuron_id) if saved_known else None
+            )
+            if saved_box is not None:
+                self.set_observation_present(volume_index, neuron_id, saved_box)
+            elif self._raw_box(volume_index, neuron_id) is not None:
+                self.set_observation_deleted(volume_index, neuron_id)
+        return self._canonical_state() != before
+
+    def discard_neuron(self, neuron_id: int) -> bool:
+        """Restore all state for one neuron from the saved/loaded snapshot."""
+        neuron_id = self._check_id(neuron_id, allow_retired=True)
+        before = self._canonical_state()
+        saved = self._saved_store()
+
+        for key in [
+            key for key in self.observation_patches if key[1] == neuron_id
+        ]:
+            del self.observation_patches[key]
+        for key, patch in saved.observation_patches.items():
+            if key[1] == neuron_id:
+                self.observation_patches[key] = copy.deepcopy(patch)
+
+        for name in (
+            "delete_all_ids",
+            "committed_added_ids",
+            "provisional_added_ids",
+            "retired_ids",
+        ):
+            current_values = getattr(self, name)
+            saved_values = getattr(saved, name)
+            current_values.discard(neuron_id)
+            if neuron_id in saved_values:
+                current_values.add(neuron_id)
+
+        self.placement_size.pop(neuron_id, None)
+        if neuron_id in saved.placement_size:
+            self.placement_size[neuron_id] = saved.placement_size[neuron_id]
+
+        self._next_neuron_id = max(
+            saved._next_neuron_id,
+            max(self.all_neuron_ids, default=-1) + 1,
+        )
+        return self._canonical_state() != before
+
     # ------------------------------------------------------------------
     # Sidecar metadata and persistence
     # ------------------------------------------------------------------

@@ -108,6 +108,9 @@ MANAGED_ROI_ROLES = (
 )
 ROLE_Z_IMAGE = "z_layer_image"
 MANAGED_Z_ROLES = (ROLE_Z_IMAGE,)
+DISCARD_CURRENT = "current"
+DISCARD_ACTIVE_ALL = "active_all"
+DISCARD_ALL = "all"
 LABEL_MODE_BIOLOGICAL = "biological"
 LABEL_MODE_DIGITAL = "digital"
 LABEL_MODE_DIGITAL_BIOLOGICAL = "digital_biological"
@@ -536,6 +539,27 @@ class NeuronAnnotatorWidget(QWidget):
         io_row.addWidget(self.proof_load_btn, 1, 0)
         io_row.addWidget(self.proof_discard_btn, 1, 1)
         io_layout.addLayout(io_row)
+        discard_row = QHBoxLayout()
+        discard_row.addWidget(QLabel("Discard scope:"))
+        self.proof_discard_scope_combo = QComboBox()
+        self.proof_discard_scope_combo.addItem(
+            "Current t · active neuron", DISCARD_CURRENT
+        )
+        self.proof_discard_scope_combo.addItem(
+            "All t · active neuron", DISCARD_ACTIVE_ALL
+        )
+        self.proof_discard_scope_combo.addItem(
+            "All unsaved edits", DISCARD_ALL
+        )
+        self.proof_discard_scope_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.proof_discard_scope_combo.setMinimumContentsLength(12)
+        self.proof_discard_scope_combo.setToolTip(
+            "Restore the selected scope to the most recent Save/Load state."
+        )
+        discard_row.addWidget(self.proof_discard_scope_combo, 1)
+        io_layout.addLayout(discard_row)
         io_group.setLayout(io_layout)
         layout.addWidget(io_group)
 
@@ -633,6 +657,8 @@ class NeuronAnnotatorWidget(QWidget):
             self.proof_save_as_btn.setEnabled(store is not None)
         if hasattr(self, "proof_discard_btn"):
             self.proof_discard_btn.setEnabled(store is not None and (store_dirty or draft_dirty))
+        if hasattr(self, "proof_discard_scope_combo"):
+            self.proof_discard_scope_combo.setEnabled(store is not None)
         if hasattr(self, "proof_apply_size_btn"):
             can_apply = False
             can_apply_all = False
@@ -970,6 +996,81 @@ class NeuronAnnotatorWidget(QWidget):
             self.proof_width_spin.value(),
         )
 
+    def _proof_canonical_draft_size(
+        self, target: tuple[int, int] | None
+    ) -> tuple[float, float, float]:
+        """Restore exact values hidden by the spin boxes' display precision.
+
+        The controls intentionally show three decimal places, while raw ROI
+        sizes may contain more precision.  Applying all three displayed
+        values after changing only one dimension must not quantize the other
+        two.  A value that displays exactly like the raw/effective reference
+        therefore reuses that reference's full-precision value.
+        """
+        visible = self._proof_draft_size()
+        store = self.proofread_store
+        if store is None or target is None:
+            return visible
+
+        volume_index, neuron_id = target
+        raw_box = None
+        box = None
+        with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+            raw_box = store.dataset.get_box_at_volume_index(
+                volume_index, neuron_id
+            )
+        with suppress(AttributeError, TypeError, ValueError, RuntimeError):
+            box = store.resolve(volume_index, neuron_id)
+
+        current_size = None
+        if box is not None:
+            current_size = box.size_zyx
+        else:
+            # Missing observations use their placement/restore template.
+            with suppress(
+                AttributeError, TypeError, ValueError, RuntimeError
+            ):
+                current_size = store.size_for_placement(
+                    neuron_id, volume_index
+                )
+
+        spins = (
+            self.proof_depth_spin,
+            self.proof_height_spin,
+            self.proof_width_spin,
+        )
+        canonical: list[float] = []
+        for index, (spin, value) in enumerate(zip(spins, visible, strict=True)):
+            displayed = spin.textFromValue(float(value))
+            exact = float(value)
+            current = (
+                None if current_size is None else float(current_size[index])
+            )
+            raw = None if raw_box is None else float(raw_box.size_zyx[index])
+            current_matches = (
+                current is not None
+                and spin.textFromValue(current) == displayed
+            )
+            raw_matches = (
+                raw is not None and spin.textFromValue(raw) == displayed
+            )
+            if current_matches:
+                # Preserve legitimate high-precision effective values.  An
+                # effective value exactly equal to the rounded editor value
+                # is the signature of patches written by the old UI; when it
+                # displays like raw, normalize it back to raw.
+                exact = (
+                    raw
+                    if raw_matches and current == float(value)
+                    else current
+                )
+            elif raw_matches:
+                # The user changed this component back to raw's displayed
+                # value, so restore raw's otherwise hidden precision.
+                exact = raw
+            canonical.append(exact)
+        return tuple(canonical)
+
     def _proof_placement_size(
         self, neuron_id: int, volume_index: int | None = None
     ) -> tuple[float, float, float]:
@@ -1055,7 +1156,8 @@ class NeuronAnnotatorWidget(QWidget):
         volume_index = self._current_volume_index()
         if self.active_id is None or volume_index is None:
             return
-        size = self._proof_draft_size()
+        target = (volume_index, self.active_id)
+        size = self._proof_canonical_draft_size(target)
         baseline: tuple[float, float, float] | None = None
         store = self.proofread_store
         if store is not None:
@@ -1076,7 +1178,7 @@ class NeuronAnnotatorWidget(QWidget):
             self._proof_size_draft_target = None
         else:
             self._proof_size_draft_dirty = True
-            self._proof_size_draft_target = (volume_index, self.active_id)
+            self._proof_size_draft_target = target
         if hasattr(self, "info_text"):
             self._update_info()
         self._update_proof_action_state()
@@ -1132,7 +1234,7 @@ class NeuronAnnotatorWidget(QWidget):
         store = self.proofread_store
         if store is None:
             return
-        size = self._proof_draft_size()
+        size = self._proof_canonical_draft_size(draft_target)
         if any(not np.isfinite(v) or v <= 0 for v in size):
             self.update_status("Box dimensions must be positive", "orange")
             return
@@ -1158,7 +1260,7 @@ class NeuronAnnotatorWidget(QWidget):
         ):
             return
         neuron_id = int(target[1])
-        size = self._proof_draft_size()
+        size = self._proof_canonical_draft_size(target)
         existing: list[int] = []
         changed: list[int] = []
         for volume in range(store.raw_T):
@@ -1242,7 +1344,9 @@ class NeuronAnnotatorWidget(QWidget):
                     )
                     return False
                 self.proofread_store.apply_size_at_volume_index(
-                    target[0], target[1], self._proof_draft_size()
+                    target[0],
+                    target[1],
+                    self._proof_canonical_draft_size(target),
                 )
             except (TypeError, ValueError, RuntimeError) as error:
                 self.update_status(f"Could not apply size: {error}", "red")
@@ -1310,7 +1414,7 @@ class NeuronAnnotatorWidget(QWidget):
             and self._proof_size_draft_target == (volume_index, self.active_id)
         )
         size = (
-            self._proof_draft_size()
+            self._proof_canonical_draft_size((volume_index, self.active_id))
             if draft_matches
             else self._proof_placement_size(self.active_id, volume_index)
         )
@@ -1635,16 +1739,70 @@ class NeuronAnnotatorWidget(QWidget):
         store = self.proofread_store
         if store is None:
             return
+        scope = self.proof_discard_scope_combo.currentData()
+        active_id = self.active_id
+        volume_index = self._current_volume_index()
+        if scope in (DISCARD_CURRENT, DISCARD_ACTIVE_ALL) and active_id is None:
+            self.update_status("Select an active neuron to discard edits", "orange")
+            return
+        if scope == DISCARD_CURRENT and volume_index is None:
+            self.update_status("Current Image time has no ROI volume", "orange")
+            return
+
+        if scope in (DISCARD_ACTIVE_ALL, DISCARD_ALL):
+            label = (
+                f"all unsaved edits for neuron {active_id}"
+                if scope == DISCARD_ACTIVE_ALL
+                else "all unsaved proofreading edits"
+            )
+            answer = QMessageBox.question(
+                self,
+                "Discard proofreading edits",
+                f"Discard {label}?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
         try:
-            store.discard()
-        except (AttributeError, RuntimeError, ValueError) as error:
+            if scope == DISCARD_CURRENT:
+                changed = store.discard_observation(volume_index, active_id)
+                status = (
+                    f"Discarded unsaved edits for neuron {active_id} at current t"
+                )
+            elif scope == DISCARD_ACTIVE_ALL:
+                changed = store.discard_neuron(active_id)
+                status = f"Discarded unsaved edits for neuron {active_id} at all t"
+            else:
+                changed = store.dirty
+                store.discard()
+                status = "Discarded all unsaved proof edits"
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             self.update_status(f"Could not discard proof edits: {error}", "red")
             return
-        self._proof_size_draft_dirty = False
-        self._proof_size_draft_target = None
+
+        draft_target = self._proof_size_draft_target
+        discard_draft = bool(
+            self._proof_size_draft_dirty
+            and (
+                scope == DISCARD_ALL
+                or (
+                    draft_target is not None
+                    and draft_target[1] == active_id
+                    and (
+                        scope == DISCARD_ACTIVE_ALL
+                        or draft_target[0] == volume_index
+                    )
+                )
+            )
+        )
+        if discard_draft:
+            self._proof_size_draft_dirty = False
+            self._proof_size_draft_target = None
+        changed = bool(changed or discard_draft)
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
-        self.update_status("Discarded unsaved proof edits", "green")
+        self.update_status(status if changed else "No matching unsaved edits", "green")
 
     def export_corrected_npy(self) -> None:
         store = self.proofread_store

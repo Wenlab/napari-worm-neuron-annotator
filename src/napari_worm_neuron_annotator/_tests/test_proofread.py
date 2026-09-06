@@ -315,6 +315,106 @@ def test_dirty_save_and_discard_snapshot(tmp_path):
     assert store.resolve(1, 0).center_zyx == (3, 21, 11)
 
 
+def test_discard_observation_restores_saved_value_only_at_requested_volume(
+    tmp_path,
+):
+    store = ProofreadStore(_dataset(tmp_path))
+    store.set_observation_present(
+        0, 0, center_zyx=(4, 5, 6), size_zyx=(3, 9, 7)
+    )
+    store.save(tmp_path / "edits.json")
+    saved_box = store.resolve(0, 0)
+    store.set_observation_present(
+        0, 0, center_zyx=(7, 8, 9), size_zyx=(4, 8, 6)
+    )
+    store.set_observation_deleted(1, 0)
+
+    assert store.discard_observation(0, 0)
+
+    assert store.resolve(0, 0) == saved_box
+    assert store.resolve(1, 0) is None
+    assert store.dirty
+
+
+def test_discard_observation_splits_unsaved_delete_all_without_restoring_other_t():
+    store = ProofreadStore(_dataset())
+    store.delete_all_observations(0)
+
+    assert store.discard_observation(0, 0)
+
+    assert store.resolve(0, 0) == store.dataset.get_box_at_volume_index(0, 0)
+    assert store.resolve(1, 0) is None
+    assert store.resolve(2, 0) is None
+    assert 0 not in store.delete_all_ids
+    assert store.observation_patches[(1, 0)].state == DELETED
+
+
+def test_discard_observation_restores_saved_delete_all_at_one_volume(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    store.delete_all_observations(0)
+    store.save(tmp_path / "edits.json")
+    store.set_observation_present(
+        0, 0, center_zyx=(4, 5, 6), size_zyx=(3, 9, 7)
+    )
+
+    assert store.discard_observation(0, 0)
+
+    assert 0 in store.delete_all_ids
+    assert (0, 0) not in store.observation_patches
+    assert store.resolve(0, 0) is None
+    assert not store.dirty
+
+
+def test_discard_observation_splits_delete_all_for_saved_added_neuron(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    added = store.add_neuron(0, (1, 2, 3))
+    store.set_observation_present(
+        1, added, center_zyx=(4, 5, 6), size_zyx=(3, 7, 7)
+    )
+    store.save(tmp_path / "edits.json")
+    store.delete_all_observations(added)
+
+    assert store.discard_observation(0, added)
+
+    assert store.resolve(0, added) is not None
+    assert store.resolve(1, added) is None
+    assert store.classify_observation(1, added) == "deleted"
+    assert added not in store.delete_all_ids
+    assert store.dirty
+
+
+def test_discard_neuron_restores_only_that_neuron_and_removes_provisional():
+    store = ProofreadStore(_dataset())
+    store.set_observation_deleted(0, 0)
+    store.set_observation_deleted(2, 1)
+
+    assert store.discard_neuron(0)
+
+    assert store.resolve(0, 0) is not None
+    assert store.resolve(2, 1) is None
+    assert store.dirty
+
+    added = store.add_neuron(1, (4, 5, 6))
+    assert store.discard_neuron(added)
+    assert added not in store.all_neuron_ids
+    assert store.add_neuron(1, (4, 5, 6)) == added
+
+
+def test_discard_observation_keeps_provisional_identity_for_other_volumes():
+    store = ProofreadStore(_dataset())
+    added = store.add_neuron(0, (1, 2, 3))
+    store.set_observation_present(
+        1, added, center_zyx=(4, 5, 6), size_zyx=(3, 7, 7)
+    )
+
+    assert store.discard_observation(0, added)
+
+    assert added in store.provisional_added_ids
+    assert store.resolve(0, added) is None
+    assert store.resolve(1, added) is not None
+    assert store.dirty
+
+
 def test_v2_sidecar_writes_changed_fields_and_round_trips(tmp_path):
     store = ProofreadStore(_dataset(tmp_path))
     store.set_observation_present(
