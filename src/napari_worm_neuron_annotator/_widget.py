@@ -42,6 +42,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -378,6 +379,9 @@ class NeuronAnnotatorWidget(QWidget):
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.scroll_content = QWidget()
+        self.scroll_content.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
         layout = QVBoxLayout(self.scroll_content)
 
         header = QLabel("Worm Neuron Annotator")
