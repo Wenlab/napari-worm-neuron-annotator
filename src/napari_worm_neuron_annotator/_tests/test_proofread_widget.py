@@ -269,6 +269,7 @@ def test_proofreading_defaults_off_and_handlers_are_inert(
     assert not widget.proof_width_spin.isEnabled()
     # Save is only actionable when there are applied edits or a draft.
     assert not widget.proof_save_btn.isEnabled()
+    assert widget.proof_discard_btn.text() == "Discard changes"
     assert [
         widget.proof_discard_scope_combo.itemText(index)
         for index in range(widget.proof_discard_scope_combo.count())

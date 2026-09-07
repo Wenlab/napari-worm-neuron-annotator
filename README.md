@@ -300,7 +300,7 @@ save/load snapshot. A size edit that has not yet been applied is shown as an
 `Unapplied size draft` and is never written to a sidecar without an explicit
 Apply/Discard decision.
 
-**Discard scope** controls what **Discard unsaved** restores to the most recent
+**Discard scope** controls what **Discard changes** restores to the most recent
 successful Save/Load state. It defaults to `Current t · active neuron`; the
 other choices restore `All t · active neuron` or `All unsaved edits`. Current-t
 discard uses the configured Image-time to raw-volume mapping. Discarding one

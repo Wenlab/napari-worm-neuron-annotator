@@ -530,7 +530,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.proof_save_btn = QPushButton("Save edits")
         self.proof_save_as_btn = QPushButton("Save As…")
         self.proof_load_btn = QPushButton("Load…")
-        self.proof_discard_btn = QPushButton("Discard unsaved")
+        self.proof_discard_btn = QPushButton("Discard changes")
         self.proof_save_btn.clicked.connect(self.save_proof_edits)
         self.proof_save_as_btn.clicked.connect(self.save_proof_edits_as)
         self.proof_load_btn.clicked.connect(self.load_proof_edits)
