@@ -22,6 +22,13 @@ from napari_worm_neuron_annotator._proofread import (
     PRESENT,
     ObservationPatch,
 )
+from napari_worm_neuron_annotator._proofread_files import (
+    canonical_json_bytes,
+    read_recovery,
+    recovery_path,
+    utc_now_text,
+    write_temp_bytes,
+)
 from napari_worm_neuron_annotator._widget import (
     DISCARD_ACTIVE_ALL,
     DISCARD_ALL,
@@ -284,6 +291,76 @@ def test_proofreading_defaults_off_and_handlers_are_inert(
 
     assert store.resolve(1, 0) is not None
     assert store.observation_patches == {}
+
+
+def test_automatic_recovery_skips_clean_state_and_unapplied_draft(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    expected = recovery_path(
+        widget.roi_dataset.path, widget._recovery_session_uuid
+    )
+
+    widget._schedule_recovery_snapshot()
+    assert widget._recovery_thread is None
+    _enable_proofreading(widget)
+    widget.proof_width_spin.setValue(9)
+    widget._schedule_recovery_snapshot()
+    assert widget._recovery_thread is None
+    assert not expected.exists()
+
+
+def test_automatic_recovery_writes_applied_state_and_excludes_draft(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    store = widget.proofread_store
+    store.set_observation_deleted(1, 0)
+    _enable_proofreading(widget)
+    widget.proof_width_spin.setValue(9)
+
+    widget._schedule_recovery_snapshot()
+    expected = recovery_path(
+        widget.roi_dataset.path, widget._recovery_session_uuid
+    )
+    qtbot.waitUntil(lambda: expected.exists(), timeout=5_000)
+    payload = read_recovery(expected)
+
+    assert payload["working_state"] == store.working_snapshot
+    assert payload["saved_state"] == store.saved_snapshot
+    assert "draft" not in canonical_json_bytes(payload).decode("utf-8")
+
+
+def test_late_recovery_completion_cannot_publish_after_invalidation(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets
+):
+    _, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    target = recovery_path(widget.roi_dataset.path, "late")
+    temporary = write_temp_bytes(target, b"stale")
+    generation = widget._recovery_generation
+    widget._invalidate_recovery_task(delete_current=False)
+
+    widget._on_recovery_task_completed(
+        {
+            "ok": True,
+            "kind": "snapshot",
+            "temporary": temporary,
+            "target": target,
+            "state_key": {},
+            "utc_time": utc_now_text(),
+            "generation": generation,
+            "session_uuid": widget._recovery_session_uuid,
+        }
+    )
+
+    assert not target.exists()
+    assert not temporary.exists()
 
 
 def test_discard_current_scope_restores_only_active_neuron_at_mapped_volume(

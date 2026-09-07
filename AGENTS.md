@@ -166,6 +166,21 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 - Keep Excel dependencies optional unless they become a required plugin
   feature; expose them through a clearly named optional dependency group.
 
+## Proofreading recovery and history
+
+- Formal proof sidecars remain schema v2 and keep accepting v1 input.
+- Automatically protect changed, applied dirty state for file-backed ROIs in
+  `<ROI filename>.proofread-recovery/`; never serialize an unapplied size draft.
+- Recovery snapshots preserve complete working state and the last saved/loaded
+  baseline. Validate the full raw ROI hash before an explicit restore.
+- Keep one latest recovery per session and retain unresolved snapshots from
+  other sessions. Never auto-load a recovery.
+- Preserve exact previous formal JSON bytes in `<formal filename>.history/`
+  before overwrite. Retain the newest 10 distinct versions and refuse to
+  overwrite a bound formal file that changed externally.
+- History loads an old version as working state over the current formal
+  baseline. Preserve committed/retired ID lineage; numeric IDs are never reused.
+
 ## ROI overlay behavior
 
 - Treat `(T,N,K)` NPY data as read-only; load with memory mapping and

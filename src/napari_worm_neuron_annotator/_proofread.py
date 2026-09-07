@@ -21,6 +21,15 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ._proofread_files import (
+    RECOVERY_SCHEMA_VERSION,
+    backup_formal_bytes,
+    fingerprint_file,
+    is_history_version,
+    sha256_bytes,
+    trim_history,
+    validate_recovery_envelope,
+)
 from ._roi import NeuronBox, NeuronBoxDataset
 
 # Sidecars written by this module use schema v2.  The reader deliberately
@@ -78,6 +87,10 @@ class ObservationPatch:
 
 class SidecarError(ValueError):
     """Raised when a proof sidecar is invalid or incompatible."""
+
+
+class ExternalSidecarChangeError(SidecarError):
+    """Raised when a bound formal sidecar changed outside this session."""
 
 
 def _is_int(value: Any) -> bool:
@@ -165,6 +178,26 @@ def _patch_to_json(
     if changed_fields is not None:
         record["changed_fields"] = list(changed_fields)
     return record
+
+
+def _copy_canonical_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Copy the known state containers without deep-copying immutable scalars."""
+    result = state.copy()
+    records = []
+    for record in state["observation_patches"]:
+        copied = record.copy()
+        if "box" in record:
+            copied["box"] = {key: list(value) for key, value in record["box"].items()}
+        if "restore_size_zyx" in record:
+            copied["restore_size_zyx"] = list(record["restore_size_zyx"])
+        records.append(copied)
+    result["observation_patches"] = records
+    result["placement_size"] = {
+        key: list(value) for key, value in state["placement_size"].items()
+    }
+    for key in ("delete_all_ids", "committed_added_ids", "provisional_added_ids", "retired_ids"):
+        result[key] = list(state[key])
+    return result
 
 
 _CHANGED_FIELD_ORDER = ("presence", "center_zyx", "size_zyx")
@@ -265,6 +298,8 @@ class ProofreadStore:
         self.retired_ids: set[int] = set()
         self._next_neuron_id = self.dataset.raw_N
         self._bound_sidecar_path: Path | None = None
+        self._bound_sidecar_fingerprint: str | None = None
+        self.last_history_warning: str | None = None
         self._saved_snapshot = self._canonical_state()
 
     # ------------------------------------------------------------------
@@ -814,7 +849,34 @@ class ProofreadStore:
 
     @property
     def saved_snapshot(self) -> dict[str, Any]:
-        return copy.deepcopy(self._saved_snapshot)
+        return _copy_canonical_state(self._saved_snapshot)
+
+    @property
+    def working_snapshot(self) -> dict[str, Any]:
+        """Return an independent canonical snapshot for background work."""
+        # Canonicalization already creates every nested container afresh.
+        return self._canonical_state()
+
+    @property
+    def bound_sidecar_path(self) -> Path | None:
+        return self._bound_sidecar_path
+
+    @property
+    def bound_sidecar_fingerprint(self) -> str | None:
+        return self._bound_sidecar_fingerprint
+
+    def bind_sidecar_baseline(
+        self, path: str | Path | None, fingerprint: str | None
+    ) -> None:
+        """Set a previously validated formal-file binding."""
+        if path is None:
+            self._bound_sidecar_path = None
+            self._bound_sidecar_fingerprint = None
+            return
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise ValueError("a formal-file SHA256 fingerprint is required")
+        self._bound_sidecar_path = Path(path)
+        self._bound_sidecar_fingerprint = fingerprint
 
     @property
     def dirty(self) -> bool:
@@ -851,6 +913,254 @@ class ProofreadStore:
         }
         self.retired_ids = {int(v) for v in state["retired_ids"]}
         self._next_neuron_id = int(state["next_neuron_id"])
+
+    def _validated_canonical_state(
+        self, state: Any, *, name: str
+    ) -> dict[str, Any]:
+        """Validate a complete recovery state without mutating this store."""
+        if not isinstance(state, dict):
+            raise SidecarError(f"{name} must be an object")
+        required = {
+            "observation_patches",
+            "delete_all_ids",
+            "placement_size",
+            "committed_added_ids",
+            "provisional_added_ids",
+            "retired_ids",
+            "next_neuron_id",
+        }
+        _require_fields(state, name, required=required)
+        committed = _id_set(state["committed_added_ids"], f"{name} committed")
+        provisional = _id_set(
+            state["provisional_added_ids"], f"{name} provisional"
+        )
+        retired = _id_set(state["retired_ids"], f"{name} retired")
+        if (committed & provisional) or (committed & retired) or (
+            provisional & retired
+        ):
+            raise SidecarError(f"{name} identity sets overlap")
+        added = committed | provisional | retired
+        if any(value < self.raw_N for value in added):
+            raise SidecarError(f"{name} added IDs overlap raw IDs")
+        next_id = state["next_neuron_id"]
+        if not _is_int(next_id) or int(next_id) < self.raw_N:
+            raise SidecarError(f"{name} next_neuron_id is invalid")
+        next_id = int(next_id)
+        if len(added) != next_id - self.raw_N or any(v >= next_id for v in added):
+            raise SidecarError(f"{name} added neuron lineage is incomplete")
+        known = set(range(self.raw_N)) | committed | provisional
+
+        delete_all = _id_set(state["delete_all_ids"], f"{name} delete_all")
+        if not delete_all <= known:
+            raise SidecarError(f"{name} delete_all references unknown neuron")
+        placement_raw = state["placement_size"]
+        if not isinstance(placement_raw, dict):
+            raise SidecarError(f"{name} placement_size must be an object")
+        placement: dict[str, list[float]] = {}
+        for key, value in placement_raw.items():
+            try:
+                neuron_id = int(key)
+            except (TypeError, ValueError) as exc:
+                raise SidecarError(f"{name} invalid placement neuron ID") from exc
+            if str(neuron_id) != key or neuron_id not in known:
+                raise SidecarError(f"{name} invalid placement neuron ID")
+            placement[key] = list(_json_size(value, f"{name} placement size"))
+
+        records = state["observation_patches"]
+        if not isinstance(records, list):
+            raise SidecarError(f"{name} observation_patches must be a list")
+        patches: list[dict[str, Any]] = []
+        keys: set[tuple[int, int]] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise SidecarError(f"{name} patch must be an object")
+            patch_state = record.get("state")
+            if patch_state == PRESENT:
+                _require_fields(
+                    record,
+                    f"{name} present patch",
+                    required={"volume_index", "neuron_id", "state", "box"},
+                )
+            elif patch_state == DELETED:
+                _require_fields(
+                    record,
+                    f"{name} deleted patch",
+                    required={"volume_index", "neuron_id", "state"},
+                    optional={"restore_size_zyx"},
+                )
+            else:
+                raise SidecarError(f"{name} patch state is invalid")
+            try:
+                volume_index = _require_int(record["volume_index"], "volume_index")
+                neuron_id = _require_int(record["neuron_id"], "neuron_id")
+            except TypeError as exc:
+                raise SidecarError(f"{name} patch indices are invalid") from exc
+            key = (volume_index, neuron_id)
+            if not 0 <= volume_index < self.raw_T or neuron_id not in known:
+                raise SidecarError(f"{name} patch references invalid observation")
+            if key in keys:
+                raise SidecarError(f"{name} contains duplicate patch")
+            if patch_state == DELETED and neuron_id in delete_all:
+                raise SidecarError(f"{name} deleted patch conflicts with delete_all")
+            keys.add(key)
+            if patch_state == PRESENT:
+                box_data = record["box"]
+                if not isinstance(box_data, dict):
+                    raise SidecarError(f"{name} patch box must be an object")
+                _require_fields(
+                    box_data,
+                    f"{name} patch box",
+                    required={"center_zyx", "size_zyx"},
+                )
+                box = _box_from_parts(
+                    neuron_id,
+                    volume_index,
+                    _json_triplet(box_data["center_zyx"], "box center_zyx"),
+                    _json_size(box_data["size_zyx"], "box size_zyx"),
+                )
+                patches.append(_patch_to_json(volume_index, neuron_id, ObservationPatch.present(box)))
+            else:
+                restore = (
+                    _json_size(record["restore_size_zyx"], "restore size")
+                    if "restore_size_zyx" in record
+                    else None
+                )
+                patches.append(
+                    _patch_to_json(
+                        volume_index,
+                        neuron_id,
+                        ObservationPatch.deleted(restore),
+                    )
+                )
+        return {
+            "observation_patches": sorted(
+                patches,
+                key=lambda item: (item["volume_index"], item["neuron_id"]),
+            ),
+            "delete_all_ids": sorted(delete_all),
+            "placement_size": {
+                key: placement[key]
+                for key in sorted(placement, key=lambda value: int(value))
+            },
+            "committed_added_ids": sorted(committed),
+            "provisional_added_ids": sorted(provisional),
+            "retired_ids": sorted(retired),
+            "next_neuron_id": next_id,
+        }
+
+    def recovery_payload(
+        self,
+        *,
+        session_uuid: str,
+        revision: int,
+        raw_sha256: str,
+        utc_time: str,
+        formal_path: str | Path | None = None,
+        formal_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Capture complete working and baseline state for crash recovery."""
+        if not isinstance(session_uuid, str) or not session_uuid:
+            raise ValueError("session_uuid is required")
+        if not _is_int(revision) or int(revision) < 1:
+            raise ValueError("revision must be a positive integer")
+        if not isinstance(raw_sha256, str) or len(raw_sha256) != 64:
+            raise ValueError("raw_sha256 must be a SHA256 hex digest")
+        bound_path = self._bound_sidecar_path if formal_path is None else Path(formal_path)
+        bound_fingerprint = (
+            self._bound_sidecar_fingerprint
+            if formal_fingerprint is None
+            else formal_fingerprint
+        )
+        return {
+            "recovery_schema_version": RECOVERY_SCHEMA_VERSION,
+            "session_uuid": session_uuid,
+            "utc_time": utc_time,
+            "revision": int(revision),
+            "raw": {
+                "shape": list(self.dataset.raw_shape),
+                "dtype": self.dataset.raw_dtype.str,
+                "z_divisor": float(self.dataset.z_divisor),
+                "sha256": raw_sha256,
+            },
+            "image_signature": copy.deepcopy(self.image_signature),
+            "formal": {
+                "path": None if bound_path is None else str(bound_path),
+                "sha256": bound_fingerprint,
+            },
+            "working_state": self.working_snapshot,
+            "saved_state": self.saved_snapshot,
+        }
+
+    def restore_recovery_payload(
+        self, payload: Any, *, raw_sha256: str | None = None
+    ) -> tuple[Path | None, str | None]:
+        """Validate a recovery completely, then replace this store's state."""
+        try:
+            validate_recovery_envelope(payload)
+        except ValueError as exc:
+            raise SidecarError(str(exc)) from exc
+        raw = payload.get("raw")
+        if not isinstance(raw, dict) or set(raw) != {
+            "shape",
+            "dtype",
+            "z_divisor",
+            "sha256",
+        }:
+            raise SidecarError("recovery raw metadata is invalid")
+        if (
+            not isinstance(raw["shape"], list)
+            or any(not _is_int(value) for value in raw["shape"])
+            or tuple(raw["shape"]) != self.dataset.raw_shape
+        ):
+            raise SidecarError("raw shape does not match dataset")
+        if raw["dtype"] != self.dataset.raw_dtype.str:
+            raise SidecarError("raw dtype does not match dataset")
+        if (
+            isinstance(raw["z_divisor"], bool)
+            or not isinstance(raw["z_divisor"], int | float)
+            or raw["z_divisor"] != self.dataset.z_divisor
+        ):
+            raise SidecarError("raw z_divisor does not match dataset")
+        actual_hash = self._raw_fingerprint() if raw_sha256 is None else raw_sha256
+        if raw["sha256"] != actual_hash:
+            raise SidecarError("raw fingerprint does not match dataset")
+        try:
+            image_signature = _canonical_json_value(payload["image_signature"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SidecarError("invalid image signature") from exc
+        if image_signature != self.image_signature:
+            raise SidecarError("image signature does not match dataset")
+        working = self._validated_canonical_state(
+            payload.get("working_state"), name="recovery working_state"
+        )
+        saved = self._validated_canonical_state(
+            payload.get("saved_state"), name="recovery saved_state"
+        )
+        saved_ids = set(saved["committed_added_ids"]) | set(saved["retired_ids"])
+        working_ids = set(working["committed_added_ids"]) | set(working["retired_ids"])
+        if (
+            saved["provisional_added_ids"]
+            or not saved_ids <= working_ids
+            or not set(saved["retired_ids"]) <= set(working["retired_ids"])
+        ):
+            raise SidecarError("recovery state changes committed identity lineage")
+        formal = payload.get("formal")
+        if not isinstance(formal, dict) or set(formal) != {"path", "sha256"}:
+            raise SidecarError("recovery formal baseline is invalid")
+        formal_path = formal["path"]
+        formal_hash = formal["sha256"]
+        if formal_path is not None and not isinstance(formal_path, str):
+            raise SidecarError("recovery formal path is invalid")
+        if formal_hash is not None and (
+            not isinstance(formal_hash, str) or len(formal_hash) != 64
+        ):
+            raise SidecarError("recovery formal fingerprint is invalid")
+        # No live mutation occurs until every field and both states validate.
+        self._restore_state(working)
+        self._saved_snapshot = saved
+        self._bound_sidecar_path = None
+        self._bound_sidecar_fingerprint = None
+        return (Path(formal_path) if formal_path is not None else None, formal_hash)
 
     def discard(self) -> None:
         """Restore the most recently saved/loaded canonical snapshot."""
@@ -1104,26 +1414,59 @@ class ProofreadStore:
         self._saved_snapshot = self._canonical_state()
 
     def save(self, path: str | Path | None = None) -> Path:
-        """Atomically save canonical edits to a JSON sidecar."""
+        """Atomically save canonical edits, preserving prior exact bytes."""
         target = self._sidecar_path(path)
         payload = self._payload_for_save()
         text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        output = text.encode("utf-8")
+        existing: bytes | None = None
+        if target.exists():
+            existing = target.read_bytes()
+
+        same_bound = False
+        if self._bound_sidecar_path is not None:
+            with contextlib.suppress(OSError, ValueError):
+                same_bound = (
+                    target.resolve() == self._bound_sidecar_path.resolve()
+                )
+        if (
+            same_bound
+            and self._bound_sidecar_fingerprint is not None
+            and (
+                existing is None
+                or sha256_bytes(existing) != self._bound_sidecar_fingerprint
+            )
+        ):
+            raise ExternalSidecarChangeError(
+                "bound proof sidecar changed externally; use Save As"
+            )
+
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-                stream.write(text)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
-            raise
+        if existing != output:
+            # History preservation is a prerequisite for replacing existing
+            # formal bytes.  A failure here leaves the primary untouched.
+            if existing is not None:
+                backup_formal_bytes(target, existing)
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(output)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+                raise
         self._commit_saved_payload(payload)
         self._bound_sidecar_path = target
+        self._bound_sidecar_fingerprint = sha256_bytes(output)
+        try:
+            self.last_history_warning = trim_history(target)
+        except OSError as exc:
+            self.last_history_warning = f"History cleanup failed: {exc}"
         return target
 
     save_as = save
@@ -1131,14 +1474,17 @@ class ProofreadStore:
     def _sidecar_path(self, path: str | Path | None) -> Path:
         if path is None:
             if self._bound_sidecar_path is not None:
-                return self._bound_sidecar_path
-            if self.dataset.path is None:
+                target = self._bound_sidecar_path
+            elif self.dataset.path is None:
                 raise ValueError(
                     "a sidecar path is required for an in-memory dataset"
                 )
-            target = self.dataset.path.with_suffix(".proofread.json")
+            else:
+                target = self.dataset.path.with_suffix(".proofread.json")
         else:
             target = Path(path)
+        if is_history_version(target):
+            raise ValueError("history snapshots are read-only; use Save As")
         if self.dataset.path is not None:
             try:
                 if target.resolve() == self.dataset.path.resolve():
@@ -1175,23 +1521,82 @@ class ProofreadStore:
         """Replace working state from a validated sidecar transactionally."""
         source = Path(path)
         try:
-            with source.open("r", encoding="utf-8") as stream:
-                payload = json.load(
-                    stream,
-                    parse_constant=_reject_json_constants,
-                    object_pairs_hook=_reject_duplicate_keys,
-                )
+            source_bytes = source.read_bytes()
+            payload = json.loads(
+                source_bytes.decode("utf-8"),
+                parse_constant=_reject_json_constants,
+                object_pairs_hook=_reject_duplicate_keys,
+            )
         except SidecarError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise SidecarError(f"cannot load proof sidecar: {exc}") from exc
         state = self._validate_payload(payload)
+        parsed_fingerprint = sha256_bytes(source_bytes)
+        try:
+            if fingerprint_file(source) != parsed_fingerprint:
+                raise SidecarError("proof sidecar changed while loading")
+        except OSError as exc:
+            raise SidecarError(f"proof sidecar changed while loading: {exc}") from exc
         # No mutation has happened before this point.
         self._restore_state(state)
         self._saved_snapshot = self._canonical_state()
         self._bound_sidecar_path = source
+        self._bound_sidecar_fingerprint = parsed_fingerprint
 
     load_sidecar = load
+
+    def load_history_as_working(self, path: str | Path) -> bool:
+        """Load an older formal version as working state over current baseline."""
+        historical = ProofreadStore(
+            self.dataset, image_signature=copy.deepcopy(self.image_signature)
+        )
+        historical.load(path)
+        return self.restore_history_snapshot(historical.working_snapshot)
+
+    def restore_history_snapshot(self, snapshot: dict[str, Any]) -> bool:
+        """Apply a staged history version after resolving pending GUI edits."""
+        working = self._validated_canonical_state(snapshot, name="history state")
+        if working["provisional_added_ids"]:
+            raise SidecarError("history must not contain provisional identities")
+        baseline = self.saved_snapshot
+        bound_path = self._bound_sidecar_path
+        bound_fingerprint = self._bound_sidecar_fingerprint
+
+        current_committed = set(baseline["committed_added_ids"])
+        current_retired = set(baseline["retired_ids"])
+        historical_committed = set(working["committed_added_ids"])
+        max_next = max(
+            int(baseline["next_neuron_id"]), int(working["next_neuron_id"])
+        )
+        lineage = set(range(self.raw_N, max_next))
+        committed = (current_committed & historical_committed) - current_retired
+        retired = lineage - committed
+        working["committed_added_ids"] = sorted(committed)
+        working["provisional_added_ids"] = []
+        working["retired_ids"] = sorted(retired)
+        working["next_neuron_id"] = max_next
+        working["observation_patches"] = [
+            record
+            for record in working["observation_patches"]
+            if int(record["neuron_id"]) not in retired
+        ]
+        working["delete_all_ids"] = [
+            value for value in working["delete_all_ids"] if int(value) not in retired
+        ]
+        working["placement_size"] = {
+            key: value
+            for key, value in working["placement_size"].items()
+            if int(key) not in retired
+        }
+        validated = self._validated_canonical_state(
+            working, name="history working state"
+        )
+        self._restore_state(validated)
+        self._saved_snapshot = baseline
+        self._bound_sidecar_path = bound_path
+        self._bound_sidecar_fingerprint = bound_fingerprint
+        return self.dirty
 
     def _validate_payload(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -1602,6 +2007,7 @@ __all__ = [
     "ABSENT",
     "DEFAULT_SIZE_ZYX",
     "DELETED",
+    "ExternalSidecarChangeError",
     "PRESENT",
     "RAW",
     "SCHEMA_VERSION",

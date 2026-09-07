@@ -318,6 +318,36 @@ creates a separate array with stable neuron indices; deleted geometry uses NaN
 in the first six fields. If an Image's shape or spatial metadata changes,
 proofreading pauses until a compatible Image is restored.
 
+Applied unsaved edits are also protected automatically every 30 seconds for a
+file-backed ROI. Recovery snapshots live beside the ROI in
+`<ROI filename>.proofread-recovery/`; they contain both the complete working
+state and the last saved/loaded baseline, but never an unapplied size draft.
+The **Recovery…** dialog lists snapshots and requires an explicit Restore or
+Delete—recovery is never loaded automatically. Protection continues while
+proofreading is off or its Image is detached. If the ROI file changes on disk,
+automatic writes pause and formal saves are refused until the ROI is reloaded.
+The status line reports the last protected time or a write failure; recovery
+does not clear the separate unsaved-edits indicator. With normal local I/O, a
+crash can lose roughly the latest 30 seconds plus snapshot processing time.
+Snapshots include the saved baseline, so they can be larger than the formal
+JSON. Unresolved snapshots from other sessions are retained until handled.
+
+Restoring a snapshot preserves provisional neuron IDs and Discard's saved
+baseline. If the original formal JSON has changed or disappeared, the next
+save requires **Save As…**. A read-only recovery directory is reported without
+repeated dialogs, and writes are retried on later timer ticks.
+
+Before replacing an existing formal JSON, Save/Save As preserves its exact
+previous bytes in `<formal filename>.history/`. The newest 10 distinct
+versions are retained, duplicate/no-op saves do not create backups, and an
+externally changed bound file must be saved with **Save As…**. **History…**
+loads an older version as unsaved working state over the current saved
+baseline; saving that rollback follows the same backup rules and never reuses
+an added neuron ID.
+History files cannot be overwritten even if opened through **Load…**. A backup
+failure leaves the formal JSON and unsaved edits intact; a failure to prune old
+history is reported separately after an otherwise successful save.
+
 ## Annotation
 
 The `digital` column stores the zero-based ROI `neuron_id`.

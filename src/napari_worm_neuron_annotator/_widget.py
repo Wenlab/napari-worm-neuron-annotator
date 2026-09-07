@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import uuid
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
+from threading import Event
 
 import napari
 import numpy as np
 from napari.layers import Image, Points, Vectors
-from qtpy.QtCore import QEvent, QObject, Qt
+from qtpy.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
 from qtpy.QtGui import (
     QBrush,
     QCloseEvent,
@@ -24,6 +28,7 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -32,6 +37,8 @@ from qtpy.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -74,9 +81,25 @@ from ._z_profile import ZThresholdProfileWidget
 try:
     # The model is optional while older installations are being upgraded.  The
     # widget remains usable for browse-only ROI navigation when it is absent.
-    from ._proofread import ProofreadStore
+    from ._proofread import ExternalSidecarChangeError, ProofreadStore
 except ImportError:  # pragma: no cover - exercised by compatibility installs
     ProofreadStore = None  # type: ignore[assignment,misc]
+    ExternalSidecarChangeError = ValueError  # type: ignore[assignment,misc]
+
+from ._proofread_files import (
+    canonical_json_bytes,
+    discard_temp,
+    file_identity,
+    fingerprint_file,
+    hash_file_stable,
+    list_history_versions,
+    list_recovery_candidates,
+    read_recovery,
+    recovery_directory,
+    recovery_path,
+    utc_now_text,
+    write_temp_bytes,
+)
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -123,6 +146,74 @@ Z_SOURCE_GEOMETRY_EVENTS = (
     "axis_labels",
     "units",
 )
+RECOVERY_INTERVAL_MS = 30_000
+# Keep detached, bounded workers alive until they finish, even if the dock is
+# deleted. They never own a QWidget or require the GUI thread to wait for I/O.
+_RECOVERY_WORKERS: dict[QThread, _RecoveryWorker] = {}
+
+
+def _release_recovery_worker(thread: QThread) -> None:
+    _RECOVERY_WORKERS.pop(thread, None)
+    thread.deleteLater()
+
+
+class _RecoveryWorker(QObject):
+    """Perform bounded recovery file work without touching Qt widgets."""
+
+    completed = Signal(object)
+
+    def __init__(self, task: dict[str, object]) -> None:
+        super().__init__()
+        self.task = task
+        self.result: dict[str, object] | None = None
+        self.cancelled = Event()
+
+    @Slot()
+    def run(self) -> None:
+        result: dict[str, object]
+        try:
+            kind = self.task["kind"]
+            if kind == "hash":
+                hashed = hash_file_stable(
+                    str(self.task["source"]),
+                    cancelled=self.cancelled.is_set,
+                )
+                result = {
+                    "ok": True,
+                    "kind": kind,
+                    "sha256": hashed.sha256,
+                    "identity": hashed.identity,
+                }
+            elif kind == "snapshot":
+                if self.cancelled.is_set():
+                    raise OSError("recovery cancelled")
+                data = canonical_json_bytes(self.task["payload"])
+                if self.cancelled.is_set():
+                    raise OSError("recovery cancelled")
+                temporary = write_temp_bytes(str(self.task["target"]), data)
+                result = {
+                    "ok": True,
+                    "kind": kind,
+                    "temporary": temporary,
+                    "target": Path(str(self.task["target"])),
+                    "state_key": self.task["state_key"],
+                    "utc_time": str(self.task["utc_time"]),
+                    "revision": int(self.task["revision"]),
+                }
+            else:
+                raise ValueError(f"unknown recovery task: {kind}")
+        except Exception as exc:  # noqa: BLE001 - worker boundary
+            result = {
+                "ok": False,
+                "kind": str(self.task.get("kind", "unknown")),
+                "error": str(exc),
+            }
+        result["generation"] = self.task.get("generation", -1)
+        result["session_uuid"] = self.task.get("session_uuid", "")
+        self.result = result
+        if self.cancelled.is_set():
+            discard_temp(result.get("temporary"))
+        self.completed.emit(result)
 
 
 def _match_neuron_ids(
@@ -241,6 +332,23 @@ class NeuronAnnotatorWidget(QWidget):
         self._proof_target_volume_index: int | None = None
         self._proof_target_context: tuple[int, int, int] | None = None
         self._proof_mouse_callback_installed = False
+        self._recovery_enabled = True
+        self._recovery_session_uuid = uuid.uuid4().hex
+        self._recovery_revision = 0
+        self._recovery_generation = 0
+        self._recovery_source_identity = None
+        self._recovery_raw_sha256: str | None = None
+        self._recovery_last_state_key: dict[str, object] | None = None
+        self._recovery_last_protected_utc: str | None = None
+        self._recovery_failure: str | None = None
+        self._recovery_source_changed = False
+        self._recovery_thread: QThread | None = None
+        self._recovery_worker: _RecoveryWorker | None = None
+        self._recovery_pending = False
+        self._recovery_pending_source: Path | None = None
+        self._recovery_current_path: Path | None = None
+        self._recovery_preserved_path: Path | None = None
+        self._recovery_candidate_count = 0
 
         self._setup_ui()
         # Initial spin-box values are defaults, not an unapplied user draft.
@@ -252,6 +360,10 @@ class NeuronAnnotatorWidget(QWidget):
         self._connect_viewer_events()
         self._bind_keys()
         self._refresh_image_layers()
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setInterval(RECOVERY_INTERVAL_MS)
+        self._recovery_timer.timeout.connect(self._on_recovery_timer)
+        self._recovery_timer.start()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -375,12 +487,13 @@ class NeuronAnnotatorWidget(QWidget):
         )
         profile_header.addWidget(self.z_profile_threshold_spin)
         self.z_profile_state_label = QLabel("")
-        profile_header.addWidget(self.z_profile_state_label)
+        self.z_profile_state_label.setWordWrap(True)
         profile_header.addStretch(1)
         self.z_profile_refresh_btn = QPushButton("Refresh")
         self.z_profile_refresh_btn.clicked.connect(self.refresh_z_profile)
         profile_header.addWidget(self.z_profile_refresh_btn)
         group_layout.addLayout(profile_header)
+        group_layout.addWidget(self.z_profile_state_label)
         self.z_profile = ZThresholdProfileWidget()
         self.z_profile.cutToggled.connect(self._toggle_z_profile_cut)
         group_layout.addWidget(self.z_profile)
@@ -493,16 +606,14 @@ class NeuronAnnotatorWidget(QWidget):
         self.proof_depth_spin.setValue(3)
         sizes.addWidget(QLabel("width:"), 0, 0)
         sizes.addWidget(self.proof_width_spin, 0, 1)
-        sizes.addWidget(QLabel("height:"), 0, 2)
-        sizes.addWidget(self.proof_height_spin, 0, 3)
-        sizes.addWidget(QLabel("depth:"), 0, 4)
-        sizes.addWidget(self.proof_depth_spin, 0, 5)
+        sizes.addWidget(QLabel("height:"), 1, 0)
+        sizes.addWidget(self.proof_height_spin, 1, 1)
+        sizes.addWidget(QLabel("depth:"), 2, 0)
+        sizes.addWidget(self.proof_depth_spin, 2, 1)
         sizes.setColumnStretch(1, 1)
-        sizes.setColumnStretch(3, 1)
-        sizes.setColumnStretch(5, 1)
         layout.addLayout(sizes)
 
-        apply_row = QHBoxLayout()
+        apply_row = QVBoxLayout()
         self.proof_apply_size_btn = QPushButton("Apply current t")
         self.proof_apply_size_btn.clicked.connect(self._proof_apply_size)
         apply_row.addWidget(self.proof_apply_size_btn)
@@ -530,16 +641,25 @@ class NeuronAnnotatorWidget(QWidget):
         self.proof_save_btn = QPushButton("Save edits")
         self.proof_save_as_btn = QPushButton("Save As…")
         self.proof_load_btn = QPushButton("Load…")
+        self.proof_history_btn = QPushButton("History…")
+        self.proof_recovery_btn = QPushButton("Recovery…")
         self.proof_discard_btn = QPushButton("Discard changes")
         self.proof_save_btn.clicked.connect(self.save_proof_edits)
         self.proof_save_as_btn.clicked.connect(self.save_proof_edits_as)
         self.proof_load_btn.clicked.connect(self.load_proof_edits)
+        self.proof_history_btn.clicked.connect(self.show_proof_history)
+        self.proof_recovery_btn.clicked.connect(self.show_proof_recovery)
         self.proof_discard_btn.clicked.connect(self.discard_proof_edits)
         io_row.addWidget(self.proof_save_btn, 0, 0)
         io_row.addWidget(self.proof_save_as_btn, 0, 1)
         io_row.addWidget(self.proof_load_btn, 1, 0)
         io_row.addWidget(self.proof_discard_btn, 1, 1)
+        io_row.addWidget(self.proof_history_btn, 2, 0)
+        io_row.addWidget(self.proof_recovery_btn, 2, 1)
         io_layout.addLayout(io_row)
+        self.proof_recovery_status_label = QLabel("Automatic recovery: waiting")
+        self.proof_recovery_status_label.setWordWrap(True)
+        io_layout.addWidget(self.proof_recovery_status_label)
         discard_row = QHBoxLayout()
         discard_row.addWidget(QLabel("Discard scope:"))
         self.proof_discard_scope_combo = QComboBox()
@@ -586,6 +706,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.proof_help_label = QLabel(
             "Click to lock target · F7 delete · F8 place · F9 add · F12 exit"
         )
+        self.proof_help_label.setWordWrap(True)
         self.proof_help_label.setToolTip(
             "Select the source Image layer. In 2D/All, click to lock the cyan crosshair, then use F8 or F9."
         )
@@ -637,6 +758,8 @@ class NeuronAnnotatorWidget(QWidget):
             self.proof_save_btn,
             self.proof_save_as_btn,
             self.proof_load_btn,
+            self.proof_history_btn,
+            self.proof_recovery_btn,
             self.proof_discard_btn,
             self.proof_export_btn,
         ):
@@ -660,6 +783,14 @@ class NeuronAnnotatorWidget(QWidget):
             self.proof_discard_btn.setEnabled(store is not None and (store_dirty or draft_dirty))
         if hasattr(self, "proof_discard_scope_combo"):
             self.proof_discard_scope_combo.setEnabled(store is not None)
+        if hasattr(self, "proof_history_btn"):
+            self.proof_history_btn.setEnabled(
+                store is not None and self._proof_sidecar_path is not None
+            )
+        if hasattr(self, "proof_recovery_btn"):
+            self.proof_recovery_btn.setEnabled(
+                store is not None and self._recovery_candidate_count > 0
+            )
         if hasattr(self, "proof_apply_size_btn"):
             can_apply = False
             can_apply_all = False
@@ -1580,6 +1711,491 @@ class NeuronAnnotatorWidget(QWidget):
         self._update_info()
         self._update_proof_action_state()
 
+    def _recovery_status_text(self) -> str:
+        if self._recovery_source_changed:
+            return "Automatic recovery paused: ROI source changed; reload it"
+        if self._recovery_failure:
+            return f"Automatic recovery failed: {self._recovery_failure}; retrying"
+        if self._recovery_last_protected_utc:
+            return f"Last protected: {self._recovery_last_protected_utc}"
+        if self._recovery_thread is not None:
+            return "Automatic recovery: protecting…"
+        if self._recovery_candidate_count:
+            return f"Recovery available ({self._recovery_candidate_count}); open Recovery…"
+        return "Automatic recovery: waiting for an applied edit"
+
+    def _update_recovery_status(self) -> None:
+        label = getattr(self, "proof_recovery_status_label", None)
+        if label is not None:
+            label.setText(self._recovery_status_text())
+
+    def _invalidate_recovery_task(self, *, delete_current: bool) -> None:
+        self._recovery_generation += 1
+        self._recovery_pending = False
+        if self._recovery_worker is not None:
+            self._recovery_worker.cancelled.set()
+        if delete_current:
+            for attribute in ("_recovery_current_path", "_recovery_preserved_path"):
+                path = getattr(self, attribute)
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        self._recovery_failure = f"could not remove old snapshot: {exc}"
+                    else:
+                        setattr(self, attribute, None)
+            self._recovery_last_state_key = None
+            self._recovery_last_protected_utc = None
+            self._refresh_recovery_candidate_count()
+        self._update_recovery_status()
+
+    def _refresh_recovery_candidate_count(self) -> None:
+        dataset = self.roi_dataset
+        self._recovery_candidate_count = 0
+        if dataset is not None and dataset.path is not None:
+            try:
+                self._recovery_candidate_count = sum(
+                    1 for _ in recovery_directory(dataset.path).glob("*.recovery.json")
+                )
+            except OSError as exc:
+                self._recovery_failure = str(exc)
+
+    def _begin_recovery_session(self) -> None:
+        self._invalidate_recovery_task(delete_current=False)
+        self._recovery_session_uuid = uuid.uuid4().hex
+        self._recovery_revision = 0
+        self._recovery_source_identity = None
+        self._recovery_raw_sha256 = None
+        self._recovery_last_state_key = None
+        self._recovery_last_protected_utc = None
+        self._recovery_failure = None
+        self._recovery_source_changed = False
+        self._recovery_current_path = None
+        self._recovery_preserved_path = None
+        self._recovery_pending_source = None
+        dataset = self.roi_dataset
+        if dataset is not None and dataset.path is not None:
+            with suppress(OSError):
+                self._recovery_source_identity = file_identity(dataset.path)
+        self._refresh_recovery_candidate_count()
+        self._update_recovery_status()
+
+    def _start_recovery_task(self, task: dict[str, object]) -> None:
+        if self._recovery_thread is not None:
+            self._recovery_pending = True
+            return
+        generation = self._recovery_generation
+        session_uuid = self._recovery_session_uuid
+        task["generation"] = generation
+        task["session_uuid"] = session_uuid
+        thread = QThread()
+        worker = _RecoveryWorker(task)
+        _RECOVERY_WORKERS[thread] = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_recovery_task_completed)
+        worker.completed.connect(thread.quit, Qt.DirectConnection)
+        worker.completed.connect(worker.deleteLater)
+        thread.finished.connect(self._on_recovery_thread_finished)
+        thread.finished.connect(lambda: _release_recovery_worker(thread))
+        self._recovery_thread = thread
+        self._recovery_worker = worker
+        thread.start()
+        self._update_recovery_status()
+
+    @Slot(object)
+    def _on_recovery_task_completed(self, result: dict[str, object]) -> None:
+        generation = int(result.get("generation", -1))
+        session_uuid = str(result.get("session_uuid", ""))
+        temporary = result.get("temporary")
+        valid = (
+            not self._closed
+            and generation == self._recovery_generation
+            and session_uuid == self._recovery_session_uuid
+        )
+        try:
+            if not valid:
+                discard_temp(temporary)
+                return
+            if not bool(result.get("ok")):
+                self._recovery_failure = str(result.get("error", "unknown error"))
+                return
+            if result["kind"] == "hash":
+                if (
+                    self._recovery_source_identity is not None
+                    and result["identity"] != self._recovery_source_identity
+                ):
+                    self._recovery_source_changed = True
+                    self._recovery_failure = None
+                    return
+                self._recovery_raw_sha256 = str(result["sha256"])
+                self._recovery_source_identity = result["identity"]
+                self._recovery_failure = None
+                self._schedule_recovery_snapshot(force=True)
+                return
+            target = Path(result["target"])
+            dataset = self.roi_dataset
+            if dataset is None or file_identity(dataset.path) != self._recovery_source_identity:
+                discard_temp(temporary)
+                self._recovery_source_changed = True
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(Path(temporary), target)
+            self._recovery_current_path = target
+            self._recovery_last_state_key = result["state_key"]
+            self._recovery_last_protected_utc = str(result["utc_time"])
+            self._recovery_failure = None
+            preserved = self._recovery_preserved_path
+            if preserved is not None and preserved != target:
+                try:
+                    preserved.unlink(missing_ok=True)
+                except OSError as exc:
+                    self._recovery_failure = f"could not remove replaced recovery: {exc}"
+                else:
+                    self._recovery_preserved_path = None
+            self._refresh_recovery_candidate_count()
+        except OSError as exc:
+            discard_temp(temporary)
+            self._recovery_failure = str(exc)
+        finally:
+            if not self._closed:
+                self._update_recovery_status()
+                self._update_proof_action_state()
+
+    def _on_recovery_thread_finished(self) -> None:
+        if self.sender() is not self._recovery_thread:
+            return
+        self._recovery_thread = None
+        self._recovery_worker = None
+        pending = self._recovery_pending
+        self._recovery_pending = False
+        if pending and not self._closed:
+            self._schedule_recovery_snapshot(force=True)
+
+    def _stop_recovery_worker(self) -> None:
+        thread = self._recovery_thread
+        worker = self._recovery_worker
+        if thread is None:
+            return
+        if worker is not None:
+            worker.cancelled.set()
+            with suppress(TypeError, RuntimeError):
+                worker.completed.disconnect(self._on_recovery_task_completed)
+        with suppress(TypeError, RuntimeError):
+            thread.finished.disconnect(self._on_recovery_thread_finished)
+        thread.quit()
+        if worker is not None and worker.result is not None:
+            discard_temp(worker.result.get("temporary"))
+        self._recovery_thread = None
+        self._recovery_worker = None
+        self._recovery_pending = False
+
+    def _on_recovery_timer(self) -> None:
+        self._schedule_recovery_snapshot()
+
+    def _schedule_recovery_snapshot(self, *, force: bool = False) -> None:
+        store = self.proofread_store
+        dataset = self.roi_dataset
+        if (
+            not self._recovery_enabled
+            or store is None
+            or dataset is None
+            or dataset.path is None
+            or self._closed
+            or self._recovery_source_changed
+        ):
+            return
+        source = Path(dataset.path)
+        if self._recovery_thread is not None:
+            self._recovery_pending = True
+            return
+        if self._recovery_raw_sha256 is None:
+            if not store.dirty:
+                self._invalidate_recovery_task(delete_current=True)
+                return
+            try:
+                identity = file_identity(source)
+            except OSError as exc:
+                self._recovery_failure = str(exc)
+                self._update_recovery_status()
+                return
+            if (
+                self._recovery_source_identity is not None
+                and identity != self._recovery_source_identity
+            ):
+                self._recovery_source_changed = True
+                self._recovery_failure = None
+                self._update_recovery_status()
+                return
+            self._recovery_pending_source = source
+            self._start_recovery_task({"kind": "hash", "source": source})
+            return
+        try:
+            if file_identity(source) != self._recovery_source_identity:
+                self._recovery_source_changed = True
+                self._recovery_failure = None
+                self._update_recovery_status()
+                return
+        except OSError as exc:
+            self._recovery_failure = str(exc)
+            self._update_recovery_status()
+            return
+        utc_time = utc_now_text()
+        payload = store.recovery_payload(
+            session_uuid=self._recovery_session_uuid,
+            revision=self._recovery_revision + 1,
+            raw_sha256=self._recovery_raw_sha256,
+            utc_time=utc_time,
+            formal_path=self._proof_sidecar_path,
+            formal_fingerprint=store.bound_sidecar_fingerprint,
+        )
+        if payload["working_state"] == payload["saved_state"]:
+            self._invalidate_recovery_task(delete_current=True)
+            return
+        state_key = {
+            "working": payload["working_state"],
+            "saved": payload["saved_state"],
+            "formal_path": payload["formal"]["path"],
+            "formal_sha256": payload["formal"]["sha256"],
+        }
+        if not force and state_key == self._recovery_last_state_key:
+            return
+        self._recovery_revision += 1
+        target = recovery_path(source, self._recovery_session_uuid)
+        self._start_recovery_task(
+            {
+                "kind": "snapshot",
+                "payload": payload,
+                "target": target,
+                "state_key": state_key,
+                "utc_time": utc_time,
+                "revision": self._recovery_revision,
+            }
+        )
+
+    def _delete_current_recovery(self) -> None:
+        self._invalidate_recovery_task(delete_current=True)
+
+    def _format_candidate(self, candidate) -> str:
+        if candidate.error:
+            return f"Corrupt: {candidate.path.name} — {candidate.error}"
+        utc = candidate.utc_time or "unknown time"
+        try:
+            local = datetime.fromisoformat(utc.replace("Z", "+00:00")).astimezone()
+            local_text = local.strftime("%Y-%m-%d %H:%M:%S %Z")
+        except ValueError:
+            local_text = "invalid time"
+        formal = Path(candidate.formal_path).name if candidate.formal_path else "unsaved"
+        source_status = "source unconfirmed"
+        dataset = self.roi_dataset
+        if dataset is not None:
+            try:
+                raw = read_recovery(candidate.path)["raw"]
+                source_status = (
+                    "source metadata matches"
+                    if tuple(raw.get("shape", ())) == dataset.raw_shape
+                    and raw.get("dtype") == dataset.raw_dtype.str
+                    and raw.get("z_divisor") == dataset.z_divisor
+                    else "source metadata differs"
+                )
+            except (OSError, TypeError, ValueError):
+                source_status = "source invalid"
+        return (
+            f"{utc} ({local_text}) · {formal} · {source_status}; "
+            "full hash checked on restore"
+        )
+
+    def show_proof_recovery(self) -> None:
+        dataset = self.roi_dataset
+        if dataset is None or dataset.path is None:
+            return
+        candidates = list_recovery_candidates(dataset.path)
+        if not candidates:
+            self.update_status("No recovery snapshots found", "green")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Proofreading recovery")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Recovery snapshots are never loaded automatically."))
+        entries = QListWidget()
+        for candidate in candidates:
+            item = QListWidgetItem(self._format_candidate(candidate))
+            item.setData(Qt.UserRole, candidate)
+            entries.addItem(item)
+        entries.setCurrentRow(0)
+        layout.addWidget(entries)
+        buttons = QHBoxLayout()
+        restore = QPushButton("Restore")
+        delete = QPushButton("Delete")
+        later = QPushButton("Later")
+        buttons.addWidget(restore)
+        buttons.addWidget(delete)
+        buttons.addWidget(later)
+        layout.addLayout(buttons)
+
+        def selected():
+            item = entries.currentItem()
+            return None if item is None else item.data(Qt.UserRole)
+
+        def restore_selected() -> None:
+            candidate = selected()
+            if candidate is not None and self._restore_recovery(candidate.path):
+                dialog.accept()
+
+        def delete_selected() -> None:
+            candidate = selected()
+            if candidate is None:
+                return
+            try:
+                candidate.path.unlink()
+            except OSError as exc:
+                self.update_status(f"Could not delete recovery: {exc}", "red")
+                return
+            if candidate.path == self._recovery_current_path:
+                self._invalidate_recovery_task(delete_current=False)
+                self._recovery_current_path = None
+                self._recovery_last_state_key = None
+                self._recovery_last_protected_utc = None
+            if candidate.path == self._recovery_preserved_path:
+                self._recovery_preserved_path = None
+            row = entries.currentRow()
+            entries.takeItem(row)
+            if entries.count() == 0:
+                dialog.accept()
+            self._recovery_candidate_count = entries.count()
+            self._update_recovery_status()
+            self._update_proof_action_state()
+
+        restore.clicked.connect(restore_selected)
+        delete.clicked.connect(delete_selected)
+        later.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _restore_recovery(self, path: str | Path) -> bool:
+        store = self.proofread_store
+        dataset = self.roi_dataset
+        if store is None or dataset is None or dataset.path is None:
+            return False
+        try:
+            payload = read_recovery(path)
+            raw_check = hash_file_stable(dataset.path)
+            if (
+                self._recovery_source_identity is not None
+                and raw_check.identity != self._recovery_source_identity
+            ):
+                raise ValueError("ROI source changed; reload it before recovery")
+            staged = ProofreadStore(
+                dataset, image_signature=store.image_signature
+            )
+            formal_path, formal_hash = staged.restore_recovery_payload(
+                payload, raw_sha256=raw_check.sha256
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            self.update_status(f"Recovery restore failed: {exc}", "red")
+            return False
+        if not self._confirm_proof_transition("restoring recovery"):
+            return False
+        self._invalidate_recovery_task(delete_current=False)
+        self.proofread_store = staged
+        bind_formal = False
+        if formal_path is not None and formal_hash is not None:
+            with suppress(OSError):
+                bind_formal = fingerprint_file(formal_path) == formal_hash
+        if bind_formal:
+            staged.bind_sidecar_baseline(formal_path, formal_hash)
+            self._proof_sidecar_path = formal_path
+        else:
+            self._proof_sidecar_path = None
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self._clear_proof_target()
+        self._begin_recovery_session()
+        self._recovery_raw_sha256 = raw_check.sha256
+        self._recovery_source_identity = raw_check.identity
+        self._recovery_preserved_path = Path(path)
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self._update_proof_path_display()
+        self._schedule_recovery_snapshot(force=True)
+        self.update_status("Restored proofreading recovery", "green")
+        return True
+
+    def show_proof_history(self) -> None:
+        store = self.proofread_store
+        formal_path = self._proof_sidecar_path
+        if store is None or formal_path is None:
+            self.update_status("No bound proof sidecar history", "orange")
+            return
+        versions = list_history_versions(formal_path)
+        if not versions:
+            self.update_status("No proof history versions", "green")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Proofreading history")
+        layout = QVBoxLayout(dialog)
+        entries = QListWidget()
+        for version in versions:
+            item = QListWidgetItem(
+                f"{version.utc_time} · {version.size} bytes · {version.path.name}"
+            )
+            item.setData(Qt.UserRole, version.path)
+            entries.addItem(item)
+        entries.setCurrentRow(0)
+        layout.addWidget(entries)
+        row = QHBoxLayout()
+        load = QPushButton("Load as working state")
+        cancel = QPushButton("Cancel")
+        row.addWidget(load)
+        row.addWidget(cancel)
+        layout.addLayout(row)
+
+        def load_selected() -> None:
+            item = entries.currentItem()
+            if item is None:
+                return
+            if self._load_history_version(Path(item.data(Qt.UserRole))):
+                dialog.accept()
+
+        load.clicked.connect(load_selected)
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _load_history_version(self, path: Path) -> bool:
+        store = self.proofread_store
+        if store is None:
+            return False
+        try:
+            historical = ProofreadStore(store.dataset, image_signature=store.image_signature)
+            historical.load(path)
+            snapshot = historical.working_snapshot
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            self.update_status(f"History load failed: {exc}", "red")
+            return False
+        if not self._confirm_proof_transition("loading proof history"):
+            return False
+        try:
+            if (
+                store.bound_sidecar_path is not None
+                and fingerprint_file(store.bound_sidecar_path) != store.bound_sidecar_fingerprint
+            ):
+                raise ValueError("formal file changed externally; reload it or use Save As")
+            changed = store.restore_history_snapshot(snapshot)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            self.update_status(f"History load failed: {exc}", "red")
+            return False
+        self._proof_size_draft_dirty = False
+        self._proof_size_draft_target = None
+        self._clear_proof_target()
+        self._invalidate_recovery_task(delete_current=True)
+        self._refresh_available_ids(select_first=False)
+        self._refresh_after_proof_edit()
+        self._schedule_recovery_snapshot(force=True)
+        self.update_status(
+            "Loaded history as working state" if changed else "History matches current state",
+            "green",
+        )
+        return True
+
     def save_proof_edits(self) -> None:
         store = self.proofread_store
         if store is None:
@@ -1612,15 +2228,31 @@ class NeuronAnnotatorWidget(QWidget):
         if store is None:
             return False
         try:
+            if (
+                store.dataset.path is not None
+                and self._recovery_source_identity is not None
+                and file_identity(store.dataset.path) != self._recovery_source_identity
+            ):
+                self._recovery_source_changed = True
+                self._update_recovery_status()
+                raise ValueError("ROI source changed; reload it before saving")
             store.save(path)
+        except ExternalSidecarChangeError as error:
+            self.update_status(f"{error}. Choose Save As…", "red")
+            return False
         except (OSError, PermissionError, ValueError, RuntimeError) as error:
             self.update_status(f"Proof save failed: {error}", "red")
             return False
         self._proof_sidecar_path = Path(path)
+        warning = store.last_history_warning
+        self._delete_current_recovery()
         self._update_proof_path_display()
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
-        self.update_status(f"Saved proof edits: {Path(path).name}", "green")
+        message = f"Saved proof edits: {Path(path).name}"
+        if warning:
+            message += f"; {warning}"
+        self.update_status(message, "orange" if warning else "green")
         return True
 
     def _save_proof_edits_for_transition(self) -> bool:
@@ -1661,6 +2293,7 @@ class NeuronAnnotatorWidget(QWidget):
             return self._save_proof_edits_for_transition()
         if result == QMessageBox.Discard:
             store.discard()
+            self._delete_current_recovery()
             self._refresh_available_ids(select_first=False)
             return True
         return False
@@ -1736,6 +2369,7 @@ class NeuronAnnotatorWidget(QWidget):
                 return
         self.proofread_store = loaded
         self._proof_sidecar_path = Path(path)
+        self._delete_current_recovery()
         self._update_proof_path_display()
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
@@ -1806,6 +2440,10 @@ class NeuronAnnotatorWidget(QWidget):
             self._proof_size_draft_dirty = False
             self._proof_size_draft_target = None
         changed = bool(changed or discard_draft)
+        if changed:
+            self._invalidate_recovery_task(delete_current=True)
+            if store.dirty:
+                self._schedule_recovery_snapshot(force=True)
         self._refresh_available_ids(select_first=False)
         self._refresh_after_proof_edit()
         self.update_status(status if changed else "No matching unsaved edits", "green")
@@ -2476,6 +3114,13 @@ class NeuronAnnotatorWidget(QWidget):
             and not self._confirm_proof_transition("switching Image")
         ):
             return False
+        invalidates_recovery = bool(
+            self.roi_dataset is not None
+            and self.proofread_store is not None
+            and not force
+        )
+        if invalidates_recovery:
+            self._invalidate_recovery_task(delete_current=True)
         preserve_draft = force and self._proof_size_draft_dirty
         if self.proofreading_enabled:
             self._proof_cancel_or_exit()
@@ -2499,6 +3144,7 @@ class NeuronAnnotatorWidget(QWidget):
                     image_signature=self._proof_image_signature(source),
                 )
                 self._proof_sidecar_path = None
+                self._begin_recovery_session()
                 self._update_proof_path_display()
         self.load_roi_btn.setEnabled(
             source is not None and self.roi_dataset is None
@@ -2991,6 +3637,12 @@ class NeuronAnnotatorWidget(QWidget):
             return True
         if not force and not self._confirm_proof_transition("closing the widget"):
             return False
+        # A forced/process shutdown must retain the newest already completed
+        # recovery. Invalidate any in-flight temp so it cannot publish after
+        # the widget lifecycle ends, without deleting the completed file.
+        self._recovery_timer.stop()
+        self._invalidate_recovery_task(delete_current=False)
+        self._stop_recovery_worker()
         self._remove_proof_key_filter()
         self._remove_proof_mouse_callback()
         self._clear_proof_target()
@@ -3535,6 +4187,10 @@ class NeuronAnnotatorWidget(QWidget):
             if ProofreadStore
             else None
         )
+        self._begin_recovery_session()
+        self._recovery_candidate_count = len(
+            list_recovery_candidates(source_path)
+        )
         self._proof_detached = False
         self.roi_path_input.setText(str(source_path))
         self.unload_roi_btn.setEnabled(True)
@@ -3550,6 +4206,12 @@ class NeuronAnnotatorWidget(QWidget):
         self.proofreading_toggle.setEnabled(self._proof_view_allowed())
         self._set_proofreading_controls_enabled(False)
         self.update_status(f"Loaded ROI: {source_path.name}", "green")
+        if self._recovery_candidate_count:
+            self.update_status(
+                f"Found {self._recovery_candidate_count} proofreading recovery snapshot(s)",
+                "orange",
+            )
+        self._update_proof_action_state()
 
     def unload_roi(self, *, force: bool = False) -> bool:
         if not force and not self._confirm_proof_transition("unloading ROI"):
@@ -3559,6 +4221,7 @@ class NeuronAnnotatorWidget(QWidget):
         else:
             self._remove_proof_mouse_callback()
             self._clear_proof_target()
+        self._invalidate_recovery_task(delete_current=not force)
         self.proofread_store = None
         self._proof_sidecar_path = None
         self._update_proof_path_display()
@@ -3574,6 +4237,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.roi_info_label.setText("No ROI loaded")
         self.proofreading_toggle.setEnabled(False)
         self._set_proofreading_controls_enabled(False)
+        self._recovery_candidate_count = 0
         self._rebuild_selection_items()
         self._update_proof_current_box_status()
         self._update_info()

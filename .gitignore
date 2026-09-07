@@ -82,6 +82,9 @@ venv/
 
 # Local validation datasets
 /data/
+*.proofread-recovery/
+*.json.history/
+.*.json.*.tmp
 
 # written by setuptools_scm
 **/_version.py
