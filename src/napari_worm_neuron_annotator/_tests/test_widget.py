@@ -142,6 +142,17 @@ def test_widget_ignores_labels_layers_when_no_image_exists(make_napari_viewer):
     assert not widget.orientation_group.isEnabled()
 
 
+def test_empty_viewer_shutdown_preserves_three_dimensional_camera_center(
+    make_napari_viewer,
+):
+    viewer = make_napari_viewer()
+    viewer.camera.center = (1.0, 2.0, 3.0)
+    widget = NeuronAnnotatorWidget(viewer)
+
+    assert widget.shutdown(force=True)
+    assert tuple(viewer.camera.center) == (1.0, 2.0, 3.0)
+
+
 def test_orientation_controls_apply_absolute_viewer_transform_and_reset(
     make_napari_viewer,
 ):

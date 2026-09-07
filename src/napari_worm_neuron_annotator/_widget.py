@@ -2181,10 +2181,15 @@ class NeuronAnnotatorWidget(QWidget):
         camera: Orientation2D,
     ) -> None:
         current_order = tuple(self.viewer.dims.order)
+        camera_center = tuple(self.viewer.camera.center)
+        spatial_count = min(3, len(current_order))
         center_by_axis = dict(
-            zip(current_order[-3:], self.viewer.camera.center, strict=True)
+            zip(current_order[-3:], camera_center[-spatial_count:], strict=True)
         )
-        center = tuple(center_by_axis[axis] for axis in order[-3:])
+        # An empty viewer has two dimensions, but Camera.center stays 3D.
+        center = camera_center[: 3 - spatial_count] + tuple(
+            center_by_axis[axis] for axis in order[-3:]
+        )
         zoom = float(self.viewer.camera.zoom)
         angles = tuple(self.viewer.camera.angles)
         current_step = tuple(self.viewer.dims.current_step)
