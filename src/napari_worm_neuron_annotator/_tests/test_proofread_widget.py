@@ -20,7 +20,6 @@ from qtpy.QtWidgets import QApplication, QLineEdit, QMessageBox
 from napari_worm_neuron_annotator._proofread import (
     DELETED,
     PRESENT,
-    ObservationPatch,
 )
 from napari_worm_neuron_annotator._proofread_files import (
     canonical_json_bytes,
@@ -961,9 +960,14 @@ def test_f8_requires_click_target_and_preserves_float_restore_size(
     store = widget.proofread_store
     _enable_proofreading(widget)
     widget._proof_delete_current()
-    store.observation_patches[(1, 0)] = ObservationPatch.deleted(
-        (2.5, 6.25, 8.75)
+    raw_box = store.dataset.get_box_at_volume_index(1, 0)
+    store.set_observation_present(
+        1,
+        0,
+        center_zyx=raw_box.center_zyx,
+        size_zyx=(2.5, 6.25, 8.75),
     )
+    store.set_observation_deleted(1, 0)
     widget._proof_size_draft_dirty = False
     widget._update_proof_size_controls()
 

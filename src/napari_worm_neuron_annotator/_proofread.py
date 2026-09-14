@@ -15,8 +15,10 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 import numpy as np
@@ -72,7 +74,11 @@ class ObservationPatch:
         elif self.box is not None:
             raise ValueError("deleted patch cannot carry a box")
         if self.restore_size_zyx is not None:
-            _validate_size(self.restore_size_zyx)
+            object.__setattr__(
+                self,
+                "restore_size_zyx",
+                _validate_size(self.restore_size_zyx),
+            )
 
     @classmethod
     def present(cls, box: NeuronBox) -> ObservationPatch:
@@ -180,28 +186,130 @@ def _patch_to_json(
     return record
 
 
-def _copy_canonical_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Copy the known state containers without deep-copying immutable scalars."""
-    result = state.copy()
-    records = []
-    for record in state["observation_patches"]:
-        copied = record.copy()
-        if "box" in record:
-            copied["box"] = {key: list(value) for key, value in record["box"].items()}
-        if "restore_size_zyx" in record:
-            copied["restore_size_zyx"] = list(record["restore_size_zyx"])
-        records.append(copied)
-    result["observation_patches"] = records
-    result["placement_size"] = {
-        key: list(value) for key, value in state["placement_size"].items()
-    }
-    for key in ("delete_all_ids", "committed_added_ids", "provisional_added_ids", "retired_ids"):
-        result[key] = list(state[key])
-    return result
-
-
 _CHANGED_FIELD_ORDER = ("presence", "center_zyx", "size_zyx")
 _CHANGED_FIELDS = frozenset(_CHANGED_FIELD_ORDER)
+_RAW_BOX_UNSET = object()
+
+
+@dataclass(frozen=True)
+class ProofreadStatus:
+    """Cached summary of the working proofreading state."""
+
+    dirty: bool
+    moved: int
+    resized: int
+    presence: int
+
+
+@dataclass(frozen=True)
+class _StoreState:
+    """Immutable-container snapshot used for baselines and worker handoff."""
+
+    observation_patches: Mapping[tuple[int, int], ObservationPatch]
+    delete_all_ids: frozenset[int]
+    placement_size: Mapping[int, tuple[float, float, float]]
+    committed_added_ids: frozenset[int]
+    provisional_added_ids: frozenset[int]
+    retired_ids: frozenset[int]
+    next_neuron_id: int
+    changed_fields: Mapping[tuple[int, int], tuple[str, ...]]
+
+
+def _frozen_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
+    return MappingProxyType(dict(values))
+
+
+def _store_state(
+    *,
+    observation_patches: Mapping[tuple[int, int], ObservationPatch],
+    delete_all_ids: set[int] | frozenset[int],
+    placement_size: Mapping[int, tuple[float, float, float]],
+    committed_added_ids: set[int] | frozenset[int],
+    provisional_added_ids: set[int] | frozenset[int],
+    retired_ids: set[int] | frozenset[int],
+    next_neuron_id: int,
+    changed_fields: Mapping[tuple[int, int], tuple[str, ...]],
+) -> _StoreState:
+    """Own immutable top-level containers while sharing immutable records."""
+    return _StoreState(
+        observation_patches=_frozen_mapping(observation_patches),
+        delete_all_ids=frozenset(delete_all_ids),
+        placement_size=_frozen_mapping(placement_size),
+        committed_added_ids=frozenset(committed_added_ids),
+        provisional_added_ids=frozenset(provisional_added_ids),
+        retired_ids=frozenset(retired_ids),
+        next_neuron_id=int(next_neuron_id),
+        changed_fields=_frozen_mapping(changed_fields),
+    )
+
+
+def _state_to_json(state: _StoreState) -> dict[str, Any]:
+    """Return the established detached JSON-dictionary state interface."""
+    return {
+        "observation_patches": [
+            _patch_to_json(volume_index, neuron_id, patch)
+            for (volume_index, neuron_id), patch in sorted(
+                state.observation_patches.items()
+            )
+        ],
+        "delete_all_ids": sorted(state.delete_all_ids),
+        "placement_size": {
+            str(neuron_id): [float(value) for value in size]
+            for neuron_id, size in sorted(state.placement_size.items())
+        },
+        "committed_added_ids": sorted(state.committed_added_ids),
+        "provisional_added_ids": sorted(state.provisional_added_ids),
+        "retired_ids": sorted(state.retired_ids),
+        "next_neuron_id": int(state.next_neuron_id),
+    }
+
+
+@dataclass(frozen=True)
+class _RecoveryCapture:
+    """Store-independent immutable input for recovery serialization."""
+
+    raw_shape: tuple[int, ...]
+    raw_dtype: str
+    z_divisor: float
+    image_signature: Any
+    formal_path: str | None
+    formal_fingerprint: str | None
+    working_state: _StoreState
+    saved_state: _StoreState
+
+    def payload(
+        self,
+        *,
+        session_uuid: str,
+        revision: int,
+        raw_sha256: str,
+        utc_time: str,
+    ) -> dict[str, Any]:
+        return {
+            "recovery_schema_version": RECOVERY_SCHEMA_VERSION,
+            "session_uuid": session_uuid,
+            "utc_time": utc_time,
+            "revision": int(revision),
+            "raw": {
+                "shape": list(self.raw_shape),
+                "dtype": self.raw_dtype,
+                "z_divisor": self.z_divisor,
+                "sha256": raw_sha256,
+            },
+            "image_signature": copy.deepcopy(self.image_signature),
+            "formal": {
+                "path": self.formal_path,
+                "sha256": self.formal_fingerprint,
+            },
+            "working_state": _state_to_json(self.working_state),
+            "saved_state": _state_to_json(self.saved_state),
+        }
+
+
+@dataclass(frozen=True)
+class _SavePlan:
+    payload: dict[str, Any]
+    committed_state: _StoreState
 
 
 def _ordered_changed_fields(value: Any) -> tuple[str, ...]:
@@ -290,17 +398,47 @@ class ProofreadStore:
             raise TypeError("dataset must be a NeuronBoxDataset")
         self.dataset = dataset
         self.image_signature = _canonical_json_value(image_signature)
-        self.observation_patches: dict[tuple[int, int], ObservationPatch] = {}
-        self.delete_all_ids: set[int] = set()
-        self.placement_size: dict[int, tuple[float, float, float]] = {}
-        self.committed_added_ids: set[int] = set()
-        self.provisional_added_ids: set[int] = set()
-        self.retired_ids: set[int] = set()
+        self._observation_patches: dict[
+            tuple[int, int], ObservationPatch
+        ] = {}
+        self._delete_all_ids: set[int] = set()
+        self._placement_size: dict[int, tuple[float, float, float]] = {}
+        self._committed_added_ids: set[int] = set()
+        self._provisional_added_ids: set[int] = set()
+        self._retired_ids: set[int] = set()
         self._next_neuron_id = self.dataset.raw_N
+        self._revision = 0
+        self._baseline_revision = 0
+
+        self._changed_fields: dict[tuple[int, int], tuple[str, ...]] = {}
+        self._field_observations = {
+            field: set() for field in _CHANGED_FIELD_ORDER
+        }
+        self._changed_keys_by_neuron: dict[
+            int, set[tuple[int, int]]
+        ] = {}
+        self._patch_keys_by_neuron: dict[
+            int, set[tuple[int, int]]
+        ] = {}
+        self._raw_presence_cache: dict[int, frozenset[int]] = {}
+        self._effective_presence_cache: dict[int, frozenset[int]] = {}
+
+        self._dirty_patch_keys: set[tuple[int, int]] = set()
+        self._dirty_delete_all_ids: set[int] = set()
+        self._dirty_placement_ids: set[int] = set()
+        self._dirty_committed_ids: set[int] = set()
+        self._dirty_provisional_ids: set[int] = set()
+        self._dirty_retired_ids: set[int] = set()
+        self._allocator_dirty = False
+        self._status = ProofreadStatus(False, 0, 0, 0)
+
         self._bound_sidecar_path: Path | None = None
         self._bound_sidecar_fingerprint: str | None = None
         self.last_history_warning: str | None = None
-        self._saved_snapshot = self._canonical_state()
+        self._saved_state = self._capture_state()
+        self._saved_patch_keys_by_neuron: dict[
+            int, set[tuple[int, int]]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Identity and raw-data helpers
@@ -314,36 +452,79 @@ class ProofreadStore:
         return self.dataset.raw_N
 
     @property
+    def observation_patches(
+        self,
+    ) -> Mapping[tuple[int, int], ObservationPatch]:
+        return MappingProxyType(self._observation_patches)
+
+    @property
+    def delete_all_ids(self) -> frozenset[int]:
+        return frozenset(self._delete_all_ids)
+
+    @property
+    def placement_size(
+        self,
+    ) -> Mapping[int, tuple[float, float, float]]:
+        return MappingProxyType(self._placement_size)
+
+    @property
+    def committed_added_ids(self) -> frozenset[int]:
+        return frozenset(self._committed_added_ids)
+
+    @property
+    def provisional_added_ids(self) -> frozenset[int]:
+        return frozenset(self._provisional_added_ids)
+
+    @property
+    def retired_ids(self) -> frozenset[int]:
+        return frozenset(self._retired_ids)
+
+    @property
+    def next_neuron_id(self) -> int:
+        return self._next_neuron_id
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    @property
+    def baseline_revision(self) -> int:
+        return self._baseline_revision
+
+    @property
+    def status(self) -> ProofreadStatus:
+        return self._status
+
+    @property
     def neuron_ids(self) -> list[int]:
         """Current non-retired identities in deterministic order."""
         ids = set(range(self.raw_N))
-        ids.update(self.committed_added_ids)
-        ids.update(self.provisional_added_ids)
-        ids.difference_update(self.retired_ids)
+        ids.update(self._committed_added_ids)
+        ids.update(self._provisional_added_ids)
+        ids.difference_update(self._retired_ids)
         return sorted(ids)
 
     @property
     def all_neuron_ids(self) -> list[int]:
         ids = set(range(self.raw_N))
-        ids.update(self.committed_added_ids)
-        ids.update(self.provisional_added_ids)
-        ids.update(self.retired_ids)
+        ids.update(self._committed_added_ids)
+        ids.update(self._provisional_added_ids)
+        ids.update(self._retired_ids)
         return sorted(ids)
 
     @property
     def identity_state(self) -> dict[int, str]:
         states = dict.fromkeys(range(self.raw_N), "raw")
-        states.update(dict.fromkeys(self.committed_added_ids, "committed_added"))
-        states.update(dict.fromkeys(self.provisional_added_ids, "provisional_added"))
-        states.update(dict.fromkeys(self.retired_ids, "retired"))
+        states.update(dict.fromkeys(self._committed_added_ids, "committed_added"))
+        states.update(dict.fromkeys(self._provisional_added_ids, "provisional_added"))
+        states.update(dict.fromkeys(self._retired_ids, "retired"))
         return states
 
     @property
     def observation_count(self) -> int:
         return sum(
-            self.resolve(t, i) is not None
-            for t in range(self.raw_T)
-            for i in self.neuron_ids
+            len(self.observation_volume_indices(neuron_id))
+            for neuron_id in self.neuron_ids
         )
 
     def _check_volume(self, volume_index: Any) -> int:
@@ -358,7 +539,7 @@ class ProofreadStore:
         value = _require_int(neuron_id, "neuron_id")
         if value < 0 or value not in set(self.all_neuron_ids):
             raise ValueError(f"unknown neuron_id: {value}")
-        if not allow_retired and value in self.retired_ids:
+        if not allow_retired and value in self._retired_ids:
             raise ValueError(f"neuron_id is retired: {value}")
         return value
 
@@ -367,6 +548,341 @@ class ProofreadStore:
             return None
         return self.dataset.get_box_at_volume_index(volume_index, neuron_id)
 
+    def _capture_state(self) -> _StoreState:
+        """Copy only top-level containers and share immutable patch records."""
+        return _store_state(
+            observation_patches=self._observation_patches,
+            delete_all_ids=self._delete_all_ids,
+            placement_size=self._placement_size,
+            committed_added_ids=self._committed_added_ids,
+            provisional_added_ids=self._provisional_added_ids,
+            retired_ids=self._retired_ids,
+            next_neuron_id=self._next_neuron_id,
+            changed_fields=self._changed_fields,
+        )
+
+    @staticmethod
+    def _patch_index(
+        patches: Mapping[tuple[int, int], ObservationPatch],
+    ) -> dict[int, set[tuple[int, int]]]:
+        result: dict[int, set[tuple[int, int]]] = {}
+        for key in patches:
+            result.setdefault(key[1], set()).add(key)
+        return result
+
+    def _set_saved_state(self, state: _StoreState) -> bool:
+        changed = state != self._saved_state
+        self._saved_state = state
+        self._saved_patch_keys_by_neuron = self._patch_index(
+            state.observation_patches
+        )
+        if changed:
+            self._baseline_revision = max(
+                self._baseline_revision + 1, self._revision
+            )
+        return changed
+
+    def _state_equals_working(self, state: _StoreState) -> bool:
+        return bool(
+            self._observation_patches == state.observation_patches
+            and self._delete_all_ids == state.delete_all_ids
+            and self._placement_size == state.placement_size
+            and self._committed_added_ids == state.committed_added_ids
+            and self._provisional_added_ids == state.provisional_added_ids
+            and self._retired_ids == state.retired_ids
+            and self._next_neuron_id == state.next_neuron_id
+        )
+
+    def _install_working_state(
+        self, state: _StoreState, *, advance_revision: bool
+    ) -> bool:
+        changed = not self._state_equals_working(state)
+        self._observation_patches = dict(state.observation_patches)
+        self._delete_all_ids = set(state.delete_all_ids)
+        self._placement_size = dict(state.placement_size)
+        self._committed_added_ids = set(state.committed_added_ids)
+        self._provisional_added_ids = set(state.provisional_added_ids)
+        self._retired_ids = set(state.retired_ids)
+        self._next_neuron_id = int(state.next_neuron_id)
+        self._patch_keys_by_neuron = self._patch_index(
+            self._observation_patches
+        )
+        self._effective_presence_cache.clear()
+        self._replace_all_changed_fields(state.changed_fields)
+        if changed and advance_revision:
+            self._revision += 1
+        return changed
+
+    def _replace_patch(
+        self,
+        key: tuple[int, int],
+        patch: ObservationPatch | None,
+    ) -> bool:
+        old = self._observation_patches.get(key)
+        if old == patch:
+            return False
+        neuron_id = key[1]
+        if patch is None:
+            self._observation_patches.pop(key, None)
+            keys = self._patch_keys_by_neuron.get(neuron_id)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    self._patch_keys_by_neuron.pop(neuron_id, None)
+        else:
+            self._observation_patches[key] = patch
+            self._patch_keys_by_neuron.setdefault(neuron_id, set()).add(key)
+        return True
+
+    def _set_changed_fields(
+        self, key: tuple[int, int], fields: tuple[str, ...]
+    ) -> None:
+        previous = self._changed_fields.get(key, ())
+        if previous == fields:
+            return
+        for field in previous:
+            self._field_observations[field].discard(key)
+        neuron_keys = self._changed_keys_by_neuron.get(key[1])
+        if not fields:
+            self._changed_fields.pop(key, None)
+            if neuron_keys is not None:
+                neuron_keys.discard(key)
+                if not neuron_keys:
+                    self._changed_keys_by_neuron.pop(key[1], None)
+            return
+        self._changed_fields[key] = fields
+        self._changed_keys_by_neuron.setdefault(key[1], set()).add(key)
+        for field in fields:
+            self._field_observations[field].add(key)
+
+    def _replace_all_changed_fields(
+        self,
+        changed_fields: Mapping[tuple[int, int], tuple[str, ...]],
+    ) -> None:
+        self._changed_fields = dict(changed_fields)
+        self._field_observations = {
+            field: {
+                key
+                for key, fields in self._changed_fields.items()
+                if field in fields
+            }
+            for field in _CHANGED_FIELD_ORDER
+        }
+        self._changed_keys_by_neuron = {}
+        for key in self._changed_fields:
+            self._changed_keys_by_neuron.setdefault(key[1], set()).add(key)
+
+    def _refresh_observation_changed_fields(
+        self, key: tuple[int, int]
+    ) -> None:
+        volume_index, neuron_id = key
+        patch = self._observation_patches.get(key)
+        if patch is not None:
+            fields = self._changed_fields_for_patch(
+                volume_index, neuron_id, patch
+            )
+        elif (
+            neuron_id in self._delete_all_ids
+            and self._raw_box(volume_index, neuron_id) is not None
+        ):
+            fields = ("presence",)
+        else:
+            fields = ()
+        self._set_changed_fields(key, fields)
+
+    def _raw_present_volume_indices(self, neuron_id: int) -> frozenset[int]:
+        cached = self._raw_presence_cache.get(neuron_id)
+        if cached is not None:
+            return cached
+        if neuron_id >= self.raw_N:
+            result = frozenset()
+        else:
+            values = np.asarray(
+                self.dataset.raw_data[:, neuron_id, :6], dtype=float
+            )
+            result = frozenset(
+                int(value)
+                for value in np.flatnonzero(
+                    np.all(np.isfinite(values), axis=1)
+                )
+            )
+        self._raw_presence_cache[neuron_id] = result
+        return result
+
+    def _refresh_neuron_changed_fields(self, neuron_id: int) -> None:
+        for key in tuple(self._changed_keys_by_neuron.get(neuron_id, ())):
+            self._set_changed_fields(key, ())
+        for key in tuple(self._patch_keys_by_neuron.get(neuron_id, ())):
+            patch = self._observation_patches[key]
+            self._set_changed_fields(
+                key, self._changed_fields_for_patch(*key, patch)
+            )
+        if neuron_id in self._delete_all_ids:
+            for volume_index in self._raw_present_volume_indices(neuron_id):
+                key = (volume_index, neuron_id)
+                if key not in self._observation_patches:
+                    self._set_changed_fields(key, ("presence",))
+
+    @staticmethod
+    def _update_difference(
+        differences: set[int],
+        neuron_id: int,
+        different: bool,
+    ) -> None:
+        if different:
+            differences.add(neuron_id)
+        else:
+            differences.discard(neuron_id)
+
+    def _refresh_dirty_patch(self, key: tuple[int, int]) -> None:
+        if self._observation_patches.get(key) == self._saved_state.observation_patches.get(key):
+            self._dirty_patch_keys.discard(key)
+        else:
+            self._dirty_patch_keys.add(key)
+
+    def _refresh_dirty_metadata(self, neuron_id: int) -> None:
+        saved = self._saved_state
+        self._update_difference(
+            self._dirty_delete_all_ids,
+            neuron_id,
+            (neuron_id in self._delete_all_ids)
+            != (neuron_id in saved.delete_all_ids),
+        )
+        missing = object()
+        self._update_difference(
+            self._dirty_placement_ids,
+            neuron_id,
+            self._placement_size.get(neuron_id, missing)
+            != saved.placement_size.get(neuron_id, missing),
+        )
+        for current, baseline, differences in (
+            (
+                self._committed_added_ids,
+                saved.committed_added_ids,
+                self._dirty_committed_ids,
+            ),
+            (
+                self._provisional_added_ids,
+                saved.provisional_added_ids,
+                self._dirty_provisional_ids,
+            ),
+            (self._retired_ids, saved.retired_ids, self._dirty_retired_ids),
+        ):
+            self._update_difference(
+                differences,
+                neuron_id,
+                (neuron_id in current) != (neuron_id in baseline),
+            )
+        self._allocator_dirty = (
+            self._next_neuron_id != saved.next_neuron_id
+        )
+
+    def _refresh_dirty_neuron(
+        self,
+        neuron_id: int,
+        *,
+        extra_patch_keys: set[tuple[int, int]] | None = None,
+    ) -> None:
+        keys = set(self._patch_keys_by_neuron.get(neuron_id, ()))
+        keys.update(self._saved_patch_keys_by_neuron.get(neuron_id, ()))
+        if extra_patch_keys:
+            keys.update(extra_patch_keys)
+        for key in keys:
+            self._refresh_dirty_patch(key)
+        self._refresh_dirty_metadata(neuron_id)
+
+    def _rebuild_dirty_cache(self) -> None:
+        saved = self._saved_state
+        self._dirty_patch_keys = {
+            key
+            for key in set(self._observation_patches)
+            | set(saved.observation_patches)
+            if self._observation_patches.get(key)
+            != saved.observation_patches.get(key)
+        }
+        self._dirty_delete_all_ids = self._delete_all_ids ^ set(
+            saved.delete_all_ids
+        )
+        placement_ids = set(self._placement_size) | set(saved.placement_size)
+        missing = object()
+        self._dirty_placement_ids = {
+            neuron_id
+            for neuron_id in placement_ids
+            if self._placement_size.get(neuron_id, missing)
+            != saved.placement_size.get(neuron_id, missing)
+        }
+        self._dirty_committed_ids = self._committed_added_ids ^ set(
+            saved.committed_added_ids
+        )
+        self._dirty_provisional_ids = self._provisional_added_ids ^ set(
+            saved.provisional_added_ids
+        )
+        self._dirty_retired_ids = self._retired_ids ^ set(saved.retired_ids)
+        self._allocator_dirty = (
+            self._next_neuron_id != saved.next_neuron_id
+        )
+        self._refresh_status()
+
+    def _is_dirty(self) -> bool:
+        return bool(
+            self._dirty_patch_keys
+            or self._dirty_delete_all_ids
+            or self._dirty_placement_ids
+            or self._dirty_committed_ids
+            or self._dirty_provisional_ids
+            or self._dirty_retired_ids
+            or self._allocator_dirty
+        )
+
+    def _refresh_status(self) -> None:
+        self._status = ProofreadStatus(
+            dirty=self._is_dirty(),
+            moved=len(self._field_observations["center_zyx"]),
+            resized=len(self._field_observations["size_zyx"]),
+            presence=len(self._field_observations["presence"]),
+        )
+
+    def _finish_change(self) -> None:
+        self._revision += 1
+        self._refresh_status()
+
+    def observation_volume_indices(self, neuron_id: int) -> frozenset[int]:
+        """Return cached volumes where one current identity has a box."""
+        neuron_id = self._check_id(neuron_id)
+        cached = self._effective_presence_cache.get(neuron_id)
+        if cached is not None:
+            return cached
+        present = (
+            set()
+            if neuron_id in self._delete_all_ids
+            else set(self._raw_present_volume_indices(neuron_id))
+        )
+        for key in self._patch_keys_by_neuron.get(neuron_id, ()):
+            if self._observation_patches[key].state == PRESENT:
+                present.add(key[0])
+            else:
+                present.discard(key[0])
+        result = frozenset(present)
+        self._effective_presence_cache[neuron_id] = result
+        return result
+
+    def has_observations(self, neuron_id: int) -> bool:
+        """Return whether an identity has any current observation."""
+        return bool(self.observation_volume_indices(neuron_id))
+
+    def set_placement_size(
+        self, neuron_id: int, size_zyx: Any
+    ) -> tuple[float, float, float]:
+        """Set one placement template through the versioned state API."""
+        neuron_id = self._check_id(neuron_id)
+        size = _validate_size(size_zyx)
+        if self._placement_size.get(neuron_id) == size:
+            return size
+        self._placement_size[neuron_id] = size
+        self._refresh_dirty_metadata(neuron_id)
+        self._finish_change()
+        return size
+
     # ------------------------------------------------------------------
     # Resolver and edit operations
     # ------------------------------------------------------------------
@@ -374,12 +890,12 @@ class ProofreadStore:
         """Resolve one observation using canonical patch precedence."""
         volume_index = self._check_volume(volume_index)
         neuron_id = self._check_id(neuron_id)
-        patch = self.observation_patches.get((volume_index, neuron_id))
+        patch = self._observation_patches.get((volume_index, neuron_id))
         if patch is not None:
             if patch.state == PRESENT:
                 return patch.box
             return None
-        if neuron_id in self.delete_all_ids:
+        if neuron_id in self._delete_all_ids:
             return None
         return self._raw_box(volume_index, neuron_id)
 
@@ -387,10 +903,10 @@ class ProofreadStore:
         """Return ``present``, ``deleted``, ``raw`` or ``absent``."""
         volume_index = self._check_volume(volume_index)
         neuron_id = self._check_id(neuron_id)
-        patch = self.observation_patches.get((volume_index, neuron_id))
+        patch = self._observation_patches.get((volume_index, neuron_id))
         if patch is not None:
             return patch.state
-        if neuron_id in self.delete_all_ids:
+        if neuron_id in self._delete_all_ids:
             return DELETED
         return RAW if self._raw_box(volume_index, neuron_id) is not None else ABSENT
 
@@ -437,16 +953,30 @@ class ProofreadStore:
         # A patch that exactly restores raw data is redundant unless it is an
         # explicit exception to a Delete-all marker.
         if (
-            neuron_id not in self.delete_all_ids
+            neuron_id not in self._delete_all_ids
             and raw_box is not None
             and raw_box.center_zyx == new_box.center_zyx
             and raw_box.size_zyx == new_box.size_zyx
         ):
-            self.observation_patches.pop((volume_index, neuron_id), None)
+            new_patch = None
         else:
-            self.observation_patches[(volume_index, neuron_id)] = (
-                ObservationPatch.present(new_box)
+            new_patch = ObservationPatch.present(new_box)
+        key = (volume_index, neuron_id)
+        if self._replace_patch(key, new_patch):
+            self._effective_presence_cache.pop(neuron_id, None)
+            fields = (
+                ()
+                if new_patch is None
+                else self._changed_fields_for_patch(
+                    volume_index,
+                    neuron_id,
+                    new_patch,
+                    raw_box=raw_box,
+                )
             )
+            self._set_changed_fields(key, fields)
+            self._refresh_dirty_patch(key)
+            self._finish_change()
         return new_box
 
     # Friendly alias used by callers that avoid database terminology.
@@ -460,15 +990,25 @@ class ProofreadStore:
         """Delete one observation, normalizing against Delete-all markers."""
         volume_index = self._check_volume(volume_index)
         neuron_id = self._check_id(neuron_id)
-        if neuron_id in self.delete_all_ids:
+        key = (volume_index, neuron_id)
+        if neuron_id in self._delete_all_ids:
             # A PRESENT exception is removed; no redundant DELETED patch is
             # needed because the marker already expresses the deletion.
-            self.observation_patches.pop((volume_index, neuron_id), None)
+            if self._replace_patch(key, None):
+                self._effective_presence_cache.pop(neuron_id, None)
+                self._refresh_observation_changed_fields(key)
+                self._refresh_dirty_patch(key)
+                self._finish_change()
             return
-        existing = self.observation_patches.get((volume_index, neuron_id))
+        existing = self._observation_patches.get(key)
         if existing is not None and existing.state == DELETED:
             return
-        if existing is None and self._raw_box(volume_index, neuron_id) is None:
+        raw = (
+            self._raw_box(volume_index, neuron_id)
+            if existing is None
+            else None
+        )
+        if existing is None and raw is None:
             # Deleting a naturally absent observation is a no-op.  This keeps
             # modified_observations aligned with actual proofreading effects.
             return
@@ -477,31 +1017,39 @@ class ProofreadStore:
             assert existing.box is not None
             restore_size = existing.box.size_zyx
         else:
-            raw = self._raw_box(volume_index, neuron_id)
             if raw is not None:
                 restore_size = raw.size_zyx
-            elif neuron_id in self.placement_size:
-                restore_size = self.placement_size[neuron_id]
-        self.observation_patches[(volume_index, neuron_id)] = (
-            ObservationPatch.deleted(restore_size)
-        )
+            elif neuron_id in self._placement_size:
+                restore_size = self._placement_size[neuron_id]
+        if self._replace_patch(key, ObservationPatch.deleted(restore_size)):
+            self._effective_presence_cache.pop(neuron_id, None)
+            self._refresh_observation_changed_fields(key)
+            self._refresh_dirty_patch(key)
+            self._finish_change()
 
     set_deleted = set_observation_deleted
 
     def delete_all_observations(self, neuron_id: int) -> None:
         """Logically remove an identity's observations at every volume."""
         neuron_id = self._check_id(neuron_id)
-        if neuron_id not in self.placement_size:
+        old_keys = set(self._patch_keys_by_neuron.get(neuron_id, ()))
+        changed = neuron_id not in self._delete_all_ids or bool(old_keys)
+        if neuron_id not in self._placement_size:
             # Infer before clearing PRESENT patches or adding the marker;
             # afterwards the resolver would see every observation as absent.
-            self.placement_size[neuron_id] = self.size_for_placement(neuron_id)
-        for key in [
-            key
-            for key in self.observation_patches
-            if key[1] == neuron_id
-        ]:
-            del self.observation_patches[key]
-        self.delete_all_ids.add(neuron_id)
+            self._placement_size[neuron_id] = self.size_for_placement(neuron_id)
+            changed = True
+        for key in old_keys:
+            self._replace_patch(key, None)
+        self._delete_all_ids.add(neuron_id)
+        if not changed:
+            return
+        self._effective_presence_cache.pop(neuron_id, None)
+        self._refresh_neuron_changed_fields(neuron_id)
+        self._refresh_dirty_neuron(
+            neuron_id, extra_patch_keys=old_keys
+        )
+        self._finish_change()
 
     delete_all = delete_all_observations
 
@@ -523,14 +1071,18 @@ class ProofreadStore:
         while neuron_id in set(self.all_neuron_ids):
             neuron_id += 1
         self._next_neuron_id = neuron_id + 1
-        self.provisional_added_ids.add(neuron_id)
-        self.placement_size[neuron_id] = size
-        self.set_observation_present(
-            volume_index,
-            neuron_id,
-            center_zyx=center,
-            size_zyx=size,
+        self._provisional_added_ids.add(neuron_id)
+        self._placement_size[neuron_id] = size
+        key = (volume_index, neuron_id)
+        self._replace_patch(
+            key,
+            ObservationPatch.present(
+                _box_from_parts(neuron_id, volume_index, center, size)
+            ),
         )
+        self._refresh_observation_changed_fields(key)
+        self._refresh_dirty_neuron(neuron_id)
+        self._finish_change()
         return neuron_id
 
     def retire_added_neuron(self, neuron_id: int) -> None:
@@ -538,33 +1090,44 @@ class ProofreadStore:
         neuron_id = self._check_id(neuron_id)
         if neuron_id < self.raw_N:
             raise ValueError("raw neuron IDs cannot be retired")
-        self.provisional_added_ids.discard(neuron_id)
-        self.committed_added_ids.discard(neuron_id)
-        self.retired_ids.add(neuron_id)
-        self.delete_all_ids.discard(neuron_id)
-        self.placement_size.pop(neuron_id, None)
-        for key in [key for key in self.observation_patches if key[1] == neuron_id]:
-            del self.observation_patches[key]
+        old_keys = set(self._patch_keys_by_neuron.get(neuron_id, ()))
+        self._provisional_added_ids.discard(neuron_id)
+        self._committed_added_ids.discard(neuron_id)
+        self._retired_ids.add(neuron_id)
+        self._delete_all_ids.discard(neuron_id)
+        self._placement_size.pop(neuron_id, None)
+        for key in old_keys:
+            self._replace_patch(key, None)
+        self._effective_presence_cache.pop(neuron_id, None)
+        self._refresh_neuron_changed_fields(neuron_id)
+        self._refresh_dirty_neuron(
+            neuron_id, extra_patch_keys=old_keys
+        )
+        self._finish_change()
 
     def size_for_placement(
         self, neuron_id: int, volume_index: int | None = None
     ) -> tuple[float, float, float]:
         """Infer a committed placement size using the documented priority."""
         neuron_id = self._check_id(neuron_id)
-        if neuron_id in self.placement_size:
-            return self.placement_size[neuron_id]
+        if neuron_id in self._placement_size:
+            return self._placement_size[neuron_id]
         if volume_index is not None:
             volume_index = self._check_volume(volume_index)
-            patch = self.observation_patches.get((volume_index, neuron_id))
+            patch = self._observation_patches.get((volume_index, neuron_id))
             if patch is not None and patch.restore_size_zyx is not None:
                 return patch.restore_size_zyx
-            indices = sorted(
-                range(self.raw_T),
+            candidates = self.observation_volume_indices(neuron_id)
+            candidate = min(
+                candidates,
                 key=lambda value: (abs(value - volume_index), value),
+                default=None,
             )
         else:
-            indices = list(range(self.raw_T))
-        for candidate in indices:
+            candidate = min(
+                self.observation_volume_indices(neuron_id), default=None
+            )
+        if candidate is not None:
             box = self.resolve(candidate, neuron_id)
             if box is not None:
                 return box.size_zyx
@@ -576,22 +1139,42 @@ class ProofreadStore:
         """Apply a size to every currently valid observation of an ID."""
         neuron_id = self._check_id(neuron_id)
         size = _validate_size(size_zyx)
-        self.placement_size[neuron_id] = size
         # Snapshot the resolved boxes before mutating patches.  Missing
         # observations (including Delete-all volumes) are not created.
         boxes = [
             (volume_index, self.resolve(volume_index, neuron_id))
-            for volume_index in range(self.raw_T)
+            for volume_index in sorted(
+                self.observation_volume_indices(neuron_id)
+            )
         ]
+        changed_keys: set[tuple[int, int]] = set()
+        changed = self._placement_size.get(neuron_id) != size
+        self._placement_size[neuron_id] = size
         for volume_index, box in boxes:
             if box is None:
                 continue
-            self.set_observation_present(
-                volume_index,
-                neuron_id,
-                center_zyx=box.center_zyx,
-                size_zyx=size,
+            new_box = _box_from_parts(
+                neuron_id, volume_index, box.center_zyx, size
             )
+            raw_box = self._raw_box(volume_index, neuron_id)
+            patch = (
+                None
+                if neuron_id not in self._delete_all_ids
+                and raw_box is not None
+                and raw_box.center_zyx == new_box.center_zyx
+                and raw_box.size_zyx == new_box.size_zyx
+                else ObservationPatch.present(new_box)
+            )
+            key = (volume_index, neuron_id)
+            if self._replace_patch(key, patch):
+                changed = True
+                changed_keys.add(key)
+        if changed:
+            self._refresh_neuron_changed_fields(neuron_id)
+            self._refresh_dirty_neuron(
+                neuron_id, extra_patch_keys=changed_keys
+            )
+            self._finish_change()
         return size
 
     def apply_size_at_volume_index(
@@ -636,12 +1219,14 @@ class ProofreadStore:
         size = _validate_size(size_zyx)
         boxes = [
             self.resolve(volume_index, neuron_id)
-            for volume_index in range(self.raw_T)
+            for volume_index in self.observation_volume_indices(neuron_id)
         ]
         if (
             all(box is None or box.size_zyx == size for box in boxes)
-            and neuron_id in self.placement_size
-            and self.placement_size[neuron_id] == size
+            and (
+                neuron_id not in self._placement_size
+                or self._placement_size[neuron_id] == size
+            )
         ):
             return size
         return self.apply_size(neuron_id, size)
@@ -662,16 +1247,11 @@ class ProofreadStore:
 
     @property
     def modified_observations(self) -> set[tuple[int, int]]:
-        result = set(self.observation_patches)
-        for neuron_id in self.delete_all_ids:
-            for volume_index in range(self.raw_T):
-                if self._raw_box(volume_index, neuron_id) is not None:
-                    result.add((volume_index, neuron_id))
-        return result
+        return set(self._changed_fields)
 
     @property
     def modified_ids(self) -> set[int]:
-        return {neuron_id for _, neuron_id in self.modified_observations}
+        return set(self._changed_keys_by_neuron)
 
     def _changed_fields_for_patch(
         self,
@@ -680,6 +1260,7 @@ class ProofreadStore:
         patch: ObservationPatch,
         *,
         delete_all_ids: set[int] | None = None,
+        raw_box: NeuronBox | None | object = _RAW_BOX_UNSET,
     ) -> tuple[str, ...]:
         """Derive v2's field list from raw geometry and a complete patch.
 
@@ -687,14 +1268,15 @@ class ProofreadStore:
         the complete patch box.  Exact tuple equality is intentional here and
         matches the canonical redundant-patch normalization rules.
         """
-        raw_box = self._raw_box(volume_index, neuron_id)
         markers = (
-            self.delete_all_ids
+            self._delete_all_ids
             if delete_all_ids is None
             else delete_all_ids
         )
         if patch.state == DELETED:
             return ("presence",)
+        if raw_box is _RAW_BOX_UNSET:
+            raw_box = self._raw_box(volume_index, neuron_id)
         assert patch.box is not None
         if raw_box is None:
             return ("presence",)
@@ -717,15 +1299,7 @@ class ProofreadStore:
         """Return the canonical v2 field list for one observation."""
         volume_index = self._check_volume(volume_index)
         neuron_id = self._check_id(neuron_id)
-        patch = self.observation_patches.get((volume_index, neuron_id))
-        if patch is not None:
-            return self._changed_fields_for_patch(volume_index, neuron_id, patch)
-        if (
-            neuron_id in self.delete_all_ids
-            and self._raw_box(volume_index, neuron_id) is not None
-        ):
-            return ("presence",)
-        return ()
+        return self._changed_fields.get((volume_index, neuron_id), ())
 
     # ``observation_change_fields`` is a convenient mapping for UI and
     # downstream consumers; the method above remains useful for point lookup.
@@ -733,40 +1307,19 @@ class ProofreadStore:
     def observation_change_fields(
         self,
     ) -> dict[tuple[int, int], tuple[str, ...]]:
-        result: dict[tuple[int, int], tuple[str, ...]] = {}
-        for key, patch in self.observation_patches.items():
-            result[key] = self._changed_fields_for_patch(*key, patch)
-        for neuron_id in self.delete_all_ids:
-            for volume_index in range(self.raw_T):
-                key = (volume_index, neuron_id)
-                if key in result or self._raw_box(volume_index, neuron_id) is None:
-                    continue
-                result[key] = ("presence",)
-        return result
+        return dict(self._changed_fields)
 
     @property
     def center_changed_observations(self) -> set[tuple[int, int]]:
-        return {
-            key
-            for key, fields in self.observation_change_fields.items()
-            if "center_zyx" in fields
-        }
+        return set(self._field_observations["center_zyx"])
 
     @property
     def size_changed_observations(self) -> set[tuple[int, int]]:
-        return {
-            key
-            for key, fields in self.observation_change_fields.items()
-            if "size_zyx" in fields
-        }
+        return set(self._field_observations["size_zyx"])
 
     @property
     def presence_changed_observations(self) -> set[tuple[int, int]]:
-        return {
-            key
-            for key, fields in self.observation_change_fields.items()
-            if "presence" in fields
-        }
+        return set(self._field_observations["presence"])
 
     # Public/UI-friendly synonyms used by the proofreading panel.
     moved_observations = property(lambda self: self.center_changed_observations)
@@ -786,7 +1339,7 @@ class ProofreadStore:
         fields = set(self.changed_fields_for_observation(volume_index, neuron_id))
         if not fields:
             return None
-        patch = self.observation_patches.get((volume_index, neuron_id))
+        patch = self._observation_patches.get((volume_index, neuron_id))
         has_center = "center_zyx" in fields
         has_size = "size_zyx" in fields
         # Presence plus geometry (e.g. a Delete-all local restoration) keeps
@@ -795,7 +1348,7 @@ class ProofreadStore:
         if "presence" in fields and not (has_center or has_size):
             # A delete-all marker without an explicit per-volume patch is a
             # presence-only deletion represented by the global operation.
-            if patch is None and neuron_id in self.delete_all_ids:
+            if patch is None and neuron_id in self._delete_all_ids:
                 return "deleted"
             if patch is None:
                 return "placed"
@@ -819,43 +1372,24 @@ class ProofreadStore:
         neuron_id = self._check_id(neuron_id, allow_retired=True)
         return {
             status
-            for (volume_index, candidate), _fields in (
-                self.observation_change_fields.items()
+            for volume_index, candidate in self._changed_keys_by_neuron.get(
+                neuron_id, ()
             )
-            if candidate == neuron_id
             for status in [self.classify_observation(volume_index, candidate)]
             if status is not None
         }
 
     def _canonical_state(self) -> dict[str, Any]:
-        patches = [
-            _patch_to_json(volume_index, neuron_id, patch)
-            for (volume_index, neuron_id), patch in sorted(
-                self.observation_patches.items()
-            )
-        ]
-        return {
-            "observation_patches": patches,
-            "delete_all_ids": sorted(self.delete_all_ids),
-            "placement_size": {
-                str(neuron_id): [float(v) for v in size]
-                for neuron_id, size in sorted(self.placement_size.items())
-            },
-            "committed_added_ids": sorted(self.committed_added_ids),
-            "provisional_added_ids": sorted(self.provisional_added_ids),
-            "retired_ids": sorted(self.retired_ids),
-            "next_neuron_id": int(self._next_neuron_id),
-        }
+        return _state_to_json(self._capture_state())
 
     @property
     def saved_snapshot(self) -> dict[str, Any]:
-        return _copy_canonical_state(self._saved_snapshot)
+        return _state_to_json(self._saved_state)
 
     @property
     def working_snapshot(self) -> dict[str, Any]:
         """Return an independent canonical snapshot for background work."""
-        # Canonicalization already creates every nested container afresh.
-        return self._canonical_state()
+        return _state_to_json(self._capture_state())
 
     @property
     def bound_sidecar_path(self) -> Path | None:
@@ -880,43 +1414,14 @@ class ProofreadStore:
 
     @property
     def dirty(self) -> bool:
-        return self._canonical_state() != self._saved_snapshot
+        return self._status.dirty
 
-    def _restore_state(self, state: dict[str, Any]) -> None:
-        self.observation_patches = {}
-        for record in state["observation_patches"]:
-            volume_index = int(record["volume_index"])
-            neuron_id = int(record["neuron_id"])
-            if record["state"] == PRESENT:
-                box_data = record["box"]
-                box = _box_from_parts(
-                    neuron_id,
-                    volume_index,
-                    box_data["center_zyx"],
-                    box_data["size_zyx"],
-                )
-                patch = ObservationPatch.present(box)
-            else:
-                restore = record.get("restore_size_zyx")
-                patch = ObservationPatch.deleted(restore)
-            self.observation_patches[(volume_index, neuron_id)] = patch
-        self.delete_all_ids = {int(v) for v in state["delete_all_ids"]}
-        self.placement_size = {
-            int(neuron_id): tuple(float(v) for v in size)
-            for neuron_id, size in state["placement_size"].items()
-        }
-        self.committed_added_ids = {
-            int(v) for v in state["committed_added_ids"]
-        }
-        self.provisional_added_ids = {
-            int(v) for v in state["provisional_added_ids"]
-        }
-        self.retired_ids = {int(v) for v in state["retired_ids"]}
-        self._next_neuron_id = int(state["next_neuron_id"])
+    def _restore_state(self, state: _StoreState) -> None:
+        self._install_working_state(state, advance_revision=False)
 
     def _validated_canonical_state(
         self, state: Any, *, name: str
-    ) -> dict[str, Any]:
+    ) -> _StoreState:
         """Validate a complete recovery state without mutating this store."""
         if not isinstance(state, dict):
             raise SidecarError(f"{name} must be an object")
@@ -956,7 +1461,7 @@ class ProofreadStore:
         placement_raw = state["placement_size"]
         if not isinstance(placement_raw, dict):
             raise SidecarError(f"{name} placement_size must be an object")
-        placement: dict[str, list[float]] = {}
+        placement: dict[int, tuple[float, float, float]] = {}
         for key, value in placement_raw.items():
             try:
                 neuron_id = int(key)
@@ -964,12 +1469,15 @@ class ProofreadStore:
                 raise SidecarError(f"{name} invalid placement neuron ID") from exc
             if str(neuron_id) != key or neuron_id not in known:
                 raise SidecarError(f"{name} invalid placement neuron ID")
-            placement[key] = list(_json_size(value, f"{name} placement size"))
+            placement[neuron_id] = _json_size(
+                value, f"{name} placement size"
+            )
 
         records = state["observation_patches"]
         if not isinstance(records, list):
             raise SidecarError(f"{name} observation_patches must be a list")
-        patches: list[dict[str, Any]] = []
+        patches: dict[tuple[int, int], ObservationPatch] = {}
+        changed_fields: dict[tuple[int, int], tuple[str, ...]] = {}
         keys: set[tuple[int, int]] = set()
         for record in records:
             if not isinstance(record, dict):
@@ -1018,35 +1526,68 @@ class ProofreadStore:
                     _json_triplet(box_data["center_zyx"], "box center_zyx"),
                     _json_size(box_data["size_zyx"], "box size_zyx"),
                 )
-                patches.append(_patch_to_json(volume_index, neuron_id, ObservationPatch.present(box)))
+                patch = ObservationPatch.present(box)
             else:
                 restore = (
                     _json_size(record["restore_size_zyx"], "restore size")
                     if "restore_size_zyx" in record
                     else None
                 )
-                patches.append(
-                    _patch_to_json(
-                        volume_index,
-                        neuron_id,
-                        ObservationPatch.deleted(restore),
-                    )
-                )
-        return {
-            "observation_patches": sorted(
-                patches,
-                key=lambda item: (item["volume_index"], item["neuron_id"]),
-            ),
-            "delete_all_ids": sorted(delete_all),
-            "placement_size": {
-                key: placement[key]
-                for key in sorted(placement, key=lambda value: int(value))
-            },
-            "committed_added_ids": sorted(committed),
-            "provisional_added_ids": sorted(provisional),
-            "retired_ids": sorted(retired),
-            "next_neuron_id": next_id,
-        }
+                patch = ObservationPatch.deleted(restore)
+            patches[key] = patch
+            fields = self._changed_fields_for_patch(
+                volume_index,
+                neuron_id,
+                patch,
+                delete_all_ids=delete_all,
+            )
+            if fields:
+                changed_fields[key] = fields
+
+        for neuron_id in delete_all:
+            for volume_index in self._raw_present_volume_indices(neuron_id):
+                key = (volume_index, neuron_id)
+                if key not in patches:
+                    changed_fields[key] = ("presence",)
+
+        return _store_state(
+            observation_patches=patches,
+            delete_all_ids=delete_all,
+            placement_size=placement,
+            committed_added_ids=committed,
+            provisional_added_ids=provisional,
+            retired_ids=retired,
+            next_neuron_id=next_id,
+            changed_fields=changed_fields,
+        )
+
+    def capture_recovery_state(
+        self,
+        *,
+        formal_path: str | Path | None = None,
+        formal_fingerprint: str | None = None,
+    ) -> _RecoveryCapture:
+        """Capture immutable state for a worker without JSON construction."""
+        bound_path = (
+            self._bound_sidecar_path
+            if formal_path is None
+            else Path(formal_path)
+        )
+        bound_fingerprint = (
+            self._bound_sidecar_fingerprint
+            if formal_fingerprint is None
+            else formal_fingerprint
+        )
+        return _RecoveryCapture(
+            raw_shape=self.dataset.raw_shape,
+            raw_dtype=self.dataset.raw_dtype.str,
+            z_divisor=float(self.dataset.z_divisor),
+            image_signature=copy.deepcopy(self.image_signature),
+            formal_path=None if bound_path is None else str(bound_path),
+            formal_fingerprint=bound_fingerprint,
+            working_state=self._capture_state(),
+            saved_state=self._saved_state,
+        )
 
     def recovery_payload(
         self,
@@ -1065,31 +1606,16 @@ class ProofreadStore:
             raise ValueError("revision must be a positive integer")
         if not isinstance(raw_sha256, str) or len(raw_sha256) != 64:
             raise ValueError("raw_sha256 must be a SHA256 hex digest")
-        bound_path = self._bound_sidecar_path if formal_path is None else Path(formal_path)
-        bound_fingerprint = (
-            self._bound_sidecar_fingerprint
-            if formal_fingerprint is None
-            else formal_fingerprint
+        capture = self.capture_recovery_state(
+            formal_path=formal_path,
+            formal_fingerprint=formal_fingerprint,
         )
-        return {
-            "recovery_schema_version": RECOVERY_SCHEMA_VERSION,
-            "session_uuid": session_uuid,
-            "utc_time": utc_time,
-            "revision": int(revision),
-            "raw": {
-                "shape": list(self.dataset.raw_shape),
-                "dtype": self.dataset.raw_dtype.str,
-                "z_divisor": float(self.dataset.z_divisor),
-                "sha256": raw_sha256,
-            },
-            "image_signature": copy.deepcopy(self.image_signature),
-            "formal": {
-                "path": None if bound_path is None else str(bound_path),
-                "sha256": bound_fingerprint,
-            },
-            "working_state": self.working_snapshot,
-            "saved_state": self.saved_snapshot,
-        }
+        return capture.payload(
+            session_uuid=session_uuid,
+            revision=revision,
+            raw_sha256=raw_sha256,
+            utc_time=utc_time,
+        )
 
     def restore_recovery_payload(
         self, payload: Any, *, raw_sha256: str | None = None
@@ -1136,12 +1662,14 @@ class ProofreadStore:
         saved = self._validated_canonical_state(
             payload.get("saved_state"), name="recovery saved_state"
         )
-        saved_ids = set(saved["committed_added_ids"]) | set(saved["retired_ids"])
-        working_ids = set(working["committed_added_ids"]) | set(working["retired_ids"])
+        saved_ids = set(saved.committed_added_ids) | set(saved.retired_ids)
+        working_ids = set(working.committed_added_ids) | set(
+            working.retired_ids
+        )
         if (
-            saved["provisional_added_ids"]
+            saved.provisional_added_ids
             or not saved_ids <= working_ids
-            or not set(saved["retired_ids"]) <= set(working["retired_ids"])
+            or not saved.retired_ids <= working.retired_ids
         ):
             raise SidecarError("recovery state changes committed identity lineage")
         formal = payload.get("formal")
@@ -1156,57 +1684,104 @@ class ProofreadStore:
         ):
             raise SidecarError("recovery formal fingerprint is invalid")
         # No live mutation occurs until every field and both states validate.
-        self._restore_state(working)
-        self._saved_snapshot = saved
+        working_changed = not self._state_equals_working(working)
+        self._set_saved_state(saved)
+        self._install_working_state(working, advance_revision=False)
+        if working_changed:
+            self._revision += 1
+        self._rebuild_dirty_cache()
         self._bound_sidecar_path = None
         self._bound_sidecar_fingerprint = None
         return (Path(formal_path) if formal_path is not None else None, formal_hash)
 
     def discard(self) -> None:
         """Restore the most recently saved/loaded canonical snapshot."""
-        self._restore_state(copy.deepcopy(self._saved_snapshot))
-
-    def _saved_store(self) -> ProofreadStore:
-        """Return a lightweight resolver for the saved/loaded snapshot."""
-        saved = ProofreadStore(
-            self.dataset,
-            image_signature=copy.deepcopy(self.image_signature),
+        if self._state_equals_working(self._saved_state):
+            return
+        self._install_working_state(
+            self._saved_state, advance_revision=True
         )
-        saved._restore_state(copy.deepcopy(self._saved_snapshot))
-        saved._saved_snapshot = copy.deepcopy(self._saved_snapshot)
-        return saved
+        self._rebuild_dirty_cache()
+
+    def _state_neuron_ids(self, state: _StoreState) -> set[int]:
+        ids = set(range(self.raw_N))
+        ids.update(state.committed_added_ids)
+        ids.update(state.provisional_added_ids)
+        ids.difference_update(state.retired_ids)
+        return ids
+
+    def _resolve_state(
+        self,
+        state: _StoreState,
+        volume_index: int,
+        neuron_id: int,
+    ) -> NeuronBox | None:
+        patch = state.observation_patches.get((volume_index, neuron_id))
+        if patch is not None:
+            return patch.box if patch.state == PRESENT else None
+        if neuron_id in state.delete_all_ids:
+            return None
+        return self._raw_box(volume_index, neuron_id)
+
+    def _neuron_signature(self, neuron_id: int) -> tuple[Any, ...]:
+        keys = self._patch_keys_by_neuron.get(neuron_id, ())
+        return (
+            tuple(
+                sorted(
+                    (key, self._observation_patches[key]) for key in keys
+                )
+            ),
+            neuron_id in self._delete_all_ids,
+            self._placement_size.get(neuron_id),
+            neuron_id in self._committed_added_ids,
+            neuron_id in self._provisional_added_ids,
+            neuron_id in self._retired_ids,
+            self._next_neuron_id,
+        )
 
     def _expand_delete_all(
         self,
         neuron_id: int,
         *,
-        saved: ProofreadStore | None = None,
+        saved: _StoreState | None = None,
     ) -> None:
         """Replace one delete-all marker with equivalent per-volume patches."""
-        if neuron_id not in self.delete_all_ids:
+        if neuron_id not in self._delete_all_ids:
             return
         resolved = [
             self.resolve(volume_index, neuron_id)
             for volume_index in range(self.raw_T)
         ]
-        for key in [
-            key for key in self.observation_patches if key[1] == neuron_id
-        ]:
-            del self.observation_patches[key]
-        self.delete_all_ids.remove(neuron_id)
+        for key in tuple(self._patch_keys_by_neuron.get(neuron_id, ())):
+            self._replace_patch(key, None)
+        self._delete_all_ids.remove(neuron_id)
+        saved_ids = set() if saved is None else self._state_neuron_ids(saved)
         for volume_index, box in enumerate(resolved):
             if box is not None:
-                self.set_observation_present(volume_index, neuron_id, box)
+                raw_box = self._raw_box(volume_index, neuron_id)
+                patch = (
+                    None
+                    if raw_box is not None
+                    and raw_box.center_zyx == box.center_zyx
+                    and raw_box.size_zyx == box.size_zyx
+                    else ObservationPatch.present(box)
+                )
+                self._replace_patch((volume_index, neuron_id), patch)
             elif self._raw_box(volume_index, neuron_id) is not None:
-                self.set_observation_deleted(volume_index, neuron_id)
-            elif saved is not None and neuron_id in set(saved.neuron_ids):
-                saved_box = saved.resolve(volume_index, neuron_id)
+                self._replace_patch(
+                    (volume_index, neuron_id), ObservationPatch.deleted()
+                )
+            elif saved is not None and neuron_id in saved_ids:
+                saved_box = self._resolve_state(
+                    saved, volume_index, neuron_id
+                )
                 if saved_box is not None:
                     # Added-neuron observations have no raw box. Keep their
                     # deletion explicit so status and sidecar output retain
                     # the unsaved presence change at every other volume.
-                    self.observation_patches[(volume_index, neuron_id)] = (
-                        ObservationPatch.deleted(saved_box.size_zyx)
+                    self._replace_patch(
+                        (volume_index, neuron_id),
+                        ObservationPatch.deleted(saved_box.size_zyx),
                     )
 
     def discard_observation(self, volume_index: int, neuron_id: int) -> bool:
@@ -1218,68 +1793,89 @@ class ProofreadStore:
         """
         volume_index = self._check_volume(volume_index)
         neuron_id = self._check_id(neuron_id)
-        before = self._canonical_state()
-        saved = self._saved_store()
-        saved_known = neuron_id in set(saved.neuron_ids)
+        before = self._neuron_signature(neuron_id)
+        old_keys = set(self._patch_keys_by_neuron.get(neuron_id, ()))
+        saved = self._saved_state
+        saved_known = neuron_id in self._state_neuron_ids(saved)
         saved_delete_all = saved_known and neuron_id in saved.delete_all_ids
 
-        if neuron_id in self.delete_all_ids and not saved_delete_all:
+        if neuron_id in self._delete_all_ids and not saved_delete_all:
             self._expand_delete_all(neuron_id, saved=saved)
 
         key = (volume_index, neuron_id)
-        current_delete_all = neuron_id in self.delete_all_ids
+        current_delete_all = neuron_id in self._delete_all_ids
         if saved_known and current_delete_all == saved_delete_all:
             patch = saved.observation_patches.get(key)
-            if patch is None:
-                self.observation_patches.pop(key, None)
-            else:
-                self.observation_patches[key] = copy.deepcopy(patch)
+            self._replace_patch(key, patch)
         else:
-            self.observation_patches.pop(key, None)
+            self._replace_patch(key, None)
             saved_box = (
-                saved.resolve(volume_index, neuron_id) if saved_known else None
+                self._resolve_state(saved, volume_index, neuron_id)
+                if saved_known
+                else None
             )
             if saved_box is not None:
-                self.set_observation_present(volume_index, neuron_id, saved_box)
+                raw_box = self._raw_box(volume_index, neuron_id)
+                patch = (
+                    None
+                    if neuron_id not in self._delete_all_ids
+                    and raw_box is not None
+                    and raw_box.center_zyx == saved_box.center_zyx
+                    and raw_box.size_zyx == saved_box.size_zyx
+                    else ObservationPatch.present(saved_box)
+                )
+                self._replace_patch(key, patch)
             elif self._raw_box(volume_index, neuron_id) is not None:
-                self.set_observation_deleted(volume_index, neuron_id)
-        return self._canonical_state() != before
+                self._replace_patch(key, ObservationPatch.deleted())
+        if self._neuron_signature(neuron_id) == before:
+            return False
+        self._effective_presence_cache.pop(neuron_id, None)
+        self._refresh_neuron_changed_fields(neuron_id)
+        self._refresh_dirty_neuron(
+            neuron_id, extra_patch_keys=old_keys | {key}
+        )
+        self._finish_change()
+        return True
 
     def discard_neuron(self, neuron_id: int) -> bool:
         """Restore all state for one neuron from the saved/loaded snapshot."""
         neuron_id = self._check_id(neuron_id, allow_retired=True)
-        before = self._canonical_state()
-        saved = self._saved_store()
+        before = self._neuron_signature(neuron_id)
+        saved = self._saved_state
+        old_keys = set(self._patch_keys_by_neuron.get(neuron_id, ()))
 
-        for key in [
-            key for key in self.observation_patches if key[1] == neuron_id
-        ]:
-            del self.observation_patches[key]
-        for key, patch in saved.observation_patches.items():
-            if key[1] == neuron_id:
-                self.observation_patches[key] = copy.deepcopy(patch)
+        for key in old_keys:
+            self._replace_patch(key, None)
+        for key in self._saved_patch_keys_by_neuron.get(neuron_id, ()):
+            self._replace_patch(key, saved.observation_patches[key])
 
-        for name in (
-            "delete_all_ids",
-            "committed_added_ids",
-            "provisional_added_ids",
-            "retired_ids",
+        for current_values, saved_values in (
+            (self._delete_all_ids, saved.delete_all_ids),
+            (self._committed_added_ids, saved.committed_added_ids),
+            (self._provisional_added_ids, saved.provisional_added_ids),
+            (self._retired_ids, saved.retired_ids),
         ):
-            current_values = getattr(self, name)
-            saved_values = getattr(saved, name)
             current_values.discard(neuron_id)
             if neuron_id in saved_values:
                 current_values.add(neuron_id)
 
-        self.placement_size.pop(neuron_id, None)
+        self._placement_size.pop(neuron_id, None)
         if neuron_id in saved.placement_size:
-            self.placement_size[neuron_id] = saved.placement_size[neuron_id]
+            self._placement_size[neuron_id] = saved.placement_size[neuron_id]
 
         self._next_neuron_id = max(
-            saved._next_neuron_id,
+            saved.next_neuron_id,
             max(self.all_neuron_ids, default=-1) + 1,
         )
-        return self._canonical_state() != before
+        if self._neuron_signature(neuron_id) == before:
+            return False
+        self._effective_presence_cache.pop(neuron_id, None)
+        self._refresh_neuron_changed_fields(neuron_id)
+        self._refresh_dirty_neuron(
+            neuron_id, extra_patch_keys=old_keys
+        )
+        self._finish_change()
+        return True
 
     # ------------------------------------------------------------------
     # Sidecar metadata and persistence
@@ -1295,86 +1891,71 @@ class ProofreadStore:
         digest.update(np.ascontiguousarray(self.dataset.raw_data).tobytes())
         return digest.hexdigest()
 
-    def _payload_for_save(self) -> dict[str, Any]:
-        state = copy.deepcopy(self._canonical_state())
+    def _prepare_save(self) -> _SavePlan:
         # Provisional identities with at least one PRESENT patch become
         # committed on the successful save.  Empty provisional identities are
         # omitted from the persisted lineage.
-        provisional = set(state["provisional_added_ids"])
+        provisional = set(self._provisional_added_ids)
         present_ids = {
-            int(record["neuron_id"])
-            for record in state["observation_patches"]
-            if record["state"] == PRESENT
+            neuron_id
+            for (_volume_index, neuron_id), patch in (
+                self._observation_patches.items()
+            )
+            if patch.state == PRESENT
         }
-        committed = set(state["committed_added_ids"])
+        committed = set(self._committed_added_ids)
         committed.update(provisional & present_ids)
         empty = provisional - present_ids
         # Saving establishes an identity lineage even if the provisional ID
         # has no remaining observation.  Reserve it as retired so a later
         # load cannot reuse the numeric ID.
-        state["retired_ids"] = sorted(
-            set(state["retired_ids"]) | empty
+        retired = set(self._retired_ids) | empty
+        patches = {
+            key: patch
+            for key, patch in self._observation_patches.items()
+            if key[1] not in empty and self._changed_fields.get(key)
+        }
+        delete_all = self._delete_all_ids - empty
+        placement = {
+            neuron_id: size
+            for neuron_id, size in self._placement_size.items()
+            if neuron_id not in empty
+        }
+        changed_fields = {
+            key: fields
+            for key, fields in self._changed_fields.items()
+            if key[1] not in empty
+        }
+        next_neuron_id = (
+            max(self.raw_N - 1, *committed, *retired) + 1
+            if committed or retired
+            else max(self.raw_N, self._next_neuron_id)
         )
-        state["committed_added_ids"] = sorted(committed)
-        state["provisional_added_ids"] = []
-        if empty:
-            state["observation_patches"] = [
-                record
-                for record in state["observation_patches"]
-                if int(record["neuron_id"]) not in empty
-            ]
-            state["delete_all_ids"] = [
-                value
-                for value in state["delete_all_ids"]
-                if int(value) not in empty
-            ]
-            state["placement_size"] = {
-                key: value
-                for key, value in state["placement_size"].items()
-                if int(key) not in empty
-            }
-        state["next_neuron_id"] = max(
-            [
-                self.raw_N,
-                *state["committed_added_ids"],
-                *state["retired_ids"],
-            ]
-        ) + 1 if (
-            state["committed_added_ids"] or state["retired_ids"]
-        ) else max(self.raw_N, int(state["next_neuron_id"]))
+        state = _store_state(
+            observation_patches=patches,
+            delete_all_ids=delete_all,
+            placement_size=placement,
+            committed_added_ids=committed,
+            provisional_added_ids=set(),
+            retired_ids=retired,
+            next_neuron_id=next_neuron_id,
+            changed_fields=changed_fields,
+        )
         # v2 records carry an ordered field classification derived from the
         # raw geometry and the complete patch.  Keep the box itself as the
         # sole geometry authority; ``changed_fields`` is descriptive only.
-        v2_patches: list[dict[str, Any]] = []
-        for record in state["observation_patches"]:
-            volume_index = int(record["volume_index"])
-            neuron_id = int(record["neuron_id"])
-            if record["state"] == PRESENT:
-                box_data = record["box"]
-                patch = ObservationPatch.present(
-                    _box_from_parts(
-                        neuron_id,
-                        volume_index,
-                        box_data["center_zyx"],
-                        box_data["size_zyx"],
-                    )
-                )
-            else:
-                patch = ObservationPatch.deleted(record.get("restore_size_zyx"))
-            fields = self._changed_fields_for_patch(volume_index, neuron_id, patch)
-            if not fields:
-                # Drop a redundant PRESENT patch if an external caller placed
-                # a box exactly equal to raw geometry.
-                continue
-            v2_patches.append(
-                _patch_to_json(
-                    volume_index,
-                    neuron_id,
-                    patch,
-                    changed_fields=fields,
-                )
+        v2_patches = [
+            _patch_to_json(
+                volume_index,
+                neuron_id,
+                patch,
+                changed_fields=state.changed_fields[(volume_index, neuron_id)],
             )
-        return {
+            for (volume_index, neuron_id), patch in sorted(
+                state.observation_patches.items()
+            )
+        ]
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "raw": {
                 "shape": list(self.dataset.raw_shape),
@@ -1384,39 +1965,36 @@ class ProofreadStore:
             },
             "image_signature": copy.deepcopy(self.image_signature),
             "observation_patches": v2_patches,
-            "delete_all_ids": state["delete_all_ids"],
-            "placement_size": state["placement_size"],
+            "delete_all_ids": sorted(state.delete_all_ids),
+            "placement_size": {
+                str(neuron_id): [float(value) for value in size]
+                for neuron_id, size in sorted(state.placement_size.items())
+            },
             "added_neurons": {
-                "committed": state["committed_added_ids"],
-                "retired": state["retired_ids"],
+                "committed": sorted(state.committed_added_ids),
+                "retired": sorted(state.retired_ids),
             },
         }
+        return _SavePlan(payload=payload, committed_state=state)
 
-    def _commit_saved_payload(self, payload: dict[str, Any]) -> None:
-        state = {
-            "observation_patches": payload["observation_patches"],
-            "delete_all_ids": payload["delete_all_ids"],
-            "placement_size": payload["placement_size"],
-            "committed_added_ids": payload["added_neurons"]["committed"],
-            "provisional_added_ids": [],
-            "retired_ids": payload["added_neurons"]["retired"],
-            "next_neuron_id": max(
-                [
-                    self.raw_N - 1,
-                    *payload["added_neurons"]["committed"],
-                    *payload["added_neurons"]["retired"],
-                ],
-                default=self.raw_N - 1,
-            )
-            + 1,
-        }
-        self._restore_state(state)
-        self._saved_snapshot = self._canonical_state()
+    def _payload_for_save(self) -> dict[str, Any]:
+        """Return the public-compatible JSON payload used by save."""
+        return self._prepare_save().payload
+
+    def _commit_saved_state(self, state: _StoreState) -> None:
+        changed = self._install_working_state(
+            state, advance_revision=False
+        )
+        if changed:
+            self._revision += 1
+        self._set_saved_state(state)
+        self._rebuild_dirty_cache()
 
     def save(self, path: str | Path | None = None) -> Path:
         """Atomically save canonical edits, preserving prior exact bytes."""
         target = self._sidecar_path(path)
-        payload = self._payload_for_save()
+        plan = self._prepare_save()
+        payload = plan.payload
         text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
         output = text.encode("utf-8")
         existing: bytes | None = None
@@ -1460,7 +2038,7 @@ class ProofreadStore:
                 with contextlib.suppress(OSError):
                     os.unlink(temporary)
                 raise
-        self._commit_saved_payload(payload)
+        self._commit_saved_state(plan.committed_state)
         self._bound_sidecar_path = target
         self._bound_sidecar_fingerprint = sha256_bytes(output)
         try:
@@ -1539,8 +2117,12 @@ class ProofreadStore:
         except OSError as exc:
             raise SidecarError(f"proof sidecar changed while loading: {exc}") from exc
         # No mutation has happened before this point.
-        self._restore_state(state)
-        self._saved_snapshot = self._canonical_state()
+        working_changed = not self._state_equals_working(state)
+        self._install_working_state(state, advance_revision=False)
+        self._set_saved_state(state)
+        if working_changed:
+            self._revision += 1
+        self._rebuild_dirty_cache()
         self._bound_sidecar_path = source
         self._bound_sidecar_fingerprint = parsed_fingerprint
 
@@ -1552,53 +2134,64 @@ class ProofreadStore:
             self.dataset, image_signature=copy.deepcopy(self.image_signature)
         )
         historical.load(path)
-        return self.restore_history_snapshot(historical.working_snapshot)
+        return self._restore_history_state(historical._capture_state())
 
     def restore_history_snapshot(self, snapshot: dict[str, Any]) -> bool:
         """Apply a staged history version after resolving pending GUI edits."""
         working = self._validated_canonical_state(snapshot, name="history state")
-        if working["provisional_added_ids"]:
+        return self._restore_history_state(working)
+
+    def _restore_history_state(self, working: _StoreState) -> bool:
+        if working.provisional_added_ids:
             raise SidecarError("history must not contain provisional identities")
-        baseline = self.saved_snapshot
+        baseline = self._saved_state
         bound_path = self._bound_sidecar_path
         bound_fingerprint = self._bound_sidecar_fingerprint
 
-        current_committed = set(baseline["committed_added_ids"])
-        current_retired = set(baseline["retired_ids"])
-        historical_committed = set(working["committed_added_ids"])
+        current_committed = set(baseline.committed_added_ids)
+        current_retired = set(baseline.retired_ids)
+        historical_committed = set(working.committed_added_ids)
         max_next = max(
-            int(baseline["next_neuron_id"]), int(working["next_neuron_id"])
+            baseline.next_neuron_id, working.next_neuron_id
         )
         lineage = set(range(self.raw_N, max_next))
         committed = (current_committed & historical_committed) - current_retired
         retired = lineage - committed
-        working["committed_added_ids"] = sorted(committed)
-        working["provisional_added_ids"] = []
-        working["retired_ids"] = sorted(retired)
-        working["next_neuron_id"] = max_next
-        working["observation_patches"] = [
-            record
-            for record in working["observation_patches"]
-            if int(record["neuron_id"]) not in retired
-        ]
-        working["delete_all_ids"] = [
-            value for value in working["delete_all_ids"] if int(value) not in retired
-        ]
-        working["placement_size"] = {
-            key: value
-            for key, value in working["placement_size"].items()
-            if int(key) not in retired
+        patches = {
+            key: patch
+            for key, patch in working.observation_patches.items()
+            if key[1] not in retired
         }
-        validated = self._validated_canonical_state(
-            working, name="history working state"
+        transformed = _store_state(
+            observation_patches=patches,
+            delete_all_ids=set(working.delete_all_ids) - retired,
+            placement_size={
+                neuron_id: size
+                for neuron_id, size in working.placement_size.items()
+                if neuron_id not in retired
+            },
+            committed_added_ids=committed,
+            provisional_added_ids=set(),
+            retired_ids=retired,
+            next_neuron_id=max_next,
+            changed_fields={
+                key: fields
+                for key, fields in working.changed_fields.items()
+                if key[1] not in retired
+            },
         )
-        self._restore_state(validated)
-        self._saved_snapshot = baseline
+        changed = self._install_working_state(
+            transformed, advance_revision=False
+        )
+        if changed:
+            self._revision += 1
+        self._set_saved_state(baseline)
+        self._rebuild_dirty_cache()
         self._bound_sidecar_path = bound_path
         self._bound_sidecar_fingerprint = bound_fingerprint
         return self.dirty
 
-    def _validate_payload(self, payload: Any) -> dict[str, Any]:
+    def _validate_payload(self, payload: Any) -> _StoreState:
         if not isinstance(payload, dict):
             raise SidecarError("sidecar root must be an object")
         schema_version = payload.get("schema_version")
@@ -1727,6 +2320,7 @@ class ProofreadStore:
             )
 
         patches: dict[tuple[int, int], ObservationPatch] = {}
+        changed_fields: dict[tuple[int, int], tuple[str, ...]] = {}
         known_ids = set(range(self.raw_N)) | committed
         if not delete_all_ids <= known_ids:
             raise SidecarError("delete_all references unknown neuron")
@@ -1820,6 +2414,7 @@ class ProofreadStore:
                     if not expected:
                         continue
                 patches[key] = patch
+                changed_fields[key] = expected
             elif state == DELETED:
                 if neuron_id in delete_all_ids:
                     raise SidecarError(
@@ -1845,7 +2440,15 @@ class ProofreadStore:
                         raise SidecarError(
                             "changed_fields do not match raw and patch geometry"
                         )
+                else:
+                    expected = self._changed_fields_for_patch(
+                        volume_index,
+                        neuron_id,
+                        patch,
+                        delete_all_ids=delete_all_ids,
+                    )
                 patches[key] = patch
+                changed_fields[key] = expected
 
         # Retired IDs may remain reserved but cannot be active in markers.
         if delete_all_ids & retired:
@@ -1853,22 +2456,21 @@ class ProofreadStore:
         max_id = max(
             [self.raw_N - 1, *committed, *retired], default=self.raw_N - 1
         )
-        state = {
-            "observation_patches": [
-                _patch_to_json(volume_index, neuron_id, patch)
-                for (volume_index, neuron_id), patch in sorted(patches.items())
-            ],
-            "delete_all_ids": sorted(delete_all_ids),
-            "placement_size": {
-                str(neuron_id): [float(v) for v in size]
-                for neuron_id, size in sorted(placement_size.items())
-            },
-            "committed_added_ids": sorted(committed),
-            "provisional_added_ids": [],
-            "retired_ids": sorted(retired),
-            "next_neuron_id": max_id + 1,
-        }
-        return state
+        for neuron_id in delete_all_ids:
+            for volume_index in self._raw_present_volume_indices(neuron_id):
+                key = (volume_index, neuron_id)
+                if key not in patches:
+                    changed_fields[key] = ("presence",)
+        return _store_state(
+            observation_patches=patches,
+            delete_all_ids=delete_all_ids,
+            placement_size=placement_size,
+            committed_added_ids=committed,
+            provisional_added_ids=set(),
+            retired_ids=retired,
+            next_neuron_id=max_id + 1,
+            changed_fields=changed_fields,
+        )
 
     # ------------------------------------------------------------------
     # Corrected NPY materialization
@@ -2014,5 +2616,6 @@ __all__ = [
     "SUPPORTED_SCHEMA_VERSIONS",
     "ObservationPatch",
     "ProofreadStore",
+    "ProofreadStatus",
     "SidecarError",
 ]

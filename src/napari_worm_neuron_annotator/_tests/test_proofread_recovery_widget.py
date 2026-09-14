@@ -18,6 +18,7 @@ from napari_worm_neuron_annotator._proofread_files import (
     list_history_versions,
     read_recovery,
     recovery_directory,
+    recovery_path,
 )
 
 
@@ -82,6 +83,88 @@ def test_recovery_timer_reuses_hash_and_skips_unchanged_state(
     _protect(widget, qtbot)
     assert len(calls) == 1
     assert widget.proofread_store.dirty
+
+
+def test_unchanged_recovery_timer_does_not_capture_or_encode(
+    make_recovery_widget, qtbot, monkeypatch
+):
+    widget = make_recovery_widget()
+    widget.proofread_store.set_observation_deleted(0, 0)
+    path = _protect(widget, qtbot)
+
+    def fail(*_args, **_kwargs):
+        pytest.fail("unchanged recovery must stop before snapshot capture")
+
+    monkeypatch.setattr(
+        widget.proofread_store, "capture_recovery_state", fail
+    )
+    monkeypatch.setattr(widget_module, "canonical_json_bytes", fail)
+    widget._on_recovery_timer()
+
+    assert widget._recovery_thread is None
+    assert path.exists()
+
+
+def test_recovery_capture_is_on_gui_and_encoding_is_in_worker(
+    make_recovery_widget, qtbot, monkeypatch
+):
+    widget = make_recovery_widget()
+    store = widget.proofread_store
+    store.set_observation_deleted(0, 0)
+    _prime_hash(widget)
+    original_capture = store.capture_recovery_state
+    original_encode = widget_module.canonical_json_bytes
+
+    def capture(*args, **kwargs):
+        assert QThread.currentThread() == QApplication.instance().thread()
+        return original_capture(*args, **kwargs)
+
+    def encode(payload):
+        assert QThread.currentThread() != QApplication.instance().thread()
+        return original_encode(payload)
+
+    monkeypatch.setattr(store, "capture_recovery_state", capture)
+    monkeypatch.setattr(widget_module, "canonical_json_bytes", encode)
+    _protect(widget, qtbot)
+
+
+def test_concurrent_edit_discards_stale_snapshot_and_protects_latest(
+    make_recovery_widget, qtbot, monkeypatch
+):
+    widget = make_recovery_widget()
+    store = widget.proofread_store
+    store.set_observation_deleted(0, 0)
+    _prime_hash(widget)
+    started, release = Event(), Event()
+    original_write = widget_module.write_temp_bytes
+    calls = 0
+
+    def delayed_first_write(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            assert release.wait(5)
+        return original_write(*args)
+
+    monkeypatch.setattr(
+        widget_module, "write_temp_bytes", delayed_first_write
+    )
+    widget._on_recovery_timer()
+    qtbot.waitUntil(started.is_set)
+    store.set_observation_deleted(1, 1)
+    release.set()
+    path = recovery_path(
+        widget.roi_dataset.path, widget._recovery_session_uuid
+    )
+    qtbot.waitUntil(
+        lambda: widget._recovery_thread is None and path.exists(),
+        timeout=5000,
+    )
+
+    payload = read_recovery(path)
+    assert payload["working_state"] == store.working_snapshot
+    assert calls == 2
 
 
 def test_recovery_write_failure_retries_without_losing_last_snapshot(

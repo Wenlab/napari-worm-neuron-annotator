@@ -15,6 +15,7 @@ from napari_worm_neuron_annotator._proofread import (
     SidecarError,
 )
 from napari_worm_neuron_annotator._proofread_files import (
+    RECOVERY_SCHEMA_VERSION,
     backup_formal_bytes,
     canonical_json_bytes,
     hash_file_stable,
@@ -175,13 +176,50 @@ def test_history_rollback_keeps_current_baseline_and_never_reuses_ids(tmp_path):
     assert history_file.exists()
 
 
-def test_synthetic_eight_mb_recovery_workload(tmp_path):
+def test_large_patch_shaped_recovery_workload(tmp_path):
     source = tmp_path / "eight-mb.bin"
     source.write_bytes(bytes(8 * 1024 * 1024))
     start = time.perf_counter()
     hashed = hash_file_stable(source)
     hash_seconds = time.perf_counter() - start
-    payload = {"blob": "x" * (8 * 1024 * 1024)}
+    patch_count = 34_000
+    patches = [
+        {
+            "volume_index": index // 136,
+            "neuron_id": index % 136,
+            "state": "present",
+            "box": {
+                "center_zyx": [3.0, 40.0 + index % 17, 50.0],
+                "size_zyx": [3.0, 7.0, 7.0],
+            },
+        }
+        for index in range(patch_count)
+    ]
+    empty_state = {
+        "observation_patches": [],
+        "delete_all_ids": [],
+        "placement_size": {},
+        "committed_added_ids": [],
+        "provisional_added_ids": [],
+        "retired_ids": [],
+        "next_neuron_id": 136,
+    }
+    payload = {
+        "recovery_schema_version": RECOVERY_SCHEMA_VERSION,
+        "session_uuid": uuid.uuid4().hex,
+        "utc_time": utc_now_text(),
+        "revision": 1,
+        "raw": {
+            "shape": [250, 136, 8],
+            "dtype": "<f4",
+            "z_divisor": 5.0,
+            "sha256": hashed.sha256,
+        },
+        "image_signature": None,
+        "formal": {"path": None, "sha256": None},
+        "working_state": {**empty_state, "observation_patches": patches},
+        "saved_state": empty_state,
+    }
     start = time.perf_counter()
     data = canonical_json_bytes(payload)
     serialize_seconds = time.perf_counter() - start
@@ -190,7 +228,8 @@ def test_synthetic_eight_mb_recovery_workload(tmp_path):
     write_seconds = time.perf_counter() - start
 
     assert len(hashed.sha256) == 64
-    assert temporary.stat().st_size >= 8 * 1024 * 1024
+    assert len(patches) == patch_count
+    assert temporary.stat().st_size >= 5 * 1024 * 1024
     # A generous regression guard; the GUI performs these steps off-thread.
     assert hash_seconds < 10
     assert serialize_seconds < 10

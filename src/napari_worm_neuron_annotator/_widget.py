@@ -188,7 +188,14 @@ class _RecoveryWorker(QObject):
             elif kind == "snapshot":
                 if self.cancelled.is_set():
                     raise OSError("recovery cancelled")
-                data = canonical_json_bytes(self.task["payload"])
+                capture = self.task["capture"]
+                payload = capture.payload(
+                    session_uuid=str(self.task["session_uuid"]),
+                    revision=int(self.task["revision"]),
+                    raw_sha256=str(self.task["raw_sha256"]),
+                    utc_time=str(self.task["utc_time"]),
+                )
+                data = canonical_json_bytes(payload)
                 if self.cancelled.is_set():
                     raise OSError("recovery cancelled")
                 temporary = write_temp_bytes(str(self.task["target"]), data)
@@ -211,6 +218,8 @@ class _RecoveryWorker(QObject):
             }
         result["generation"] = self.task.get("generation", -1)
         result["session_uuid"] = self.task.get("session_uuid", "")
+        if self.task.get("kind") == "snapshot":
+            result["state_key"] = self.task.get("state_key")
         self.result = result
         if self.cancelled.is_set():
             discard_temp(result.get("temporary"))
@@ -339,7 +348,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._recovery_generation = 0
         self._recovery_source_identity = None
         self._recovery_raw_sha256: str | None = None
-        self._recovery_last_state_key: dict[str, object] | None = None
+        self._recovery_last_state_key: tuple[object, ...] | None = None
         self._recovery_last_protected_utc: str | None = None
         self._recovery_failure: str | None = None
         self._recovery_source_changed = False
@@ -773,7 +782,7 @@ class NeuronAnnotatorWidget(QWidget):
     def _update_proof_action_state(self) -> None:
         """Refresh proofreading button emphasis from store/draft state."""
         store = self.proofread_store
-        store_dirty = bool(store is not None and store.dirty)
+        store_dirty = bool(store is not None and store.status.dirty)
         draft_dirty = bool(self._proof_size_draft_dirty)
         if hasattr(self, "proof_save_btn"):
             self.proof_save_btn.setText("Save edits *" if store_dirty else "Save edits")
@@ -811,16 +820,12 @@ class NeuronAnnotatorWidget(QWidget):
                     box = None
                 size = self._proof_draft_size()
                 can_apply = box is not None and tuple(float(v) for v in box.size_zyx) != size
-                # All-existing is independent of whether the draft owner's
-                # current observation exists; it may legitimately update
-                # boxes at other volumes while leaving this one missing.
-                for volume in range(store.raw_T):
-                    with suppress(
-                        AttributeError, TypeError, ValueError, RuntimeError
-                    ):
-                        if store.resolve(volume, target[1]) is not None:
-                            can_apply_all = True
-                            break
+                # The Store caches observation presence per identity, so UI
+                # refreshes do not rescan every volume for an unchanged draft.
+                with suppress(
+                    AttributeError, TypeError, ValueError, RuntimeError
+                ):
+                    can_apply_all = store.has_observations(target[1])
             self.proof_apply_size_btn.setText(
                 "Apply current t *" if draft_dirty else "Apply current t"
             )
@@ -1404,7 +1409,11 @@ class NeuronAnnotatorWidget(QWidget):
         size = self._proof_canonical_draft_size(target)
         existing: list[int] = []
         changed: list[int] = []
-        for volume in range(store.raw_T):
+        try:
+            volumes = store.observation_volume_indices(neuron_id)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            volumes = ()
+        for volume in sorted(volumes):
             with suppress(AttributeError, TypeError, ValueError, RuntimeError):
                 box = store.resolve(volume, neuron_id)
                 if box is not None:
@@ -1666,7 +1675,9 @@ class NeuronAnnotatorWidget(QWidget):
         )
         try:
             self.proofread_store.delete_all_observations(self.active_id)
-            self.proofread_store.placement_size[self.active_id] = placement_size
+            self.proofread_store.set_placement_size(
+                self.active_id, placement_size
+            )
         except (AttributeError, ValueError, RuntimeError) as error:
             self.update_status(f"Could not delete all observations: {error}", "red")
             return
@@ -1823,6 +1834,15 @@ class NeuronAnnotatorWidget(QWidget):
                 return
             if not bool(result.get("ok")):
                 self._recovery_failure = str(result.get("error", "unknown error"))
+                store = self.proofread_store
+                if (
+                    result.get("kind") == "snapshot"
+                    and store is not None
+                    and store.status.dirty
+                    and result.get("state_key")
+                    != self._recovery_state_key(store)
+                ):
+                    self._recovery_pending = True
                 return
             if result["kind"] == "hash":
                 if (
@@ -1839,7 +1859,17 @@ class NeuronAnnotatorWidget(QWidget):
                 return
             target = Path(result["target"])
             dataset = self.roi_dataset
-            if dataset is None or file_identity(dataset.path) != self._recovery_source_identity:
+            store = self.proofread_store
+            if (
+                dataset is None
+                or store is None
+                or not store.status.dirty
+                or result.get("state_key") != self._recovery_state_key(store)
+            ):
+                discard_temp(temporary)
+                self._recovery_pending = True
+                return
+            if file_identity(dataset.path) != self._recovery_source_identity:
                 discard_temp(temporary)
                 self._recovery_source_changed = True
                 return
@@ -1897,7 +1927,26 @@ class NeuronAnnotatorWidget(QWidget):
     def _on_recovery_timer(self) -> None:
         self._schedule_recovery_snapshot()
 
+    def _recovery_state_key(self, store) -> tuple[object, ...]:
+        """Return the complete identity of one recovery request."""
+        formal_path = (
+            None
+            if self._proof_sidecar_path is None
+            else str(self._proof_sidecar_path)
+        )
+        return (
+            self._recovery_session_uuid,
+            id(store),
+            int(store.revision),
+            int(store.baseline_revision),
+            formal_path,
+            store.bound_sidecar_fingerprint,
+        )
+
     def _schedule_recovery_snapshot(self, *, force: bool = False) -> None:
+        # Retained for call-site compatibility; request identity, not caller
+        # urgency, decides whether serialization is necessary.
+        del force
         store = self.proofread_store
         dataset = self.roi_dataset
         if (
@@ -1910,13 +1959,20 @@ class NeuronAnnotatorWidget(QWidget):
         ):
             return
         source = Path(dataset.path)
+        if not store.status.dirty:
+            if (
+                self._recovery_thread is not None
+                or self._recovery_current_path is not None
+                or self._recovery_preserved_path is not None
+                or self._recovery_last_state_key is not None
+            ):
+                self._invalidate_recovery_task(delete_current=True)
+            return
+        state_key = self._recovery_state_key(store)
         if self._recovery_thread is not None:
             self._recovery_pending = True
             return
         if self._recovery_raw_sha256 is None:
-            if not store.dirty:
-                self._invalidate_recovery_task(delete_current=True)
-                return
             try:
                 identity = file_identity(source)
             except OSError as exc:
@@ -1944,36 +2000,27 @@ class NeuronAnnotatorWidget(QWidget):
             self._recovery_failure = str(exc)
             self._update_recovery_status()
             return
+        # A successful snapshot already protects this exact working/baseline
+        # state and formal binding. Forced scheduling never duplicates it.
+        # The cheap source-identity check above still runs on every timer tick.
+        if state_key == self._recovery_last_state_key:
+            return
         utc_time = utc_now_text()
-        payload = store.recovery_payload(
-            session_uuid=self._recovery_session_uuid,
-            revision=self._recovery_revision + 1,
-            raw_sha256=self._recovery_raw_sha256,
-            utc_time=utc_time,
+        capture = store.capture_recovery_state(
             formal_path=self._proof_sidecar_path,
             formal_fingerprint=store.bound_sidecar_fingerprint,
         )
-        if payload["working_state"] == payload["saved_state"]:
-            self._invalidate_recovery_task(delete_current=True)
-            return
-        state_key = {
-            "working": payload["working_state"],
-            "saved": payload["saved_state"],
-            "formal_path": payload["formal"]["path"],
-            "formal_sha256": payload["formal"]["sha256"],
-        }
-        if not force and state_key == self._recovery_last_state_key:
-            return
         self._recovery_revision += 1
         target = recovery_path(source, self._recovery_session_uuid)
         self._start_recovery_task(
             {
                 "kind": "snapshot",
-                "payload": payload,
+                "capture": capture,
                 "target": target,
                 "state_key": state_key,
                 "utc_time": utc_time,
                 "revision": self._recovery_revision,
+                "raw_sha256": self._recovery_raw_sha256,
             }
         )
 
@@ -2171,7 +2218,6 @@ class NeuronAnnotatorWidget(QWidget):
         try:
             historical = ProofreadStore(store.dataset, image_signature=store.image_signature)
             historical.load(path)
-            snapshot = historical.working_snapshot
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             self.update_status(f"History load failed: {exc}", "red")
             return False
@@ -2183,7 +2229,9 @@ class NeuronAnnotatorWidget(QWidget):
                 and fingerprint_file(store.bound_sidecar_path) != store.bound_sidecar_fingerprint
             ):
                 raise ValueError("formal file changed externally; reload it or use Save As")
-            changed = store.restore_history_snapshot(snapshot)
+            changed = store._restore_history_state(  # noqa: SLF001
+                historical._capture_state()  # noqa: SLF001
+            )
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             self.update_status(f"History load failed: {exc}", "red")
             return False
@@ -5070,17 +5118,16 @@ class NeuronAnnotatorWidget(QWidget):
             proof_mode = "On" if self.proofreading_enabled else "Off"
             if self._proof_detached:
                 proof_mode += " (paused)"
-            moved = len(getattr(store, "center_changed_observations", ()))
-            resized = len(getattr(store, "size_changed_observations", ()))
-            presence = len(getattr(store, "presence_changed_observations", ()))
+            status = store.status
             text += (
                 f"\nProof: {proof_mode}; "
-                f"dirty={'yes' if store.dirty else 'no'}; "
-                f"moved={moved}; resized={resized}; presence={presence}"
+                f"dirty={'yes' if status.dirty else 'no'}; "
+                f"moved={status.moved}; resized={status.resized}; "
+                f"presence={status.presence}"
             )
             if self._proof_size_draft_dirty:
                 text += "; Unapplied size draft — F8 will use it"
-            if store.dirty:
+            if status.dirty:
                 text += "; Unsaved proof edits"
         active_range = self._active_z_range()
         if self._z_ranges:
