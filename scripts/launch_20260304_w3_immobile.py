@@ -1,18 +1,14 @@
 """Open the validated 20260304_w3_immobile dataset in the ROI navigator."""
 
-from pathlib import Path
-
 import napari
 import numpy as np
 
 from napari_worm_neuron_annotator import NeuronAnnotatorWidget
 
-DATASET_NAME = "20260304_w3_immobile"
-DATA_DIR = (
-    Path(__file__).resolve().parents[1] / "data" / f"{DATASET_NAME}_npy"
-)
-IMAGE_PATH = DATA_DIR / "volumes.npy"
-ROI_PATH = DATA_DIR / "neuron_point_tuple.npy"
+DATASET_NAME = "20260304_w3"
+DATA_DIR = r"Z:\data5\CBMI_Neuron_Traces\proofreading\raw_data\20260304_w3"
+IMAGE_PATH = DATA_DIR + r"\volumes.npy"
+ROI_PATH = DATA_DIR + r"\neuron_point_tuple.npy"
 
 Z_DIVISOR = 5.0
 LAYER_SCALE_TZYX = (1.0, 5.0, 1.0, 1.0)

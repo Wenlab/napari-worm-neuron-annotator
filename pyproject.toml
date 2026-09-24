@@ -135,7 +135,7 @@ napari-worm-neuron-annotator = { path = ".", editable = true }
 default = { solve-group = "default" }
 excel = { features = ["excel"], solve-group = "default" }
 
-[tool.pixi.tasks]
+[tool.pixi.feature.excel.tasks]
 launch-actual = "python scripts/launch_20260304_w3_immobile.py"
 
 [tool.pixi.dependencies]

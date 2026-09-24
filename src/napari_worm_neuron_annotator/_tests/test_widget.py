@@ -6,6 +6,10 @@ from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import QComboBox, QLineEdit, QMessageBox, QTreeWidget
 
+from napari_worm_neuron_annotator._behavior import (
+    BehaviorEvent,
+    BehaviorWorkbook,
+)
 from napari_worm_neuron_annotator._colors import neuron_color
 from napari_worm_neuron_annotator._widget import (
     EXCEL_AVAILABLE,
@@ -465,6 +469,171 @@ def test_widget_initializes_checkable_selection(make_napari_viewer):
     assert widget.checked_ids == set()
     assert not hasattr(widget, "reset_btn")
     assert not hasattr(widget, "labels_visible_checkbox")
+
+
+def test_widget_initializes_behavior_controls(make_napari_viewer):
+    viewer = make_napari_viewer()
+    widget = NeuronAnnotatorWidget(viewer)
+
+    assert widget.behavior_path_input.isReadOnly()
+    assert widget.load_behavior_btn.text() == "Load XLSX"
+    assert widget.load_behavior_btn.isEnabled() == EXCEL_AVAILABLE
+    assert widget.load_excel_btn.isEnabled() == EXCEL_AVAILABLE
+    assert widget.save_annotation_btn.isEnabled() == EXCEL_AVAILABLE
+    assert not widget.unload_behavior_btn.isEnabled()
+    assert widget.show_behavior_checkbox.isChecked()
+    assert widget.behavior_info_label.text() == "No behavior loaded"
+    assert widget.behavior_workbook is None
+
+
+def test_behavior_overlay_maps_volume_without_roi_and_restores_on_unload(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(
+        np.zeros((4, 3, 8, 8), dtype=np.uint8), name="image"
+    )
+    viewer.dims.set_current_step(0, 0)
+    overlay = viewer.text_overlay
+    overlay.text = "user text"
+    overlay.visible = True
+    overlay.position = "bottom_left"
+    overlay.font_size = 13
+    overlay.color = "#123456"
+    original_color = np.asarray(overlay.color).copy()
+
+    path = tmp_path / "behavior.xlsx"
+    loaded = BehaviorWorkbook(
+        ("forward", "turn"),
+        (
+            BehaviorEvent("forward", 5, 9),
+            BehaviorEvent("forward", 7, 11),
+            BehaviorEvent("turn", 7, 9),
+        ),
+    )
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.load_behavior_workbook",
+        lambda requested: loaded,
+    )
+
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.volume_start_spin.setValue(5)
+    widget.volume_stride_spin.setValue(2)
+    layer_count = len(viewer.layers)
+    widget.load_behavior_path(path)
+
+    assert widget.behavior_info_label.text() == "2 behaviors / 3 events"
+    assert widget._mapped_volume_index() == 5
+    assert overlay.text == "forward"
+    assert overlay.visible
+    assert str(overlay.position) == "top_right"
+    assert overlay.font_size == 20
+    np.testing.assert_allclose(np.asarray(overlay.color), (1, 1, 1, 1))
+    assert len(viewer.layers) == layer_count
+    assert widget.roi_dataset is None
+
+    viewer.dims.set_current_step(0, 1)
+    assert widget._mapped_volume_index() == 7
+    assert overlay.text == "forward\nturn"
+
+    viewer.dims.set_current_step(0, 2)
+    assert widget._mapped_volume_index() == 9
+    assert overlay.text == "forward"
+
+    viewer.dims.set_current_step(0, 3)
+    assert widget._mapped_volume_index() == 11
+    assert overlay.text == ""
+    assert not overlay.visible
+
+    widget.show_behavior_checkbox.setChecked(False)
+    viewer.dims.set_current_step(0, 1)
+    assert overlay.text == "forward\nturn"
+    assert not overlay.visible
+    widget.show_behavior_checkbox.setChecked(True)
+    assert overlay.visible
+
+    widget.unload_behavior()
+    assert widget.behavior_workbook is None
+    assert widget.behavior_path_input.text() == ""
+    assert overlay.text == "user text"
+    assert overlay.visible
+    assert str(overlay.position) == "bottom_left"
+    assert overlay.font_size == 13
+    np.testing.assert_allclose(np.asarray(overlay.color), original_color)
+    assert image in viewer.layers
+
+
+def test_behavior_overlay_hides_without_image_and_restores_on_shutdown(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    image = viewer.add_image(np.zeros((3, 8, 8), dtype=np.uint8))
+    overlay = viewer.text_overlay
+    overlay.text = "before"
+    overlay.position = "top_left"
+    overlay.font_size = 16
+    overlay.visible = True
+
+    path = tmp_path / "behavior.xlsx"
+    loaded = BehaviorWorkbook(
+        ("pause",), (BehaviorEvent("pause", 4, 5),)
+    )
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.load_behavior_workbook",
+        lambda requested: loaded,
+    )
+
+    widget = NeuronAnnotatorWidget(viewer)
+    widget.volume_start_spin.setValue(4)
+    widget.load_behavior_path(path)
+    assert widget._mapped_volume_index() == 4
+    assert overlay.text == "pause"
+    assert overlay.font_size == 20
+    assert overlay.visible
+
+    viewer.layers.remove(image)
+    assert widget.behavior_workbook is not None
+    assert overlay.text == ""
+    assert not overlay.visible
+
+    widget.shutdown()
+    assert overlay.text == "before"
+    assert overlay.visible
+    assert str(overlay.position) == "top_left"
+    assert overlay.font_size == 16
+
+
+def test_failed_behavior_replacement_keeps_loaded_state(
+    make_napari_viewer, monkeypatch, tmp_path
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((2, 3, 8, 8), dtype=np.uint8))
+    widget = NeuronAnnotatorWidget(viewer)
+
+    valid_path = tmp_path / "valid.xlsx"
+    loaded = BehaviorWorkbook(
+        ("forward",), (BehaviorEvent("forward", 0, 2),)
+    )
+
+    def load_workbook(path):
+        if path == valid_path:
+            return loaded
+        raise OSError("missing workbook")
+
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.load_behavior_workbook",
+        load_workbook,
+    )
+    widget.load_behavior_path(valid_path)
+
+    previous = widget.behavior_workbook
+    previous_path = widget.behavior_path_input.text()
+    with pytest.raises(OSError):
+        widget.load_behavior_path(tmp_path / "missing.xlsx")
+
+    assert widget.behavior_workbook is previous
+    assert widget.behavior_path_input.text() == previous_path
+    assert viewer.text_overlay.text == "forward"
 
 
 def test_f10_toggles_only_managed_neuron_overlays_and_persists_across_refresh(

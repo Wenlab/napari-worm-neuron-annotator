@@ -3,6 +3,11 @@ import json
 import numpy as np
 import pytest
 
+from napari_worm_neuron_annotator._behavior import (
+    BehaviorEvent,
+    BehaviorWorkbook,
+    active_behavior_labels,
+)
 from napari_worm_neuron_annotator._proofread import (
     ABSENT,
     DELETED,
@@ -429,6 +434,68 @@ def test_v2_sidecar_writes_changed_fields_and_round_trips(tmp_path):
     loaded = ProofreadStore.from_sidecar(path, store.dataset)
     assert loaded.resolve(0, 0).center_zyx == (1, 2, 3)
     assert not loaded.dirty
+
+
+def test_behavior_intervals_round_trip_and_legacy_sidecar_loads(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    behavior = BehaviorWorkbook(
+        ("forward", "turn"),
+        (
+            BehaviorEvent("forward", 0, 3),
+            BehaviorEvent("turn", 1, 2),
+        ),
+    )
+    store.set_behavior(behavior)
+    assert store.dirty
+    path = store.save(tmp_path / "proof.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["behavior"] == {
+        "labels": ["forward", "turn"],
+        "events": [
+            {"label": "forward", "start": 0, "stop": 3},
+            {"label": "turn", "start": 1, "stop": 2},
+        ],
+    }
+    loaded = ProofreadStore.from_sidecar(path, store.dataset)
+    assert loaded.behavior == behavior
+    assert active_behavior_labels(loaded.behavior.events, 1) == (
+        "forward", "turn"
+    )
+    assert not loaded.dirty
+
+    payload.pop("behavior")
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(payload), encoding="utf-8")
+    loaded.load(legacy)
+    assert loaded.behavior is None
+    assert not loaded.dirty
+
+
+@pytest.mark.parametrize(
+    "behavior",
+    [
+        {"labels": ["forward"], "events": [{"label": "forward", "start": True, "stop": 2}]},
+        {"labels": ["forward"], "events": [{"label": "turn", "start": 0, "stop": 2}]},
+        {"labels": ["forward"], "events": [{"label": "forward", "start": 2, "stop": 2}]},
+    ],
+)
+def test_invalid_behavior_sidecar_does_not_replace_working_state(
+    tmp_path, behavior
+):
+    store = ProofreadStore(_dataset(tmp_path))
+    original = BehaviorWorkbook(("saved",), (BehaviorEvent("saved", 0, 1),))
+    store.set_behavior(original)
+    valid = store.save(tmp_path / "valid.json")
+    payload = json.loads(valid.read_text(encoding="utf-8"))
+    payload["behavior"] = behavior
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SidecarError, match="behavior"):
+        store.load(invalid)
+    assert store.behavior == original
+    assert store.bound_sidecar_path == valid
 
 
 def test_v1_sidecar_loads_clean_and_next_save_upgrades_in_place(tmp_path):

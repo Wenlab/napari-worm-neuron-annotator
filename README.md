@@ -86,6 +86,38 @@ The ROI array defines the neuron list. Labels layers are not used for
 selection, box rendering, annotation, centering, time navigation, or Z-layer
 display.
 
+## Behavior display
+
+The optional **Behavior** panel loads a read-only `.xlsx` workbook. Each
+worksheet name is one behavior label, and each non-empty data row uses the
+first two columns as the zero-based start volume and duration in volumes. A
+single optional textual header row is accepted. For example, the row `10, 3` is active
+on volumes 10, 11, and 12: behavior intervals are half-open
+`[start, start + duration)`.
+
+Behavior volumes use the same mapping shown in the ROI panel:
+
+```text
+volume = Volume start + Image time * Stride
+```
+
+The mapping also works before an ROI is loaded. A 3D Image has no time axis,
+so it always displays behavior for `Volume start`; Z slices are not treated as
+volumes. If behaviors overlap, their worksheet labels are shown on separate
+lines in workbook order.
+
+Behavior text defaults to 20 pt, is white, and is fixed to the upper-right
+corner of the napari canvas, so it remains in place while panning or zooming.
+**Show behavior** hides the text without unloading events. **Unload** clears
+the current behavior data and restores the viewer text overlay, including its
+prior font size, from before the workbook was loaded. When an ROI is loaded,
+**Save edits** writes behavior labels and their half-open volume intervals
+into the proofread JSON; loading that JSON restores them without the original
+workbook. Older proofread JSON files without behavior data still load
+normally. The `excel` extra is needed
+to import `.xlsx`, but not to load saved behavior from JSON. Behavior display
+does not create or modify Image, Labels, Points, or Vectors layers.
+
 ## Worm orientation
 
 The **Worm Orientation** panel rotates the complete viewer clockwise by 0°,
@@ -162,11 +194,14 @@ override visibility until the next **Show** selection.
 ### Launch the validated 20260304_w3_immobile dataset
 
 The repository includes a ready-to-use launcher for the git-ignored local
-dataset at `data/20260304_w3_immobile_npy`:
+dataset configured in `scripts/launch_20260304_w3_immobile.py`:
 
 ```text
 pixi run launch-actual
 ```
+
+Pixi selects the `excel` environment for this task, enabling both annotation
+and Behavior XLSX import without adding Excel dependencies to the base plugin.
 
 It memory-maps `volumes.npy` and `neuron_point_tuple.npy`, opens napari, docks
 the navigator, and loads all 120 ROI identities.

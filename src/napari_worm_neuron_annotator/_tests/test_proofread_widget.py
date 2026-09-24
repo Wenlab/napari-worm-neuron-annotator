@@ -17,6 +17,10 @@ from qtpy.QtCore import QEvent, Qt
 from qtpy.QtGui import QKeyEvent
 from qtpy.QtWidgets import QApplication, QLineEdit, QMessageBox
 
+from napari_worm_neuron_annotator._behavior import (
+    BehaviorEvent,
+    BehaviorWorkbook,
+)
 from napari_worm_neuron_annotator._proofread import (
     DELETED,
     PRESENT,
@@ -101,6 +105,54 @@ def _make_widget(
     widget.load_roi_path(path)
     QApplication.processEvents()
     return viewer, widget
+
+
+def test_proof_sidecar_restores_behavior_overlay_without_xlsx(
+    make_napari_viewer, qtbot, tmp_path, proof_widgets, monkeypatch
+):
+    viewer, widget = _make_widget(
+        make_napari_viewer, qtbot, tmp_path, proof_widgets
+    )
+    viewer.text_overlay.text = "original"
+    behavior = BehaviorWorkbook(
+        ("forward", "turn"),
+        (BehaviorEvent("forward", 1, 3), BehaviorEvent("turn", 1, 2)),
+    )
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.load_behavior_workbook",
+        lambda path: behavior,
+    )
+    widget.load_behavior_path(tmp_path / "behavior.xlsx")
+    assert widget.proofread_store.dirty
+    assert widget.proof_save_btn.isEnabled()
+
+    sidecar = tmp_path / "proof.json"
+    assert widget._save_proof_to_path(str(sidecar))
+    widget.unload_behavior()
+    assert viewer.text_overlay.text == "original"
+    monkeypatch.setattr(widget, "_confirm_proof_transition", lambda action: True)
+    monkeypatch.setattr(
+        "napari_worm_neuron_annotator._widget.QFileDialog.getOpenFileName",
+        lambda *args: (str(sidecar), ""),
+    )
+    widget.load_proof_edits()
+
+    assert widget.proofread_store.behavior == behavior
+    assert widget.behavior_workbook == behavior
+    assert widget.behavior_info_label.text() == "2 behaviors / 2 events"
+    assert widget.behavior_path_input.text() == str(sidecar)
+    assert viewer.text_overlay.text == "forward\nturn"
+    assert viewer.text_overlay.font_size == 20
+    assert viewer.text_overlay.visible
+
+    widget.unload_behavior()
+    widget.proof_discard_scope_combo.setCurrentIndex(
+        widget.proof_discard_scope_combo.findData(DISCARD_ALL)
+    )
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
+    widget.discard_proof_edits()
+    assert widget.behavior_workbook == behavior
+    assert viewer.text_overlay.text == "forward\nturn"
 
 
 def _managed_vectors(viewer, role: str) -> Vectors:

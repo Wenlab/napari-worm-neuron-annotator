@@ -23,6 +23,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ._behavior import BehaviorWorkbook, behavior_from_json, behavior_to_json
 from ._proofread_files import (
     RECOVERY_SCHEMA_VERSION,
     backup_formal_bytes,
@@ -213,6 +214,7 @@ class _StoreState:
     retired_ids: frozenset[int]
     next_neuron_id: int
     changed_fields: Mapping[tuple[int, int], tuple[str, ...]]
+    behavior: BehaviorWorkbook | None
 
 
 def _frozen_mapping(values: Mapping[Any, Any]) -> Mapping[Any, Any]:
@@ -229,6 +231,7 @@ def _store_state(
     retired_ids: set[int] | frozenset[int],
     next_neuron_id: int,
     changed_fields: Mapping[tuple[int, int], tuple[str, ...]],
+    behavior: BehaviorWorkbook | None,
 ) -> _StoreState:
     """Own immutable top-level containers while sharing immutable records."""
     return _StoreState(
@@ -240,12 +243,13 @@ def _store_state(
         retired_ids=frozenset(retired_ids),
         next_neuron_id=int(next_neuron_id),
         changed_fields=_frozen_mapping(changed_fields),
+        behavior=behavior,
     )
 
 
 def _state_to_json(state: _StoreState) -> dict[str, Any]:
     """Return the established detached JSON-dictionary state interface."""
-    return {
+    result = {
         "observation_patches": [
             _patch_to_json(volume_index, neuron_id, patch)
             for (volume_index, neuron_id), patch in sorted(
@@ -262,6 +266,9 @@ def _state_to_json(state: _StoreState) -> dict[str, Any]:
         "retired_ids": sorted(state.retired_ids),
         "next_neuron_id": int(state.next_neuron_id),
     }
+    if state.behavior is not None:
+        result["behavior"] = behavior_to_json(state.behavior)
+    return result
 
 
 @dataclass(frozen=True)
@@ -407,6 +414,7 @@ class ProofreadStore:
         self._provisional_added_ids: set[int] = set()
         self._retired_ids: set[int] = set()
         self._next_neuron_id = self.dataset.raw_N
+        self._behavior: BehaviorWorkbook | None = None
         self._revision = 0
         self._baseline_revision = 0
 
@@ -559,6 +567,7 @@ class ProofreadStore:
             retired_ids=self._retired_ids,
             next_neuron_id=self._next_neuron_id,
             changed_fields=self._changed_fields,
+            behavior=self._behavior,
         )
 
     @staticmethod
@@ -591,6 +600,7 @@ class ProofreadStore:
             and self._provisional_added_ids == state.provisional_added_ids
             and self._retired_ids == state.retired_ids
             and self._next_neuron_id == state.next_neuron_id
+            and self._behavior == state.behavior
         )
 
     def _install_working_state(
@@ -604,6 +614,7 @@ class ProofreadStore:
         self._provisional_added_ids = set(state.provisional_added_ids)
         self._retired_ids = set(state.retired_ids)
         self._next_neuron_id = int(state.next_neuron_id)
+        self._behavior = state.behavior
         self._patch_keys_by_neuron = self._patch_index(
             self._observation_patches
         )
@@ -832,6 +843,7 @@ class ProofreadStore:
             or self._dirty_provisional_ids
             or self._dirty_retired_ids
             or self._allocator_dirty
+            or self._behavior != self._saved_state.behavior
         )
 
     def _refresh_status(self) -> None:
@@ -1416,6 +1428,27 @@ class ProofreadStore:
     def dirty(self) -> bool:
         return self._status.dirty
 
+    @property
+    def behavior(self) -> BehaviorWorkbook | None:
+        return self._behavior
+
+    def set_behavior(self, workbook: BehaviorWorkbook | None) -> None:
+        """Set the volume labels included with this proofread session."""
+        if workbook is not None:
+            if not isinstance(workbook, BehaviorWorkbook):
+                raise TypeError("behavior must be a BehaviorWorkbook")
+            workbook = behavior_from_json(behavior_to_json(workbook))
+        if workbook != self._behavior:
+            self._behavior = workbook
+            self._finish_change()
+
+    @staticmethod
+    def _parse_behavior(value: Any) -> BehaviorWorkbook:
+        try:
+            return behavior_from_json(value)
+        except ValueError as exc:
+            raise SidecarError(str(exc)) from exc
+
     def _restore_state(self, state: _StoreState) -> None:
         self._install_working_state(state, advance_revision=False)
 
@@ -1434,7 +1467,12 @@ class ProofreadStore:
             "retired_ids",
             "next_neuron_id",
         }
-        _require_fields(state, name, required=required)
+        _require_fields(state, name, required=required, optional={"behavior"})
+        behavior = (
+            self._parse_behavior(state["behavior"])
+            if "behavior" in state
+            else None
+        )
         committed = _id_set(state["committed_added_ids"], f"{name} committed")
         provisional = _id_set(
             state["provisional_added_ids"], f"{name} provisional"
@@ -1559,6 +1597,7 @@ class ProofreadStore:
             retired_ids=retired,
             next_neuron_id=next_id,
             changed_fields=changed_fields,
+            behavior=behavior,
         )
 
     def capture_recovery_state(
@@ -1940,6 +1979,7 @@ class ProofreadStore:
             retired_ids=retired,
             next_neuron_id=next_neuron_id,
             changed_fields=changed_fields,
+            behavior=self._behavior,
         )
         # v2 records carry an ordered field classification derived from the
         # raw geometry and the complete patch.  Keep the box itself as the
@@ -1975,6 +2015,8 @@ class ProofreadStore:
                 "retired": sorted(state.retired_ids),
             },
         }
+        if state.behavior is not None:
+            payload["behavior"] = behavior_to_json(state.behavior)
         return _SavePlan(payload=payload, committed_state=state)
 
     def _payload_for_save(self) -> dict[str, Any]:
@@ -2179,6 +2221,7 @@ class ProofreadStore:
                 for key, fields in working.changed_fields.items()
                 if key[1] not in retired
             },
+            behavior=working.behavior,
         )
         changed = self._install_working_state(
             transformed, advance_revision=False
@@ -2209,7 +2252,7 @@ class ProofreadStore:
                 "placement_size",
                 "added_neurons",
             },
-            optional={"image_signature"},
+            optional={"image_signature", "behavior"},
         )
         raw = payload.get("raw")
         if not isinstance(raw, dict):
@@ -2470,6 +2513,11 @@ class ProofreadStore:
             retired_ids=retired,
             next_neuron_id=max_id + 1,
             changed_fields=changed_fields,
+            behavior=(
+                self._parse_behavior(payload["behavior"])
+                if "behavior" in payload
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------

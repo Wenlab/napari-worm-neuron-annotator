@@ -166,6 +166,29 @@ responsive in a narrow napari dock; do not hide actions beyond the viewport.
 - Keep Excel dependencies optional unless they become a required plugin
   feature; expose them through a clearly named optional dependency group.
 
+## Behavior display
+
+- Load behavior events read-only from `.xlsx`; each worksheet name is the
+  display label and each event row contains zero-based start volume and a
+  positive duration in the first two columns.
+- Accept one optional textual header row and use half-open
+  `[start, start + duration)` membership. Preserve worksheet order and display
+  simultaneous labels once each on separate lines.
+- Map Image time with `Volume start + viewer_time * Stride`, independently of
+  ROI loading. For a 3D Image, use `Volume start`; never treat Z slices as
+  volumes.
+- Use the viewer text overlay at the upper-right canvas corner. Do not create
+  a behavior layer or bind behavior display to neuron selection, Z-layer mode,
+  or ordinary Labels layers.
+- Behavior import is session-only until saved with a proof sidecar. The
+  optional schema-v2 `behavior` field preserves labels and half-open volume
+  intervals; older sidecars without it remain valid. Hide without unloading,
+  and restore the exact prior viewer text-overlay text, visibility, position,
+  color, and font size when behavior is unloaded or the widget closes.
+- Behavior text defaults to 20 pt while loaded.
+- Keep XLSX support in the existing optional `excel` dependency group and
+  report workbook, worksheet, and row errors without crashing Qt callbacks.
+
 ## Proofreading recovery and history
 
 - Formal proof sidecars remain schema v2 and keep accepting v1 input.

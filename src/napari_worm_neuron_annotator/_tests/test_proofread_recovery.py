@@ -9,6 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from napari_worm_neuron_annotator._behavior import (
+    BehaviorEvent,
+    BehaviorWorkbook,
+)
 from napari_worm_neuron_annotator._proofread import (
     ExternalSidecarChangeError,
     ProofreadStore,
@@ -66,6 +70,23 @@ def test_recovery_preserves_working_baseline_provisional_and_delete_all(tmp_path
     assert 1 in restored.delete_all_ids
     assert formal_path == tmp_path / "proof.json"
     assert formal_hash == store.bound_sidecar_fingerprint
+
+
+def test_recovery_preserves_unsaved_behavior_and_saved_baseline(tmp_path):
+    store = ProofreadStore(_dataset(tmp_path))
+    saved = BehaviorWorkbook(("forward",), (BehaviorEvent("forward", 0, 2),))
+    working = BehaviorWorkbook(("turn",), (BehaviorEvent("turn", 2, 4),))
+    store.set_behavior(saved)
+    store.save(tmp_path / "proof.json")
+    store.set_behavior(working)
+
+    restored = ProofreadStore(store.dataset)
+    restored.restore_recovery_payload(_recovery(store))
+    assert restored.behavior == working
+    assert restored.dirty
+    restored.discard()
+    assert restored.behavior == saved
+    assert not restored.dirty
 
 
 def test_recovery_failure_is_transactional(tmp_path):

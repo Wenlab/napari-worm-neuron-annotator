@@ -5,8 +5,6 @@ environments:
     - url: https://conda.anaconda.org/conda-forge/
     indexes:
     - https://pypi.org/simple
-    options:
-      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/_openmp_mutex-4.5-7_kmp_llvm.conda
@@ -548,8 +546,6 @@ environments:
     - url: https://conda.anaconda.org/conda-forge/
     indexes:
     - https://pypi.org/simple
-    options:
-      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/_openmp_mutex-4.5-7_kmp_llvm.conda
@@ -4729,8 +4725,8 @@ packages:
   timestamp: 1736862579398
 - pypi: ./
   name: napari-worm-neuron-annotator
-  version: 0.2.1.dev3+ge0d367543.d20260804
-  sha256: f76741baa0dd75453ac58540c23625196a64db0a3b2a579cf099ffe240bfb0cc
+  version: 0.4.4.dev1+g72958103e.d20260924
+  sha256: a9531981e2c82fa5dfa6bcd69b7be5b2f80c021e60eeb1b560097397271e9aad
   requires_dist:
   - napari>=0.8,<0.9
   - numpy
@@ -4743,6 +4739,7 @@ packages:
   - pytest-qt ; extra == 'testing'
   - napari[pyqt6]>=0.8,<0.9 ; extra == 'testing'
   requires_python: '>=3.11,<3.15'
+  editable: true
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/ncurses-6.6-h1d4f5a5_0.conda
   sha256: 4ea6c620b87bd1d42bb2ccc2c87cd2483fa2d7f9e905b14c223f11ff3f4c455d
   md5: 343d10ed5b44030a2f67193905aea159

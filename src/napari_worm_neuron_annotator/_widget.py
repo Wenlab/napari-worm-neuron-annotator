@@ -53,6 +53,11 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ._behavior import (
+    BehaviorWorkbook,
+    active_behavior_labels,
+    load_behavior_workbook,
+)
 from ._colors import neuron_color
 from ._orientation import (
     ALLOWED_ROTATIONS,
@@ -124,6 +129,7 @@ ROLE_PROOF_TARGET = "roi_proof_target"
 # line weight without changing annotation data.
 PROOF_TARGET_HALF_LENGTH = 8.0
 PROOF_TARGET_EDGE_WIDTH = 1.0
+BEHAVIOR_FONT_SIZE = 20.0
 MANAGED_VECTOR_ROLES = (ROLE_SELECTED, LEGACY_ROLE_ALL, ROLE_ACTIVE)
 MANAGED_ROI_ROLES = (
     *MANAGED_VECTOR_ROLES,
@@ -306,6 +312,8 @@ class NeuronAnnotatorWidget(QWidget):
         self._search_cursor = -1
         self._box_label_color = "#ffffff"
         self._roi_overlays_visible = True
+        self.behavior_workbook: BehaviorWorkbook | None = None
+        self._behavior_overlay_snapshot: dict[str, object] | None = None
         self._ui_sync = False
         self._closed = False
         self._keys_bound: list[str] = []
@@ -404,6 +412,7 @@ class NeuronAnnotatorWidget(QWidget):
         layout.addWidget(self.orientation_group)
         layout.addWidget(self._build_z_layer_group())
         layout.addWidget(self._build_roi_group())
+        layout.addWidget(self._build_behavior_group())
         layout.addWidget(self._build_proofreading_group())
         layout.addWidget(self._build_selection_group())
         layout.addWidget(self._build_annotation_group())
@@ -562,12 +571,18 @@ class NeuronAnnotatorWidget(QWidget):
         config_layout.addWidget(QLabel("Volume start:"), 1, 0)
         self.volume_start_spin = QSpinBox()
         self.volume_start_spin.setRange(0, 1_000_000)
+        self.volume_start_spin.valueChanged.connect(
+            self._on_volume_mapping_changed
+        )
         config_layout.addWidget(self.volume_start_spin, 1, 1)
 
         config_layout.addWidget(QLabel("Stride:"), 2, 0)
         self.volume_stride_spin = QSpinBox()
         self.volume_stride_spin.setRange(1, 1_000_000)
         self.volume_stride_spin.setValue(1)
+        self.volume_stride_spin.valueChanged.connect(
+            self._on_volume_mapping_changed
+        )
         config_layout.addWidget(self.volume_stride_spin, 2, 1)
         config_layout.setColumnStretch(1, 1)
         group_layout.addLayout(config_layout)
@@ -575,6 +590,46 @@ class NeuronAnnotatorWidget(QWidget):
         self.roi_info_label = QLabel("No ROI loaded")
         self.roi_info_label.setWordWrap(True)
         group_layout.addWidget(self.roi_info_label)
+        group.setLayout(group_layout)
+        return group
+
+    def _build_behavior_group(self) -> QGroupBox:
+        group = QGroupBox("Behavior")
+        group_layout = QVBoxLayout()
+
+        path_layout = QHBoxLayout()
+        self.behavior_path_input = QLineEdit()
+        self.behavior_path_input.setReadOnly(True)
+        self.behavior_path_input.setPlaceholderText("Load behavior.xlsx")
+        path_layout.addWidget(self.behavior_path_input, 1)
+
+        self.load_behavior_btn = QPushButton("Load XLSX")
+        self.load_behavior_btn.setEnabled(EXCEL_AVAILABLE)
+        self.load_behavior_btn.clicked.connect(self.load_behavior_xlsx)
+        if not EXCEL_AVAILABLE:
+            self.load_behavior_btn.setToolTip(
+                "Install the 'excel' extra to load behavior workbooks."
+            )
+        path_layout.addWidget(self.load_behavior_btn)
+
+        self.unload_behavior_btn = QPushButton("Unload")
+        self.unload_behavior_btn.setEnabled(False)
+        self.unload_behavior_btn.clicked.connect(self.unload_behavior)
+        path_layout.addWidget(self.unload_behavior_btn)
+        group_layout.addLayout(path_layout)
+
+        display_layout = QHBoxLayout()
+        self.show_behavior_checkbox = QCheckBox("Show behavior")
+        self.show_behavior_checkbox.setChecked(True)
+        self.show_behavior_checkbox.toggled.connect(
+            self._refresh_behavior_overlay
+        )
+        display_layout.addWidget(self.show_behavior_checkbox)
+        display_layout.addStretch(1)
+        self.behavior_info_label = QLabel("No behavior loaded")
+        display_layout.addWidget(self.behavior_info_label)
+        group_layout.addLayout(display_layout)
+
         group.setLayout(group_layout)
         return group
 
@@ -1118,11 +1173,9 @@ class NeuronAnnotatorWidget(QWidget):
         """Map the current Image time to the raw NPY first-axis index."""
         if self.roi_dataset is None or self.current_image is None:
             return None
-        viewer_t = self._viewer_time()
-        index = (
-            self.volume_start_spin.value()
-            + viewer_t * self.volume_stride_spin.value()
-        )
+        index = self._mapped_volume_index()
+        if index is None:
+            return None
         raw_t = getattr(self.roi_dataset, "time_count", None)
         if raw_t is None:
             raw_t = getattr(self.roi_dataset, "raw_T", 0)
@@ -2148,6 +2201,7 @@ class NeuronAnnotatorWidget(QWidget):
             return False
         self._invalidate_recovery_task(delete_current=False)
         self.proofread_store = staged
+        self._display_behavior(staged.behavior, str(formal_path or path))
         bind_formal = False
         if formal_path is not None and formal_hash is not None:
             with suppress(OSError):
@@ -2236,6 +2290,7 @@ class NeuronAnnotatorWidget(QWidget):
             self.update_status(f"History load failed: {exc}", "red")
             return False
         self._proof_size_draft_dirty = False
+        self._display_behavior(store.behavior, str(path))
         self._proof_size_draft_target = None
         self._clear_proof_target()
         self._invalidate_recovery_task(delete_current=True)
@@ -2345,6 +2400,7 @@ class NeuronAnnotatorWidget(QWidget):
             return self._save_proof_edits_for_transition()
         if result == QMessageBox.Discard:
             store.discard()
+            self._display_behavior(store.behavior, str(self._proof_sidecar_path or ""))
             self._delete_current_recovery()
             self._refresh_available_ids(select_first=False)
             return True
@@ -2420,6 +2476,7 @@ class NeuronAnnotatorWidget(QWidget):
                 self.update_status(f"Proof load failed: {error}", "red")
                 return
         self.proofread_store = loaded
+        self._display_behavior(loaded.behavior, str(path))
         self._proof_sidecar_path = Path(path)
         self._delete_current_recovery()
         self._update_proof_path_display()
@@ -2468,6 +2525,9 @@ class NeuronAnnotatorWidget(QWidget):
             else:
                 changed = store.dirty
                 store.discard()
+                self._display_behavior(
+                    store.behavior, str(self._proof_sidecar_path or "")
+                )
                 status = "Discarded all unsaved proof edits"
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             self.update_status(f"Could not discard proof edits: {error}", "red")
@@ -3195,6 +3255,7 @@ class NeuronAnnotatorWidget(QWidget):
                     self.roi_dataset,
                     image_signature=self._proof_image_signature(source),
                 )
+                self.proofread_store.set_behavior(self.behavior_workbook)
                 self._proof_sidecar_path = None
                 self._begin_recovery_session()
                 self._update_proof_path_display()
@@ -3214,6 +3275,7 @@ class NeuronAnnotatorWidget(QWidget):
             self._refresh_selection_item_styles()
             self._update_orientation_controls_enabled()
             self._update_proof_current_box_status()
+            self._refresh_behavior_overlay()
             return True
         self._validate_image_source(source)
         self._ensure_orientation_baseline()
@@ -3235,6 +3297,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._update_roi_info()
         self._update_proof_current_box_status()
         self._update_orientation_controls_enabled()
+        self._refresh_behavior_overlay()
         return True
 
     def _disconnect_current_image_events(self) -> None:
@@ -3707,6 +3770,8 @@ class NeuronAnnotatorWidget(QWidget):
         self._disconnect_current_image_events()
         self.current_image = None
         self._remove_roi_layers()
+        self._restore_behavior_overlay()
+        self.behavior_workbook = None
         self._proof_sidecar_path = None
         self._update_proof_path_display()
         return True
@@ -4181,6 +4246,134 @@ class NeuronAnnotatorWidget(QWidget):
     # ------------------------------------------------------------------
     # ROI loading and geometry layers
     # ------------------------------------------------------------------
+    def load_behavior_xlsx(self) -> None:
+        if not EXCEL_AVAILABLE:
+            QMessageBox.critical(
+                self, "Excel unavailable", "Install the 'excel' extra first."
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load behavior events",
+            "",
+            "Excel workbooks (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            self.load_behavior_path(path)
+        except Exception as error:  # noqa: BLE001 - Qt callback boundary
+            QMessageBox.critical(
+                self,
+                "Invalid behavior workbook",
+                f"Could not load behavior events:\n{error}",
+            )
+            self.update_status("Behavior load failed", "red")
+
+    def load_behavior_path(self, path: str | Path) -> None:
+        """Load behavior events and take temporary text-overlay ownership."""
+        loaded = load_behavior_workbook(path)
+        if self.proofread_store is not None:
+            self.proofread_store.set_behavior(loaded)
+        self._display_behavior(loaded, str(Path(path)))
+        self._update_proof_action_state()
+        self._schedule_recovery_snapshot()
+        self.update_status(f"Loaded behavior: {Path(path).name}", "green")
+
+    def _display_behavior(
+        self, workbook: BehaviorWorkbook | None, source: str
+    ) -> None:
+        """Synchronize the session display with loaded behavior data."""
+        if workbook is None:
+            self._restore_behavior_overlay()
+            self.behavior_workbook = None
+            self.behavior_path_input.clear()
+            self.behavior_info_label.setText("No behavior loaded")
+            self.unload_behavior_btn.setEnabled(False)
+            self._update_proof_action_state()
+            return
+        overlay = self.viewer.text_overlay
+        if self._behavior_overlay_snapshot is None:
+            self._behavior_overlay_snapshot = {
+                "text": overlay.text,
+                "visible": overlay.visible,
+                "position": overlay.position,
+                "font_size": overlay.font_size,
+                "color": (
+                    None
+                    if overlay.color is None
+                    else np.asarray(overlay.color).copy()
+                ),
+            }
+        overlay.font_size = BEHAVIOR_FONT_SIZE
+
+        self.behavior_workbook = workbook
+        self.behavior_path_input.setText(source)
+        self.behavior_info_label.setText(
+            f"{workbook.behavior_count} behaviors / "
+            f"{workbook.event_count} events"
+        )
+        self.unload_behavior_btn.setEnabled(True)
+        self.show_behavior_checkbox.blockSignals(True)
+        self.show_behavior_checkbox.setChecked(True)
+        self.show_behavior_checkbox.blockSignals(False)
+        self._refresh_behavior_overlay()
+
+    def unload_behavior(self, checked: bool = False) -> None:
+        del checked
+        if self.proofread_store is not None:
+            self.proofread_store.set_behavior(None)
+        self._display_behavior(None, "")
+        self._schedule_recovery_snapshot()
+        self.update_status("Behavior unloaded", "green")
+
+    def _mapped_volume_index(self) -> int | None:
+        """Map Image time to an experimental volume without requiring ROI."""
+        if self.current_image is None:
+            return None
+        return int(
+            self.volume_start_spin.value()
+            + self._viewer_time() * self.volume_stride_spin.value()
+        )
+
+    def _on_volume_mapping_changed(self, value: int) -> None:
+        del value
+        if self.roi_dataset is not None:
+            self._update_roi_info()
+        self._refresh_behavior_overlay()
+
+    def _refresh_behavior_overlay(self, event=None) -> None:
+        del event
+        if self._behavior_overlay_snapshot is None:
+            return
+        overlay = self.viewer.text_overlay
+        workbook = self.behavior_workbook
+        labels = (
+            active_behavior_labels(
+                workbook.events, self._mapped_volume_index()
+            )
+            if workbook is not None and self.current_image is not None
+            else ()
+        )
+        overlay.text = "\n".join(labels)
+        overlay.position = "top_right"
+        overlay.color = "white"
+        overlay.visible = bool(
+            labels and self.show_behavior_checkbox.isChecked()
+        )
+
+    def _restore_behavior_overlay(self) -> None:
+        snapshot = self._behavior_overlay_snapshot
+        if snapshot is None:
+            return
+        overlay = self.viewer.text_overlay
+        overlay.text = snapshot["text"]
+        overlay.visible = snapshot["visible"]
+        overlay.position = snapshot["position"]
+        overlay.font_size = snapshot["font_size"]
+        overlay.color = snapshot["color"]
+        self._behavior_overlay_snapshot = None
+
     def load_roi_npy(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -4239,6 +4432,8 @@ class NeuronAnnotatorWidget(QWidget):
             if ProofreadStore
             else None
         )
+        if self.proofread_store is not None and self.behavior_workbook is not None:
+            self.proofread_store.set_behavior(self.behavior_workbook)
         self._begin_recovery_session()
         self._recovery_candidate_count = len(
             list_recovery_candidates(source_path)
@@ -4441,6 +4636,7 @@ class NeuronAnnotatorWidget(QWidget):
         self._set_proofreading_controls_enabled(
             self.proofreading_enabled and self._proof_view_allowed()
         )
+        self._refresh_behavior_overlay()
 
     def _ensure_roi_layers(self) -> None:
         if (
