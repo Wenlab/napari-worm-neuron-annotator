@@ -2794,6 +2794,7 @@ class NeuronAnnotatorWidget(QWidget):
         self.annotation_table.setSelectionMode(
             QAbstractItemView.SingleSelection
         )
+        self.annotation_table.installEventFilter(self)
         self.annotation_table.itemSelectionChanged.connect(
             self._on_annotation_selection_changed
         )
@@ -5088,6 +5089,7 @@ class NeuronAnnotatorWidget(QWidget):
             self.annotation_table.setRowCount(len(rows))
             for row, (item_id, biological, annotation) in enumerate(rows):
                 digital_item = QTableWidgetItem(str(item_id))
+                digital_item.setFlags(digital_item.flags() & ~Qt.ItemIsEditable)
                 digital_item.setTextAlignment(Qt.AlignCenter)
                 self.annotation_table.setItem(row, 0, digital_item)
                 self.annotation_table.setItem(
@@ -5117,6 +5119,24 @@ class NeuronAnnotatorWidget(QWidget):
             f"Loaded {count} identities into annotation table", "green"
         )
 
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt API
+        # Editors keep Q/W as text; the idle table uses the canvas navigation.
+        if (
+            watched is self.annotation_table
+            and event.type() == QEvent.KeyPress
+            and self.annotation_table.state() != QAbstractItemView.EditingState
+            and event.key() in (Qt.Key_Q, Qt.Key_W)
+            and event.modifiers() in (Qt.NoModifier, Qt.ShiftModifier)
+        ):
+            step = -1 if event.key() == Qt.Key_Q else 1
+            if event.modifiers() == Qt.ShiftModifier:
+                self.navigate_checked(step)
+            else:
+                self.navigate(step)
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
     def _sync_annotation_to_active(self) -> None:
         if self.active_id is None:
             self._ui_sync = True
@@ -5130,7 +5150,10 @@ class NeuronAnnotatorWidget(QWidget):
             for row in range(self.annotation_table.rowCount()):
                 item = self.annotation_table.item(row, 0)
                 if item is not None and item.text() == str(self.active_id):
-                    self.annotation_table.selectRow(row)
+                    # Preserve the clicked/editable column during row sync.
+                    self.annotation_table.setCurrentCell(
+                        row, max(self.annotation_table.currentColumn(), 0)
+                    )
                     self.annotation_table.scrollToItem(item)
                     break
         finally:

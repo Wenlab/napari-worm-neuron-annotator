@@ -4,7 +4,13 @@ from app_model.types import KeyBinding
 from napari.layers import Points, Vectors
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
-from qtpy.QtWidgets import QComboBox, QLineEdit, QMessageBox, QTreeWidget
+from qtpy.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QLineEdit,
+    QMessageBox,
+    QTreeWidget,
+)
 
 from napari_worm_neuron_annotator._behavior import (
     BehaviorEvent,
@@ -1311,6 +1317,101 @@ def test_annotation_sync_uses_zero_based_roi_ids(
     assert widget.annotation_table.item(0, 1).text() == "AVA"
     widget.load_roi_path(roi_path)
     assert widget.annotation_table.item(0, 1).text() == "AVA"
+
+
+def test_annotation_digital_ids_cannot_be_edited(
+    make_napari_viewer, qtbot
+):
+    widget = NeuronAnnotatorWidget(make_napari_viewer())
+    qtbot.addWidget(widget)
+    widget._set_annotation_rows([(0, "AVA", "head"), (12, "AVB", "tail")])
+    widget.show()
+    table = widget.annotation_table
+
+    for row in range(table.rowCount()):
+        item = table.item(row, 0)
+        assert not item.flags() & Qt.ItemIsEditable
+        assert item.flags() & Qt.ItemIsEnabled
+        assert item.flags() & Qt.ItemIsSelectable
+        assert table.item(row, 1).flags() & Qt.ItemIsEditable
+        assert table.item(row, 2).flags() & Qt.ItemIsEditable
+        table.setCurrentCell(row, 0)
+        qtbot.keyClick(table, Qt.Key_F2)
+        qtbot.keyClicks(table, "9")
+        qtbot.mouseDClick(
+            table.viewport(), Qt.LeftButton, pos=table.visualItemRect(item).center()
+        )
+        assert table.state() != QAbstractItemView.EditingState
+
+    assert widget._annotation_rows() == {0: ("AVA", "head"), 12: ("AVB", "tail")}
+
+
+@pytest.mark.parametrize("column", (1, 2))
+@pytest.mark.parametrize("commit_key", (Qt.Key_Return, Qt.Key_Enter))
+def test_annotation_enter_then_q_w_navigates_without_changing_text(
+    make_napari_viewer, qtbot, tmp_path, column, commit_key
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = NeuronAnnotatorWidget(viewer)
+    qtbot.addWidget(widget)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, _roi_data()[:1])
+    widget.load_roi_path(roi_path)
+    widget.show()
+    table = widget.annotation_table
+    table.setCurrentCell(0, column)
+    qtbot.keyClick(table, Qt.Key_F2)
+    editor = table.findChild(QLineEdit)
+    assert editor is not None
+    qtbot.keyClicks(editor, "qW")
+    assert widget.active_id == 0
+    assert widget.checked_ids == {0}
+    qtbot.keyClick(editor, commit_key)
+    qtbot.waitUntil(lambda: table.state() != QAbstractItemView.EditingState)
+    assert table.item(0, column).text() == "qW"
+    saved_rows = widget._annotation_rows()
+
+    for key, expected_id in (
+        (Qt.Key_W, 1),
+        (Qt.Key_Q, 0),
+        (Qt.Key_Q, 1),
+        (Qt.Key_W, 0),
+    ):
+        qtbot.keyClick(table, key)
+        assert widget.active_id == expected_id
+        assert widget.checked_ids == {0, 1}
+        assert table.selectionModel().selectedRows()[0].row() == expected_id
+        assert table.state() != QAbstractItemView.EditingState
+        assert widget._annotation_rows() == saved_rows
+        assert [table.item(row, 0).text() for row in range(2)] == ["0", "1"]
+
+
+@pytest.mark.parametrize("column", (0, 1, 2))
+def test_annotation_shift_q_w_navigates_only_checked_ids(
+    make_napari_viewer, qtbot, tmp_path, column
+):
+    viewer = make_napari_viewer()
+    viewer.add_image(np.zeros((6, 24, 24), dtype=np.uint16), name="image")
+    widget = NeuronAnnotatorWidget(viewer)
+    qtbot.addWidget(widget)
+    roi_path = tmp_path / "roi.npy"
+    np.save(roi_path, np.repeat(_roi_data()[:1, :1], 3, axis=1))
+    widget.load_roi_path(roi_path)
+    widget.activate_id(2, locate=False)
+    widget.activate_id(0, locate=False)
+    widget.show()
+    table = widget.annotation_table
+    table.setCurrentCell(0, column)
+    saved_rows = widget._annotation_rows()
+
+    for key, expected_id in ((Qt.Key_W, 2), (Qt.Key_Q, 0), (Qt.Key_Q, 2)):
+        qtbot.keyClick(table, key, modifier=Qt.ShiftModifier)
+        assert widget.active_id == expected_id
+        assert widget.checked_ids == {0, 2}
+        assert table.selectionModel().selectedRows()[0].row() == expected_id
+        assert table.state() != QAbstractItemView.EditingState
+        assert widget._annotation_rows() == saved_rows
 
 
 @pytest.mark.skipif(not EXCEL_AVAILABLE, reason="openpyxl is optional")
