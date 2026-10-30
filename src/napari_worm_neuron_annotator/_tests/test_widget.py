@@ -1361,7 +1361,8 @@ def test_annotation_enter_then_q_w_navigates_without_changing_text(
     widget.show()
     table = widget.annotation_table
     table.setCurrentCell(0, column)
-    qtbot.keyClick(table, Qt.Key_F2)
+    # Open the Qt editor without relying on a platform-specific edit shortcut.
+    table.editItem(table.item(0, column))
     editor = table.findChild(QLineEdit)
     assert editor is not None
     qtbot.keyClicks(editor, "qW")
